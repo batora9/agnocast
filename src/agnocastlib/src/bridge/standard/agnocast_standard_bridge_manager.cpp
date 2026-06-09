@@ -1,5 +1,6 @@
 #include "agnocast/bridge/standard/agnocast_standard_bridge_manager.hpp"
 
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_utils.hpp"
 #include "agnocast/bridge/agnocast_bridge_utils.hpp"
 
@@ -99,7 +100,7 @@ void StandardBridgeManager::start_ros_execution()
     try {
       this->executor_->spin();
     } catch (const std::exception & e) {
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -125,7 +126,7 @@ void StandardBridgeManager::on_mq_request(mqd_t fd)
 
 void StandardBridgeManager::on_signal()
 {
-  if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+  if (agnocast_ipc_notify_bridge_shutdown() < 0) {
     RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
   }
   shutdown_requested_ = true;
@@ -202,7 +203,7 @@ StandardBridgeManager::BridgeKernelResult StandardBridgeManager::try_add_pubsub_
   add_bridge_args.topic_name = {topic_name.c_str(), topic_name.size()};
   add_bridge_args.is_r2a = is_r2a;
 
-  int ret = ioctl(agnocast_fd, AGNOCAST_ADD_BRIDGE_CMD, &add_bridge_args);
+  int ret = agnocast_ipc_add_bridge(&add_bridge_args);
 
   if (ret == 0 || errno == EEXIST) {
     return BridgeKernelResult{
@@ -222,7 +223,7 @@ void StandardBridgeManager::rollback_pubsub_bridge_from_kernel(
   remove_bridge_args.topic_name = {topic_name.c_str(), topic_name.size()};
   remove_bridge_args.is_r2a = is_r2a;
 
-  if (ioctl(agnocast_fd, AGNOCAST_REMOVE_BRIDGE_CMD, &remove_bridge_args) < 0) {
+  if (agnocast_ipc_remove_bridge(&remove_bridge_args) < 0) {
     RCLCPP_ERROR(
       logger_, "Rollback AGNOCAST_REMOVE_BRIDGE_CMD failed for topic '%s': %s", topic_name.c_str(),
       strerror(errno));
@@ -250,7 +251,7 @@ bool StandardBridgeManager::activate_pubsub_bridge(const DirectedPubsubBridgeRef
 
     if (!bridge) {
       RCLCPP_ERROR(logger_, "Failed to create bridge for '%s'", topic_name_with_direction.c_str());
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -311,7 +312,7 @@ void StandardBridgeManager::send_pubsub_delegation(
     RCLCPP_ERROR(
       logger_, "Failed to build delegation request for topic '%s': %s", topic_name.c_str(),
       reason.c_str());
-    if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+    if (agnocast_ipc_notify_bridge_shutdown() < 0) {
       RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
     }
     shutdown_requested_ = true;
@@ -463,7 +464,7 @@ void StandardBridgeManager::create_service_bridge_if_needed(const MqMsgBridge & 
 
     if (!bridge) {
       RCLCPP_ERROR(logger_, "Bridge loader failed for '%s'", service_name.c_str());
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -517,7 +518,7 @@ void StandardBridgeManager::check_active_pubsub_bridges()
     ioctl_remove_bridge_args args{};
     args.topic_name = {topic_name_view.data(), topic_name_view.size()};
     args.is_r2a = is_r2a;
-    if (ioctl(agnocast_fd, AGNOCAST_REMOVE_BRIDGE_CMD, &args) != 0) {
+    if (agnocast_ipc_remove_bridge(&args) != 0) {
       RCLCPP_ERROR(
         logger_, "AGNOCAST_REMOVE_BRIDGE_CMD failed for key '%s': %s", key.c_str(),
         strerror(errno));
@@ -596,7 +597,7 @@ void StandardBridgeManager::check_managed_pubsub_bridges()
 void StandardBridgeManager::check_should_exit()
 {
   if (!is_parent_alive_ && active_pubsub_bridges_.empty() && active_r2a_service_bridges_.empty()) {
-    if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+    if (agnocast_ipc_notify_bridge_shutdown() < 0) {
       RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
     }
     shutdown_requested_ = true;

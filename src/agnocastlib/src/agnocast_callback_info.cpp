@@ -1,6 +1,7 @@
 #include "agnocast/agnocast_callback_info.hpp"
 
 #include "agnocast/agnocast.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_epoll.hpp"
 #include "agnocast/agnocast_epoll_event.hpp"
 #include "agnocast/agnocast_executor.hpp"
@@ -46,7 +47,7 @@ void receive_and_execute_message(
   {
     std::lock_guard<std::mutex> lock(mmap_mtx);
 
-    if (ioctl(agnocast_fd, AGNOCAST_RECEIVE_MSG_CMD, &receive_args) < 0) {
+    if (agnocast_ipc_receive_msg(&receive_args) < 0) {
       RCLCPP_ERROR(logger, "AGNOCAST_RECEIVE_MSG_CMD failed: %s", strerror(errno));
       close(agnocast_fd);
       exit(EXIT_FAILURE);

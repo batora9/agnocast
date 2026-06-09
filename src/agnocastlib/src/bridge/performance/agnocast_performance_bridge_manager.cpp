@@ -2,6 +2,7 @@
 #include "agnocast/bridge/performance/agnocast_performance_bridge_manager.hpp"
 
 #include "agnocast/agnocast_callback_isolated_executor.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_ioctl.hpp"
 #include "agnocast/agnocast_mq.hpp"
 #include "agnocast/agnocast_utils.hpp"
@@ -86,7 +87,7 @@ void PerformanceBridgeManager::start_ros_execution()
     try {
       this->executor_->spin();
     } catch (const std::exception & e) {
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -125,7 +126,7 @@ void PerformanceBridgeManager::on_mq_request(int fd)
 
 void PerformanceBridgeManager::on_signal()
 {
-  if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+  if (agnocast_ipc_notify_bridge_shutdown() < 0) {
     RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
   }
   shutdown_requested_ = true;
@@ -172,7 +173,7 @@ void PerformanceBridgeManager::check_and_remove_pubsub_bridges()
       RCLCPP_ERROR(
         logger_, "Failed to get subscriber count for topic '%s'. Requesting shutdown.",
         topic_name.c_str());
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -202,7 +203,7 @@ void PerformanceBridgeManager::check_and_remove_pubsub_bridges()
       RCLCPP_ERROR(
         logger_, "Failed to get publisher count for topic '%s'. Requesting shutdown.",
         topic_name.c_str());
-      if (ioctl(agnocast_fd, AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) < 0) {
+      if (agnocast_ipc_notify_bridge_shutdown() < 0) {
         RCLCPP_ERROR(logger_, "Failed to notify bridge shutdown: %s", strerror(errno));
       }
       shutdown_requested_ = true;
@@ -268,7 +269,7 @@ void PerformanceBridgeManager::check_and_remove_request_cache()
 void PerformanceBridgeManager::check_and_request_shutdown()
 {
   struct ioctl_check_and_request_bridge_shutdown_args args = {};
-  if (ioctl(agnocast_fd, AGNOCAST_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN_CMD, &args) < 0) {
+  if (agnocast_ipc_check_and_request_bridge_shutdown(&args) < 0) {
     RCLCPP_ERROR(logger_, "Failed to check bridge shutdown from kernel module.");
     return;
   }

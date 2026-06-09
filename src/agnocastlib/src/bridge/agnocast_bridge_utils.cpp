@@ -1,6 +1,7 @@
 #include "agnocast/bridge/agnocast_bridge_utils.hpp"
 
 #include "agnocast/agnocast.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -51,7 +52,7 @@ rclcpp::QoS get_subscriber_qos(const std::string & topic_name, topic_local_id_t 
   get_subscriber_qos_args.topic_name = {topic_name.c_str(), topic_name.size()};
   get_subscriber_qos_args.subscriber_id = subscriber_id;
 
-  if (ioctl(agnocast_fd, AGNOCAST_GET_SUBSCRIBER_QOS_CMD, &get_subscriber_qos_args) < 0) {
+  if (agnocast_ipc_get_subscriber_qos(&get_subscriber_qos_args) < 0) {
     // This exception is intended to be caught by the factory function that instantiates the bridge.
     throw std::runtime_error("Failed to fetch subscriber QoS from agnocast kernel module");
   }
@@ -70,7 +71,7 @@ rclcpp::QoS get_publisher_qos(const std::string & topic_name, topic_local_id_t p
   get_publisher_qos_args.topic_name = {topic_name.c_str(), topic_name.size()};
   get_publisher_qos_args.publisher_id = publisher_id;
 
-  if (ioctl(agnocast_fd, AGNOCAST_GET_PUBLISHER_QOS_CMD, &get_publisher_qos_args) < 0) {
+  if (agnocast_ipc_get_publisher_qos(&get_publisher_qos_args) < 0) {
     // This exception is intended to be caught by the factory function that instantiates the bridge.
     throw std::runtime_error("Failed to fetch publisher QoS from agnocast kernel module");
   }
@@ -85,7 +86,7 @@ SubscriberCountResult get_agnocast_subscriber_count(const std::string & topic_na
 {
   union ioctl_get_subscriber_num_args args = {};
   args.topic_name = {topic_name.c_str(), topic_name.size()};
-  if (ioctl(agnocast_fd, AGNOCAST_GET_SUBSCRIBER_NUM_CMD, &args) < 0) {
+  if (agnocast_ipc_get_subscriber_num(&args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_GET_SUBSCRIBER_NUM_CMD failed: %s", strerror(errno));
     return {-1, false};
   }
@@ -103,7 +104,7 @@ PublisherCountResult get_agnocast_publisher_count(const std::string & topic_name
 {
   union ioctl_get_publisher_num_args args = {};
   args.topic_name = {topic_name.c_str(), topic_name.size()};
-  if (ioctl(agnocast_fd, AGNOCAST_GET_PUBLISHER_NUM_CMD, &args) < 0) {
+  if (agnocast_ipc_get_publisher_num(&args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_GET_PUBLISHER_NUM_CMD failed: %s", strerror(errno));
     return {-1, false};
   }
@@ -128,7 +129,7 @@ bool update_ros2_subscriber_num(const rclcpp::Node * node, const std::string & t
   args.topic_name = {topic_name.c_str(), topic_name.size()};
   args.ros2_subscriber_num = static_cast<uint32_t>(ros2_count);
 
-  if (ioctl(agnocast_fd, AGNOCAST_SET_ROS2_SUBSCRIBER_NUM_CMD, &args) < 0) {
+  if (agnocast_ipc_set_ros2_subscriber_num(&args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_SET_ROS2_SUBSCRIBER_NUM_CMD failed: %s", strerror(errno));
     return false;
   }
@@ -147,7 +148,7 @@ bool update_ros2_publisher_num(const rclcpp::Node * node, const std::string & to
   args.topic_name = {topic_name.c_str(), topic_name.size()};
   args.ros2_publisher_num = static_cast<uint32_t>(ros2_count);
 
-  if (ioctl(agnocast_fd, AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD, &args) < 0) {
+  if (agnocast_ipc_set_ros2_publisher_num(&args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD failed: %s", strerror(errno));
     return false;
   }
@@ -197,7 +198,7 @@ rclcpp::QoS get_service_qos(const std::string & service_name)
     reinterpret_cast<uint64_t>(topic_info_buffer->data());
   topic_info_args.topic_info_ret_buffer_size = 1;
 
-  if (ioctl(agnocast_fd, AGNOCAST_GET_TOPIC_SUBSCRIBER_INFO_CMD, &topic_info_args) < 0) {
+  if (agnocast_ipc_get_topic_subscriber_info(&topic_info_args) < 0) {
     if (errno == ENOBUFS) {
       throw std::runtime_error("Multiple target agnocast services found");
     }

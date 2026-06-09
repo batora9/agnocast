@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agnocast/agnocast_callback_info.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_ioctl.hpp"
 #include "agnocast/agnocast_mq.hpp"
 #include "agnocast/agnocast_public_api.hpp"
@@ -106,7 +107,7 @@ public:
     };
     remove_subscriber_args.topic_name = {topic_name_.c_str(), topic_name_.size()};
     remove_subscriber_args.subscriber_id = id_;
-    if (ioctl(agnocast_fd, AGNOCAST_REMOVE_SUBSCRIBER_CMD, &remove_subscriber_args) < 0) {
+    if (agnocast_ipc_remove_subscriber(&remove_subscriber_args) < 0) {
       RCLCPP_WARN(logger, "Failed to remove subscriber (id=%d) from kernel.", id_);
     }
   }
@@ -334,7 +335,7 @@ public:
     {
       std::lock_guard<std::mutex> lock(mmap_mtx);
 
-      if (ioctl(agnocast_fd, AGNOCAST_TAKE_MSG_CMD, &take_args) < 0) {
+      if (agnocast_ipc_take_msg(&take_args) < 0) {
         RCLCPP_ERROR(logger, "AGNOCAST_TAKE_MSG_CMD failed: %s", strerror(errno));
         close(agnocast_fd);
         exit(EXIT_FAILURE);
