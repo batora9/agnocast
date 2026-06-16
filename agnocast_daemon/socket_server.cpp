@@ -26,7 +26,7 @@ static constexpr size_t kMaxRequestSize = sizeof(RequestHeader) + 600;
 // ============================================================
 
 SocketServer::SocketServer(MetadataStore & store, MemoryAllocator & allocator)
-: store_(store), allocator_(allocator)
+: store_(store), allocator_(allocator), handlers_(store, allocator)
 {
   server_fd_ = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
   if (server_fd_ < 0) {
@@ -174,75 +174,8 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     }
 
     const void * payload = (hdr.payload_size > 0) ? buf.data() + sizeof(RequestHeader) : nullptr;
-    dispatch_command(client_fd, client_pid, hdr, payload);
+    handlers_.dispatch(client_fd, client_pid, hdr, payload);
   }
-}
 
-// ============================================================
-// Response helpers
-// ============================================================
-
-void SocketServer::send_response(int fd, int32_t error_code)
-{
-  ResponseHeader hdr{error_code, 0};
-  send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-}
-
-void SocketServer::send_response(
-  int fd, int32_t error_code, const void * payload, uint32_t payload_size)
-{
-  ResponseHeader hdr{error_code, payload_size};
-  // Deliver header + payload as a single SOCK_SEQPACKET message.
-  iovec iov[2];
-  iov[0].iov_base = &hdr;
-  iov[0].iov_len = sizeof(hdr);
-  iov[1].iov_base = const_cast<void *>(payload);
-  iov[1].iov_len = payload_size;
-  msghdr msg{};
-  msg.msg_iov = iov;
-  msg.msg_iovlen = 2;
-  sendmsg(fd, &msg, MSG_NOSIGNAL);
-}
-
-// ============================================================
-// Command dispatch
-// ============================================================
-
-void SocketServer::dispatch_command(
-  int client_fd, pid_t /*client_pid*/, const RequestHeader & hdr, const void * /*payload*/)
-{
-  switch (static_cast<CommandType>(hdr.command)) {
-    case AGNOCAST_CMD_GET_VERSION:
-    case AGNOCAST_CMD_ADD_PROCESS:
-    case AGNOCAST_CMD_ADD_SUBSCRIBER:
-    case AGNOCAST_CMD_ADD_PUBLISHER:
-    case AGNOCAST_CMD_RELEASE_SUB_REF:
-    case AGNOCAST_CMD_PUBLISH_MSG:
-    case AGNOCAST_CMD_RECEIVE_MSG:
-    case AGNOCAST_CMD_TAKE_MSG:
-    case AGNOCAST_CMD_GET_SUBSCRIBER_NUM:
-    case AGNOCAST_CMD_GET_EXIT_PROCESS:
-    case AGNOCAST_CMD_GET_SUBSCRIBER_QOS:
-    case AGNOCAST_CMD_GET_PUBLISHER_QOS:
-    case AGNOCAST_CMD_ADD_BRIDGE:
-    case AGNOCAST_CMD_REMOVE_BRIDGE:
-    case AGNOCAST_CMD_GET_PUBLISHER_NUM:
-    case AGNOCAST_CMD_REMOVE_SUBSCRIBER:
-    case AGNOCAST_CMD_REMOVE_PUBLISHER:
-    case AGNOCAST_CMD_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN:
-    case AGNOCAST_CMD_GET_TOPIC_LIST:
-    case AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO:
-    case AGNOCAST_CMD_GET_TOPIC_PUBLISHER_INFO:
-    case AGNOCAST_CMD_GET_NODE_SUBSCRIBER_TOPICS:
-    case AGNOCAST_CMD_GET_NODE_PUBLISHER_TOPICS:
-    case AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM:
-    case AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM:
-    case AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN:
-      // Command handlers are implemented in Step 3+.
-      send_response(client_fd, ENOSYS);
-      break;
-    default:
-      send_response(client_fd, EINVAL);
-      break;
-  }
+  handlers_.on_client_disconnect(client_pid);
 }
