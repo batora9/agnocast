@@ -17,3 +17,4 @@ __pycache__
 *.build
 *.upload
 *.o.d
+agnocast_daemon/build*/
