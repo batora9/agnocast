@@ -1,7 +1,7 @@
 #include "agnocast/agnocast.hpp"
 
-#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_ioctl.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_mq.hpp"
 #include "agnocast/agnocast_version.hpp"
 #include "agnocast/bridge/performance/agnocast_performance_bridge_manager.hpp"
@@ -9,6 +9,7 @@
 
 #ifdef AGNOCAST_USE_DAEMON
 #include "protocol.h"
+
 #include <sys/socket.h>
 #include <sys/un.h>
 #endif
@@ -388,6 +389,10 @@ bool is_version_consistent(
   return true;
 }
 
+#ifdef AGNOCAST_USE_DAEMON
+static void connect_to_daemon_socket();
+#endif
+
 template <typename Func>
 pid_t spawn_daemon_process(Func && func)
 {
@@ -441,6 +446,18 @@ pid_t spawn_daemon_process(Func && func)
     if (setsid() == -1) {
       fail("setsid failed: %s");
     }
+
+#ifdef AGNOCAST_USE_DAEMON
+    // The daemon identifies each client per connection, using the PID reported
+    // by SO_PEERCRED at connect time. A forked child inherits the parent's single
+    // socket connection, so without a fresh connection the daemon would attribute
+    // the child's requests to the parent PID (breaking add_process, memory
+    // assignment, and exit cleanup) and the two processes would interleave
+    // requests/responses on one stream. Drop the inherited connection and open a
+    // dedicated one for this child.
+    close(agnocast_fd);
+    connect_to_daemon_socket();
+#endif
 
     func();
     exit(0);
