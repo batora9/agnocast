@@ -6,12 +6,18 @@ if(NOT CMAKE_CXX_STANDARD)
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../agnocast_kmod/version.txt" AGNOCAST_VERSION_RAW)
+string(STRIP "${AGNOCAST_VERSION_RAW}" AGNOCAST_VERSION_RAW)
+
 add_executable(agnocast_daemon
   main.cpp
   metadata_store.cpp
   memory_allocator.cpp
+  command_handlers.cpp
   socket_server.cpp
 )
+
+target_compile_definitions(agnocast_daemon PRIVATE AGNOCAST_VERSION="${AGNOCAST_VERSION_RAW}")
 
 target_include_directories(agnocast_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(agnocast_daemon PRIVATE -Wall -Wextra -Wpedantic)

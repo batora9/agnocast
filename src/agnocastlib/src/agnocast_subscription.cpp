@@ -1,4 +1,5 @@
 #include "agnocast/agnocast.hpp"
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/internal/type_registry_writer.hpp"
 #include "agnocast/node/agnocast_node.hpp"
 
@@ -40,7 +41,7 @@ union ioctl_add_subscriber_args SubscriptionBase::initialize(
   add_subscriber_args.is_take_sub = is_take_sub;
   add_subscriber_args.ignore_local_publications = ignore_local_publications;
   add_subscriber_args.is_bridge = is_bridge;
-  if (ioctl(agnocast_fd, AGNOCAST_ADD_SUBSCRIBER_CMD, &add_subscriber_args) < 0) {
+  if (agnocast_ipc_add_subscriber(&add_subscriber_args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_ADD_SUBSCRIBER_CMD failed: %s", strerror(errno));
     close(agnocast_fd);
     exit(EXIT_FAILURE);
@@ -53,7 +54,7 @@ uint32_t get_publisher_count_core(const std::string & topic_name)
 {
   union ioctl_get_publisher_num_args args = {};
   args.topic_name = {topic_name.c_str(), topic_name.size()};
-  if (ioctl(agnocast_fd, AGNOCAST_GET_PUBLISHER_NUM_CMD, &args) < 0) {
+  if (agnocast_ipc_get_publisher_num(&args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_GET_PUBLISHER_NUM_CMD failed: %s", strerror(errno));
     close(agnocast_fd);
     exit(EXIT_FAILURE);

@@ -1,10 +1,17 @@
 #include "agnocast/agnocast.hpp"
 
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_ioctl.hpp"
 #include "agnocast/agnocast_mq.hpp"
 #include "agnocast/agnocast_version.hpp"
 #include "agnocast/bridge/performance/agnocast_performance_bridge_manager.hpp"
 #include "agnocast/bridge/standard/agnocast_standard_bridge_manager.hpp"
+
+#ifdef AGNOCAST_USE_DAEMON
+#include "protocol.h"
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
 
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -158,7 +165,7 @@ initialize_agnocast_result acquire_agnocast_resources_for_bridge(BridgeMode brid
 {
   union ioctl_add_process_args add_process_args = {};
   add_process_args.is_performance_bridge_manager = (bridge_mode == BridgeMode::Performance);
-  if (ioctl(agnocast_fd, AGNOCAST_ADD_PROCESS_CMD, &add_process_args) < 0) {
+  if (agnocast_ipc_add_process(&add_process_args) < 0) {
     throw std::runtime_error(std::string("AGNOCAST_ADD_PROCESS_CMD failed: ") + strerror(errno));
   }
 
@@ -196,7 +203,7 @@ void poll_for_unlink()
         reinterpret_cast<uint64_t>(mq_info_buf.data());
       get_exit_process_args.subscription_mq_info_buffer_size =
         static_cast<uint32_t>(mq_info_buf.size());
-      if (ioctl(agnocast_fd, AGNOCAST_GET_EXIT_PROCESS_CMD, &get_exit_process_args) < 0) {
+      if (agnocast_ipc_get_exit_process(&get_exit_process_args) < 0) {
         RCLCPP_ERROR(logger, "AGNOCAST_GET_EXIT_PROCESS_CMD failed: %s", strerror(errno));
         close(agnocast_fd);
         exit(EXIT_FAILURE);
@@ -442,6 +449,26 @@ pid_t spawn_daemon_process(Func && func)
   return pid;
 }
 
+#ifdef AGNOCAST_USE_DAEMON
+static void connect_to_daemon_socket()
+{
+  agnocast_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+  if (agnocast_fd < 0) {
+    RCLCPP_ERROR(logger, "socket() failed: %s", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, AGNOCAST_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+  if (connect(agnocast_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    RCLCPP_ERROR(logger, "connect to agnocast daemon failed: %s", strerror(errno));
+    close(agnocast_fd);
+    agnocast_fd = -1;
+    exit(EXIT_FAILURE);
+  }
+}
+#endif
+
 // NOTE: Avoid heap allocation inside initialize_agnocast. TLSF is not initialized yet.
 struct initialize_agnocast_result initialize_agnocast(
   const unsigned char * heaphook_version_ptr, const size_t heaphook_version_str_len)
@@ -451,6 +478,9 @@ struct initialize_agnocast_result initialize_agnocast(
     exit(EXIT_FAILURE);
   }
 
+#ifdef AGNOCAST_USE_DAEMON
+  connect_to_daemon_socket();
+#else
   agnocast_fd = open("/dev/agnocast", O_RDWR);
   if (agnocast_fd < 0) {
     if (errno == ENOENT) {
@@ -460,9 +490,10 @@ struct initialize_agnocast_result initialize_agnocast(
     }
     exit(EXIT_FAILURE);
   }
+#endif
 
   struct ioctl_get_version_args get_version_args = {};
-  if (ioctl(agnocast_fd, AGNOCAST_GET_VERSION_CMD, &get_version_args) < 0) {
+  if (agnocast_ipc_get_version(&get_version_args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_GET_VERSION_CMD failed: %s", strerror(errno));
     close(agnocast_fd);
     exit(EXIT_FAILURE);
@@ -474,7 +505,7 @@ struct initialize_agnocast_result initialize_agnocast(
   }
 
   union ioctl_add_process_args add_process_args = {};
-  if (ioctl(agnocast_fd, AGNOCAST_ADD_PROCESS_CMD, &add_process_args) < 0) {
+  if (agnocast_ipc_add_process(&add_process_args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_ADD_PROCESS_CMD failed: %s", strerror(errno));
     close(agnocast_fd);
     exit(EXIT_FAILURE);
@@ -484,10 +515,12 @@ struct initialize_agnocast_result initialize_agnocast(
   bool should_spawn_bridge = false;
   auto bridge_mode = get_bridge_mode();
 
+#ifndef AGNOCAST_USE_DAEMON
   // Create a shm_unlink daemon process if it doesn't exist in its ipc namespace.
   if (!add_process_args.ret_unlink_daemon_exist) {
     spawn_daemon_process([]() { poll_for_unlink(); });
   }
+#endif
   if (
     bridge_mode == BridgeMode::Performance &&
     !add_process_args.ret_performance_bridge_daemon_exist) {

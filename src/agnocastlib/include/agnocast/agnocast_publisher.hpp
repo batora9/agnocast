@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_ioctl.hpp"
 #include "agnocast/agnocast_mq.hpp"
 #include "agnocast/agnocast_public_api.hpp"
@@ -178,7 +179,7 @@ public:
     };
     remove_publisher_args.topic_name = {topic_name_.c_str(), topic_name_.size()};
     remove_publisher_args.publisher_id = id_;
-    if (ioctl(agnocast_fd, AGNOCAST_REMOVE_PUBLISHER_CMD, &remove_publisher_args) < 0) {
+    if (agnocast_ipc_remove_publisher(&remove_publisher_args) < 0) {
       RCLCPP_WARN(logger, "Failed to remove publisher (id=%d) from kernel.", id_);
     }
   }

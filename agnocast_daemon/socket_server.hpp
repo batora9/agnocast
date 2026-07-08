@@ -5,6 +5,7 @@
 
 #include <sys/types.h>
 
+#include "command_handlers.hpp"
 #include "metadata_store.hpp"
 #include "memory_allocator.hpp"
 #include "protocol.h"
@@ -45,18 +46,6 @@ private:
   // disconnects or an error occurs.
   void handle_client(int client_fd, pid_t client_pid);
 
-  // Dispatch a single decoded command.  Called from handle_client().
-  void dispatch_command(
-    int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload);
-
-  // Send a response with no payload (error-only reply).
-  static void send_response(int fd, int32_t error_code);
-
-  // Send a response with payload.  Header and payload are delivered as a
-  // single SOCK_SEQPACKET message via sendmsg() with scatter-gather I/O.
-  static void send_response(
-    int fd, int32_t error_code, const void * payload, uint32_t payload_size);
-
   int server_fd_ = -1;
   int epoll_fd_ = -1;
 
@@ -67,4 +56,5 @@ private:
 
   MetadataStore & store_;
   MemoryAllocator & allocator_;
+  CommandHandlers handlers_;
 };
