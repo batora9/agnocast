@@ -5,12 +5,13 @@
 #include "agnocast/agnocast_utils.hpp"
 #include "protocol.h"
 
-#include <cerrno>
-#include <cstring>
-#include <mutex>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <mutex>
 
 namespace agnocast
 {
@@ -19,9 +20,8 @@ static std::mutex socket_mtx;
 
 // Returns 0 on success, sets errno on failure.
 static int daemon_call(
-  uint32_t cmd,
-  const void * req_payload, uint32_t req_size,
-  void * resp_payload, uint32_t resp_size)
+  uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
+  uint32_t resp_size)
 {
   std::lock_guard<std::mutex> lock(socket_mtx);
 
@@ -128,6 +128,12 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
 
 int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
 {
+  // ioctl_publish_msg_args is a union: the output ret_released_addrs[] overlaps the input
+  // subscriber_ids_buffer_addr/size. Snapshot the caller-provided buffer pointer/size before
+  // writing any ret_* field, otherwise writing ret_released_addrs[] clobbers them.
+  const uint64_t subscriber_ids_buffer_addr = args->subscriber_ids_buffer_addr;
+  const uint32_t subscriber_ids_buffer_size = args->subscriber_ids_buffer_size;
+
   PublishMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.publisher_id = args->publisher_id;
@@ -141,11 +147,11 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
     for (uint32_t i = 0; i < resp.released_num && i < AGNOCAST_PROTO_MAX_RELEASE_NUM; i++) {
       args->ret_released_addrs[i] = resp.released_addrs[i];
     }
-    // Copy subscriber IDs into the caller-provided buffer
-    auto * sub_ids = reinterpret_cast<topic_local_id_t *>(args->subscriber_ids_buffer_addr);
-    uint32_t copy_count = (resp.subscriber_num < args->subscriber_ids_buffer_size)
+    // Copy subscriber IDs into the caller-provided buffer (snapshotted above).
+    auto * sub_ids = reinterpret_cast<topic_local_id_t *>(subscriber_ids_buffer_addr);
+    uint32_t copy_count = (resp.subscriber_num < subscriber_ids_buffer_size)
                             ? resp.subscriber_num
-                            : args->subscriber_ids_buffer_size;
+                            : subscriber_ids_buffer_size;
     for (uint32_t i = 0; i < copy_count; i++) {
       sub_ids[i] = resp.subscriber_ids[i];
     }
@@ -155,6 +161,13 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
 
 int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
 {
+  // ioctl_receive_msg_args is a union: the output ret_* fields overlap the input
+  // pub_shm_info_addr/size. The kernel reads inputs before writing outputs, but here
+  // we must snapshot the caller-provided buffer pointer/size before writing any ret_*
+  // field, otherwise writing ret_entry_ids[]/ret_entry_addrs[] clobbers them.
+  const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
+  const uint32_t pub_shm_info_size = args->pub_shm_info_size;
+
   ReceiveMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
@@ -168,11 +181,10 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
       args->ret_entry_ids[i] = resp.entry_ids[i];
       args->ret_entry_addrs[i] = resp.entry_addrs[i];
     }
-    // Copy pub_shm_infos into the caller-provided buffer
-    auto * shm_buf = reinterpret_cast<publisher_shm_info *>(args->pub_shm_info_addr);
-    uint32_t copy_count = (resp.pub_shm_num < args->pub_shm_info_size)
-                            ? resp.pub_shm_num
-                            : args->pub_shm_info_size;
+    // Copy pub_shm_infos into the caller-provided buffer (snapshotted above).
+    auto * shm_buf = reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr);
+    uint32_t copy_count =
+      (resp.pub_shm_num < pub_shm_info_size) ? resp.pub_shm_num : pub_shm_info_size;
     for (uint32_t i = 0; i < copy_count; i++) {
       shm_buf[i].pid = resp.pub_shm_infos[i].pid;
       shm_buf[i].shm_addr = resp.pub_shm_infos[i].shm_addr;
@@ -184,6 +196,11 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
 
 int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
 {
+  // ioctl_take_msg_args is a union: snapshot the caller-provided buffer pointer/size before
+  // writing any ret_* field so the output does not clobber the input pub_shm_info_addr/size.
+  const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
+  const uint32_t pub_shm_info_size = args->pub_shm_info_size;
+
   TakeMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
@@ -194,10 +211,9 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
     args->ret_addr = resp.addr;
     args->ret_entry_id = resp.entry_id;
     args->ret_pub_shm_num = resp.pub_shm_num;
-    auto * shm_buf = reinterpret_cast<publisher_shm_info *>(args->pub_shm_info_addr);
-    uint32_t copy_count = (resp.pub_shm_num < args->pub_shm_info_size)
-                            ? resp.pub_shm_num
-                            : args->pub_shm_info_size;
+    auto * shm_buf = reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr);
+    uint32_t copy_count =
+      (resp.pub_shm_num < pub_shm_info_size) ? resp.pub_shm_num : pub_shm_info_size;
     for (uint32_t i = 0; i < copy_count; i++) {
       shm_buf[i].pid = resp.pub_shm_infos[i].pid;
       shm_buf[i].shm_addr = resp.pub_shm_infos[i].shm_addr;
@@ -271,8 +287,8 @@ int agnocast_ipc_get_exit_process(struct ioctl_get_exit_process_args * args)
     args->ret_daemon_should_exit = resp.daemon_should_exit;
     args->ret_pid = resp.pid;
     args->ret_subscription_mq_info_num = resp.subscription_mq_info_num;
-    auto * mq_buf = reinterpret_cast<exit_subscription_mq_info *>(
-      args->subscription_mq_info_buffer_addr);
+    auto * mq_buf =
+      reinterpret_cast<exit_subscription_mq_info *>(args->subscription_mq_info_buffer_addr);
     if (mq_buf != nullptr) {
       uint32_t copy_count = (resp.subscription_mq_info_num < args->subscription_mq_info_buffer_size)
                               ? resp.subscription_mq_info_num
@@ -345,8 +361,8 @@ int agnocast_ipc_check_and_request_bridge_shutdown(
   struct ioctl_check_and_request_bridge_shutdown_args * args)
 {
   CheckAndRequestBridgeShutdownResponse resp{};
-  int r = daemon_call(
-    AGNOCAST_CMD_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN, nullptr, 0, &resp, sizeof(resp));
+  int r =
+    daemon_call(AGNOCAST_CMD_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN, nullptr, 0, &resp, sizeof(resp));
   if (r == 0) {
     args->ret_should_shutdown = resp.should_shutdown;
   }
@@ -379,8 +395,8 @@ int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args)
   GetTopicSubscriberInfoRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   GetTopicSubscriberInfoResponse resp{};
-  int r = daemon_call(
-    AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO, &req, sizeof(req), &resp, sizeof(resp));
+  int r =
+    daemon_call(AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_topic_info_ret_num = resp.entry_num;
     auto * buf = reinterpret_cast<topic_info_ret *>(args->topic_info_ret_buffer_addr);
