@@ -66,6 +66,12 @@ static void copy_name(char * dst, size_t dst_size, const struct name_info & src)
   dst[len] = '\0';
 }
 
+static void copy_name_out(char * dst, size_t dst_size, const char * src)
+{
+  std::strncpy(dst, src, dst_size - 1);
+  dst[dst_size - 1] = '\0';
+}
+
 int agnocast_ipc_get_version(struct ioctl_get_version_args * args)
 {
   GetVersionResponse resp{};
@@ -80,6 +86,7 @@ int agnocast_ipc_add_process(union ioctl_add_process_args * args)
 {
   AddProcessRequest req{};
   req.is_performance_bridge_manager = args->is_performance_bridge_manager;
+  req.domain_id = args->domain_id;
   AddProcessResponse resp{};
   int r = daemon_call(AGNOCAST_CMD_ADD_PROCESS, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
@@ -87,6 +94,7 @@ int agnocast_ipc_add_process(union ioctl_add_process_args * args)
     args->ret_shm_size = resp.shm_size;
     args->ret_unlink_daemon_exist = resp.unlink_daemon_exist;
     args->ret_performance_bridge_daemon_exist = resp.performance_bridge_daemon_exist;
+    args->ret_discovery_agent_exist = resp.discovery_agent_exist;
   }
   return r;
 }
@@ -103,6 +111,7 @@ int agnocast_ipc_add_publisher(union ioctl_add_publisher_args * args)
   int r = daemon_call(AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_id = resp.publisher_id;
+    copy_name_out(args->ret_mq_topic_name, sizeof(args->ret_mq_topic_name), resp.mq_topic_name);
   }
   return r;
 }
@@ -122,6 +131,7 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   int r = daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_id = resp.subscriber_id;
+    copy_name_out(args->ret_mq_topic_name, sizeof(args->ret_mq_topic_name), resp.mq_topic_name);
   }
   return r;
 }

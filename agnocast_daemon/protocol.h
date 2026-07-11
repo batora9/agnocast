@@ -135,8 +135,8 @@ struct ResponseHeader
  */
 struct AgnocastPublisherShmInfo
 {
-  int32_t pid;    /* local PID of the publisher */
-  uint32_t _pad;  /* explicit: aligns shm_addr to 8-byte boundary */
+  int32_t pid;   /* local PID of the publisher */
+  uint32_t _pad; /* explicit: aligns shm_addr to 8-byte boundary */
   uint64_t shm_addr;
   uint64_t shm_size;
 };
@@ -197,22 +197,25 @@ struct GetVersionResponse
 /* ---- AGNOCAST_CMD_ADD_PROCESS (2) ---- */
 /* The client PID is obtained by the daemon via SO_PEERCRED; not in the payload.
  *
- * Layout (4 bytes, alignment 1):
+ * Layout (8 bytes, alignment 4):
  *   offset 0: is_performance_bridge_manager (1 byte)
- *   offset 1: _pad[3]                       (3 bytes) — rounds to 4 bytes
+ *   offset 1: _pad[3]                       (3 bytes)
+ *   offset 4: domain_id                     (4 bytes)
  */
 struct AddProcessRequest
 {
   bool is_performance_bridge_manager;
   uint8_t _pad[3]; /* explicit: rounds struct to 4 bytes */
+  uint32_t domain_id;
 };
 
-/* Layout (24 bytes, alignment 8):
+/* Layout (32 bytes, alignment 8):
  *   offset  0: shm_addr                        (8 bytes)
  *   offset  8: shm_size                        (8 bytes)
  *   offset 16: unlink_daemon_exist             (1 byte)
  *   offset 17: performance_bridge_daemon_exist (1 byte)
- *   offset 18: _pad[6]                         (6 bytes) — rounds to 24 bytes
+ *   offset 18: discovery_agent_exist           (1 byte)
+ *   offset 19: _pad[5]                         (5 bytes) — rounds to 24 bytes
  */
 struct AddProcessResponse
 {
@@ -220,7 +223,8 @@ struct AddProcessResponse
   uint64_t shm_size;
   bool unlink_daemon_exist;
   bool performance_bridge_daemon_exist;
-  uint8_t _pad[6]; /* explicit: rounds struct to a multiple of 8 */
+  bool discovery_agent_exist;
+  uint8_t _pad[5]; /* explicit: rounds struct to a multiple of 8 */
 };
 
 /* ---- AGNOCAST_CMD_ADD_SUBSCRIBER (3) ---- */
@@ -251,6 +255,7 @@ struct AddSubscriberRequest
 struct AddSubscriberResponse
 {
   int32_t subscriber_id; /* topic_local_id_t */
+  char mq_topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
 };
 
 /* ---- AGNOCAST_CMD_ADD_PUBLISHER (4) ---- */
@@ -275,6 +280,7 @@ struct AddPublisherRequest
 struct AddPublisherResponse
 {
   int32_t publisher_id; /* topic_local_id_t */
+  char mq_topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
 };
 
 /* ---- AGNOCAST_CMD_RELEASE_SUB_REF (6) ---- */
@@ -346,7 +352,7 @@ struct ReceiveMsgResponse
 {
   uint16_t entry_num;
   bool call_again;
-  uint8_t _pad1[5];  /* explicit: aligns entry_ids to 8-byte boundary */
+  uint8_t _pad1[5]; /* explicit: aligns entry_ids to 8-byte boundary */
   int64_t entry_ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint64_t entry_addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint32_t pub_shm_num;
@@ -645,35 +651,62 @@ struct SetRos2PublisherNumRequest
 #ifdef __cplusplus
 static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-static_assert(sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
-static_assert(sizeof(struct AgnocastExitSubscriptionInfo) == 260, "AgnocastExitSubscriptionInfo must be 260 bytes");
-static_assert(sizeof(struct AgnocastTopicInfoEntry) == 264, "AgnocastTopicInfoEntry must be 264 bytes");
-static_assert(sizeof(struct AddProcessRequest) == 4, "AddProcessRequest must be 4 bytes");
+static_assert(
+  sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
+static_assert(
+  sizeof(struct AgnocastExitSubscriptionInfo) == 260,
+  "AgnocastExitSubscriptionInfo must be 260 bytes");
+static_assert(
+  sizeof(struct AgnocastTopicInfoEntry) == 264, "AgnocastTopicInfoEntry must be 264 bytes");
+static_assert(sizeof(struct AddProcessRequest) == 8, "AddProcessRequest must be 8 bytes");
 static_assert(sizeof(struct AddProcessResponse) == 24, "AddProcessResponse must be 24 bytes");
+static_assert(
+  sizeof(struct AddSubscriberResponse) == 260, "AddSubscriberResponse must be 260 bytes");
+static_assert(sizeof(struct AddPublisherResponse) == 260, "AddPublisherResponse must be 260 bytes");
 static_assert(sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
 static_assert(sizeof(struct PublishMsgRequest) == 272, "PublishMsgRequest must be 272 bytes");
 static_assert(sizeof(struct ReceiveMsgResponse) == 24752, "ReceiveMsgResponse must be 24752 bytes");
 static_assert(sizeof(struct TakeMsgResponse) == 24600, "TakeMsgResponse must be 24600 bytes");
-static_assert(sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
-static_assert(sizeof(struct GetSubscriberQosResponse) == 8, "GetSubscriberQosResponse must be 8 bytes");
-static_assert(sizeof(struct GetPublisherQosResponse) == 8, "GetPublisherQosResponse must be 8 bytes");
+static_assert(
+  sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
+static_assert(
+  sizeof(struct GetSubscriberQosResponse) == 8, "GetSubscriberQosResponse must be 8 bytes");
+static_assert(
+  sizeof(struct GetPublisherQosResponse) == 8, "GetPublisherQosResponse must be 8 bytes");
 static_assert(sizeof(struct AddBridgeResponse) == 8, "AddBridgeResponse must be 8 bytes");
-static_assert(sizeof(struct CheckAndRequestBridgeShutdownResponse) == 4, "CheckAndRequestBridgeShutdownResponse must be 4 bytes");
+static_assert(
+  sizeof(struct CheckAndRequestBridgeShutdownResponse) == 4,
+  "CheckAndRequestBridgeShutdownResponse must be 4 bytes");
 #else
 _Static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 _Static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-_Static_assert(sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
-_Static_assert(sizeof(struct AgnocastExitSubscriptionInfo) == 260, "AgnocastExitSubscriptionInfo must be 260 bytes");
-_Static_assert(sizeof(struct AgnocastTopicInfoEntry) == 264, "AgnocastTopicInfoEntry must be 264 bytes");
-_Static_assert(sizeof(struct AddProcessRequest) == 4, "AddProcessRequest must be 4 bytes");
+_Static_assert(
+  sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
+_Static_assert(
+  sizeof(struct AgnocastExitSubscriptionInfo) == 260,
+  "AgnocastExitSubscriptionInfo must be 260 bytes");
+_Static_assert(
+  sizeof(struct AgnocastTopicInfoEntry) == 264, "AgnocastTopicInfoEntry must be 264 bytes");
+_Static_assert(sizeof(struct AddProcessRequest) == 8, "AddProcessRequest must be 8 bytes");
 _Static_assert(sizeof(struct AddProcessResponse) == 24, "AddProcessResponse must be 24 bytes");
-_Static_assert(sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
+_Static_assert(
+  sizeof(struct AddSubscriberResponse) == 260, "AddSubscriberResponse must be 260 bytes");
+_Static_assert(
+  sizeof(struct AddPublisherResponse) == 260, "AddPublisherResponse must be 260 bytes");
+_Static_assert(
+  sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
 _Static_assert(sizeof(struct PublishMsgRequest) == 272, "PublishMsgRequest must be 272 bytes");
-_Static_assert(sizeof(struct ReceiveMsgResponse) == 24752, "ReceiveMsgResponse must be 24752 bytes");
+_Static_assert(
+  sizeof(struct ReceiveMsgResponse) == 24752, "ReceiveMsgResponse must be 24752 bytes");
 _Static_assert(sizeof(struct TakeMsgResponse) == 24600, "TakeMsgResponse must be 24600 bytes");
-_Static_assert(sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
-_Static_assert(sizeof(struct GetSubscriberQosResponse) == 8, "GetSubscriberQosResponse must be 8 bytes");
-_Static_assert(sizeof(struct GetPublisherQosResponse) == 8, "GetPublisherQosResponse must be 8 bytes");
+_Static_assert(
+  sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
+_Static_assert(
+  sizeof(struct GetSubscriberQosResponse) == 8, "GetSubscriberQosResponse must be 8 bytes");
+_Static_assert(
+  sizeof(struct GetPublisherQosResponse) == 8, "GetPublisherQosResponse must be 8 bytes");
 _Static_assert(sizeof(struct AddBridgeResponse) == 8, "AddBridgeResponse must be 8 bytes");
-_Static_assert(sizeof(struct CheckAndRequestBridgeShutdownResponse) == 4, "CheckAndRequestBridgeShutdownResponse must be 4 bytes");
+_Static_assert(
+  sizeof(struct CheckAndRequestBridgeShutdownResponse) == 4,
+  "CheckAndRequestBridgeShutdownResponse must be 4 bytes");
 #endif

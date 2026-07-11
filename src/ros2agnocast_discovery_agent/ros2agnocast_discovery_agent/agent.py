@@ -5,26 +5,25 @@ Reads the local Agnocast state via the existing NS-scoped ioctl wrapper
 ``/_agnocast_discovery`` so other namespaces and ECUs running ros2agnocast
 tooling can observe and make bridge generation decisions.
 
-One daemon process is intended to run per IPC namespace. To make duplicate
+One daemon process is intended to run per (IPC namespace, ROS_DOMAIN_ID):
+gossip is published on the agent's DDS domain, so a namespace shared by
+launches in different domains needs one agent per domain. To make duplicate
 launches (e.g. one node spawning the agent and another ``ros2 launch``
-session also trying to spawn one) safe, the agent acquires an
-``flock(2)``-based singleton lock on a per-IPC-namespace file before
-starting; subsequent instances detect the held lock and stay idle on
-``signal.pause()`` until terminated, so they don't disturb the launch
-tree they belong to.
+session also trying to spawn one) safe, the agent claims a singleton slot in
+the kernel module (the ``add_discovery_agent`` ioctl) before starting;
+subsequent instances in the same (ns, domain) lose the claim and exit
+cleanly (code 0), leaving exactly one live agent per (ns, domain). The
+kmod is the single source of truth for agent liveness, so the idle self-exit
+is decided atomically against new processes and can never orphan a namespace
+(a process starting during the grace period keeps the agent running).
 """
 
 import ctypes
-from dataclasses import dataclass
-from enum import Enum
-import fcntl
 import importlib.metadata
 import logging
 import os
-import signal
 import socket
 import sys
-from typing import IO
 import uuid
 
 import rclpy
@@ -41,6 +40,7 @@ from ros2agnocast_discovery_msgs.msg import (
     AgnocastTopic,
 )
 
+from . import bridge_decider
 from .type_registry import TypeRegistryReader
 
 
@@ -61,6 +61,40 @@ TOPIC_NAME_BUFFER_SIZE = 256
 # being refreshed before we drop it. Matches the gossip Liveliness lease so
 # DDS-side liveliness loss and local prune happen on the same timescale.
 REMOTE_STATE_STALE_SEC = 30.0
+# Opt-in idle-exit (--exit-when-idle CLI flag or the env var): the agent exits
+# after its (IPC NS, domain) has had no Agnocast node for EXIT_WHEN_IDLE_GRACE_SEC.
+# Off by default, so a launch-started agent runs until the launch stops it.
+EXIT_WHEN_IDLE_FLAG = '--exit-when-idle'
+EXIT_WHEN_IDLE_ENV = 'AGNOCAST_DISCOVERY_AGENT_EXIT_WHEN_IDLE'
+EXIT_WHEN_IDLE_GRACE_SEC = 30.0
+
+
+def _exit_when_idle_enabled(argv=None) -> bool:
+    if argv is None:
+        argv = sys.argv
+    if EXIT_WHEN_IDLE_FLAG in argv:
+        return True
+    return os.environ.get(EXIT_WHEN_IDLE_ENV, '').strip().lower() in ('1', 'true', 'yes')
+
+
+class IdleExitTracker:
+    """Reports idle after ``threshold`` consecutive idle ticks.
+
+    ``update()`` returns True on every idle tick at or beyond the threshold
+    (on every such tick, not just the first); a single non-idle tick resets the
+    count, so a brief gap (e.g. a node restarting) does not trigger an exit.
+    """
+
+    def __init__(self, threshold: int):
+        self._threshold = max(1, threshold)
+        self._idle_count = 0
+
+    def update(self, is_idle: bool) -> bool:
+        self._idle_count = self._idle_count + 1 if is_idle else 0
+        return self._idle_count >= self._threshold
+
+    def reset(self) -> None:
+        self._idle_count = 0
 
 
 class TopicInfoRet(ctypes.Structure):
@@ -79,20 +113,34 @@ def _load_ioctl_wrapper():
     """Load libagnocast_ioctl_wrapper.so and set argtypes for the symbols we use."""
     lib = ctypes.CDLL('libagnocast_ioctl_wrapper.so')
 
-    lib.get_agnocast_topics.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.get_agnocast_topics.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32)),
+    ]
     lib.get_agnocast_topics.restype = ctypes.POINTER(ctypes.POINTER(ctypes.c_char))
     lib.free_agnocast_topics.argtypes = [
         ctypes.POINTER(ctypes.POINTER(ctypes.c_char)),
         ctypes.c_int,
     ]
     lib.free_agnocast_topics.restype = None
+    lib.free_agnocast_topic_domains.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+    lib.free_agnocast_topic_domains.restype = None
 
-    lib.get_agnocast_sub_nodes.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    lib.get_agnocast_sub_nodes.argtypes = [
+        ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_uint32]
     lib.get_agnocast_sub_nodes.restype = ctypes.POINTER(TopicInfoRet)
-    lib.get_agnocast_pub_nodes.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    lib.get_agnocast_pub_nodes.argtypes = [
+        ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_uint32]
     lib.get_agnocast_pub_nodes.restype = ctypes.POINTER(TopicInfoRet)
     lib.free_agnocast_topic_info_ret.argtypes = [ctypes.POINTER(TopicInfoRet)]
     lib.free_agnocast_topic_info_ret.restype = None
+
+    lib.agnocast_discovery_agent_register.argtypes = [ctypes.c_uint32]
+    lib.agnocast_discovery_agent_register.restype = ctypes.c_int
+    lib.agnocast_discovery_agent_should_exit.argtypes = [ctypes.c_uint32]
+    lib.agnocast_discovery_agent_should_exit.restype = ctypes.c_int
+    lib.agnocast_discovery_agent_commit_exit.argtypes = [ctypes.c_uint32]
+    lib.agnocast_discovery_agent_commit_exit.restype = ctypes.c_int
 
     return lib
 
@@ -122,16 +170,28 @@ def _ioctl_to_endpoint(
     return ep
 
 
-def read_local_topics(lib, registry: TypeRegistryReader | None = None) -> list:
+def read_local_topics(
+        lib, registry: TypeRegistryReader | None = None,
+        own_domain_id: int | None = None) -> list:
     """Snapshot the current namespace's Agnocast topics via the ioctl wrapper.
 
     Returns a list of AgnocastTopic msgs. The ioctl returns only the caller's
     IPC namespace, so the daemon process just being inside that namespace is
     sufficient to scope the result. The optional ``registry`` argument
     supplies the type names and pids that the ioctl does not expose.
+
+    When ``own_domain_id`` is given, only topics in that domain are returned.
+    Each agent is per-(IPC namespace, domain) and gossips on its own DDS domain,
+    so it must report only its own domain's topics; otherwise it would leak
+    other domains' endpoints onto its channel and let its bridge decider issue
+    requests for domains it does not own.
     """
     topic_count = ctypes.c_int()
-    topic_names_ptr = lib.get_agnocast_topics(ctypes.byref(topic_count))
+    # The wrapper allocates the domain array (sized to match the name buffer) and
+    # returns it here; we own it and free it below.
+    domain_ids_ptr = ctypes.POINTER(ctypes.c_uint32)()
+    topic_names_ptr = lib.get_agnocast_topics(
+        ctypes.byref(topic_count), ctypes.pointer(domain_ids_ptr))
     topics = []
     if not topic_names_ptr:
         return topics
@@ -140,15 +200,22 @@ def read_local_topics(lib, registry: TypeRegistryReader | None = None) -> list:
         for i in range(topic_count.value):
             topic_name_b = ctypes.cast(topic_names_ptr[i], ctypes.c_char_p).value
             topic_name = topic_name_b.decode('utf-8', errors='replace')
+            # The same topic name can occur once per domain; each row is a
+            # distinct (name, domain) pair that becomes its own AgnocastTopic.
+            domain_id = domain_ids_ptr[i]
+            if own_domain_id is not None and domain_id != own_domain_id:
+                continue
 
             agnocast_topic = AgnocastTopic()
             agnocast_topic.topic_name = topic_name
             agnocast_topic.type_name = ''
-            agnocast_topic.domain_id = 0
+            agnocast_topic.domain_id = domain_id
             agnocast_topic.publishers = _collect_endpoints(
-                lib.get_agnocast_pub_nodes, lib, topic_name_b, topic_name, 'pub', registry)
+                lib.get_agnocast_pub_nodes, lib, topic_name_b, topic_name, domain_id, 'pub',
+                registry)
             agnocast_topic.subscribers = _collect_endpoints(
-                lib.get_agnocast_sub_nodes, lib, topic_name_b, topic_name, 'sub', registry)
+                lib.get_agnocast_sub_nodes, lib, topic_name_b, topic_name, domain_id, 'sub',
+                registry)
             # Type name comes from the tmpfs registry; any registered
             # endpoint on this topic carries the same type (ROS 2
             # invariant), so the first non-empty one wins.
@@ -159,6 +226,7 @@ def read_local_topics(lib, registry: TypeRegistryReader | None = None) -> list:
             topics.append(agnocast_topic)
     finally:
         lib.free_agnocast_topics(topic_names_ptr, topic_count.value)
+        lib.free_agnocast_topic_domains(domain_ids_ptr)
 
     return topics
 
@@ -177,10 +245,10 @@ def _resolve_topic_type(
 
 
 def _collect_endpoints(
-        getter, lib, topic_name_b: bytes, topic_name: str, role: str,
+        getter, lib, topic_name_b: bytes, topic_name: str, domain_id: int, role: str,
         registry: TypeRegistryReader | None = None) -> list:
     count = ctypes.c_int()
-    array = getter(topic_name_b, ctypes.byref(count))
+    array = getter(topic_name_b, ctypes.byref(count), domain_id)
     endpoints = []
     if not array:
         return endpoints
@@ -211,57 +279,21 @@ def _read_ipc_ns_inode() -> int:
     return os.stat(SELF_IPC_NS_PATH).st_ino
 
 
-def _singleton_lock_path(ipc_ns_inode: int) -> str:
-    """Return the singleton lock-file path for this IPC namespace.
-
-    Co-located with the rest of Agnocast tmpfs state so a container
-    overriding ``AGNOCAST_TMPFS_DIR`` keeps the lock under the same root.
-    """
-    root = os.environ.get('AGNOCAST_TMPFS_DIR') or '/dev/shm'
-    return os.path.join(root, f'agnocast_discovery_agent_{ipc_ns_inode}.lock')
-
-
-class LockStatus(Enum):
-    ACQUIRED = 'acquired'   # we got the lock
-    HELD = 'held'           # another agent in this NS holds it — caller should idle
-    ERROR = 'error'         # could not even open the lock file — caller should exit non-zero
-
-
-@dataclass
-class SingletonLockAttempt:
-    """Result of trying to acquire the per-NS singleton lock.
-
-    ``file`` is set only when ``status == ACQUIRED`` — the caller keeps the
-    reference alive so the ``flock(2)`` outlives the spin loop.
-    """
-    status: LockStatus
-    file: IO | None = None
-
-
-def _try_acquire_singleton_lock(ipc_ns_inode: int) -> SingletonLockAttempt:
-    """Try to take an exclusive ``flock(2)`` on the per-IPC-namespace lock file."""
-    lock_path = _singleton_lock_path(ipc_ns_inode)
+def _read_ros_domain_id() -> int:
+    """Return ROS_DOMAIN_ID from the environment (0 if unset, empty,
+    unparsable, or outside the uint32 range), matching ROS 2's default and
+    the kmod's get_ros_domain_id. An out-of-range value must not slip through:
+    it would wrap into an unintended domain when passed via the uint32 ioctl."""
+    raw = os.environ.get('ROS_DOMAIN_ID')
+    if not raw:
+        return 0
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
-    except OSError as e:
-        sys.stderr.write(
-            f'agnocast_discovery_agent: cannot open singleton lock {lock_path}: {e}\n')
-        return SingletonLockAttempt(LockStatus.ERROR)
-    lock_file = os.fdopen(fd, 'r+')
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        # Contention: another agent in this NS holds the lock.
-        lock_file.close()
-        return SingletonLockAttempt(LockStatus.HELD)
-    except OSError as e:
-        # Real failure (permission denied, ENOTSUP on the FS, etc.) — surface
-        # it rather than masking it as "already running".
-        sys.stderr.write(
-            f'agnocast_discovery_agent: flock({lock_path}) failed: {e}\n')
-        lock_file.close()
-        return SingletonLockAttempt(LockStatus.ERROR)
-    return SingletonLockAttempt(LockStatus.ACQUIRED, file=lock_file)
+        value = int(raw)
+    except ValueError:
+        return 0
+    if value < 0 or value > 0xFFFFFFFF:
+        return 0
+    return value
 
 
 def _gossip_qos() -> QoSProfile:
@@ -290,21 +322,27 @@ class DiscoveryAgent(Node):
     """rclpy Node that publishes the local Agnocast state every PUBLISH_INTERVAL_SEC.
 
     Also subscribes to its own gossip topic and caches the latest snapshot per
-    ``(host_uuid, ipc_ns_inode)`` — exposed through ``remote_states`` for
-    future consumers (e.g. cross-NS decision logic added in a follow-up PR).
+    ``(host_uuid, ipc_ns_inode)``; each tick the bridge decider diffs that
+    against the local state and issues cross-NS bridge requests.
     """
 
-    def __init__(self, registry: TypeRegistryReader | None = None):
+    def __init__(
+        self,
+        registry: TypeRegistryReader | None = None,
+        *,
+        exit_when_idle: bool | None = None,
+    ):
         self._host_uuid = _read_host_uuid()
         self._host_hostname = socket.gethostname()
         self._ipc_ns_inode = _read_ipc_ns_inode()
-        # Multiple agents may run on one ECU (one per IPC NS); disambiguate.
+        self._domain_id = _read_ros_domain_id()
+        # Multiple agents may run on one ECU (one per (IPC NS, domain)); disambiguate.
         host_short = self._host_uuid.replace('-', '')[:8]
         # Force use_sim_time=False so the 1 Hz timer + clock reads are
         # wall-clock regardless of /clock; sim-time playback would otherwise
         # stretch the publish cadence past the liveliness lease window.
         super().__init__(
-            f'agnocast_discovery_agent_{host_short}_{self._ipc_ns_inode}',
+            f'agnocast_discovery_agent_{host_short}_{self._ipc_ns_inode}_d{self._domain_id}',
             parameter_overrides=[Parameter('use_sim_time', value=False)],
         )
         self._lib = _load_ioctl_wrapper()
@@ -321,6 +359,12 @@ class DiscoveryAgent(Node):
             AgnocastDaemonState, GOSSIP_TOPIC, self._on_remote_state, qos)
         self._remote_states = {}
 
+        if exit_when_idle is None:
+            exit_when_idle = _exit_when_idle_enabled()
+        self._exit_when_idle = exit_when_idle
+        self._idle_tracker = IdleExitTracker(
+            threshold=round(EXIT_WHEN_IDLE_GRACE_SEC / PUBLISH_INTERVAL_SEC))
+
         self._timer = self.create_timer(PUBLISH_INTERVAL_SEC, self._on_tick)
 
         self.get_logger().info(
@@ -332,7 +376,31 @@ class DiscoveryAgent(Node):
         self._registry.rebuild()
         self._registry.cleanup_dead_pids()
         self._prune_stale_remote_states()
-        self.publish_snapshot()
+        snapshot = self.publish_snapshot()
+        self._dispatch_bridge_requests(snapshot)
+        if self._exit_when_idle:
+            self._maybe_exit_when_idle()
+
+    def _maybe_exit_when_idle(self) -> None:
+        """Exit once this (IPC NS, domain) has had no Agnocast node for the grace period.
+
+        A query error counts as "not idle", so a transient failure never exits. When the grace
+        period elapses the exit is gated on the kmod's atomic commit, which only deregisters (and
+        clears us to exit) if the domain is still empty -- so a process that started during the
+        grace period vetoes the exit and the agent keeps serving it instead of orphaning it.
+        """
+        ret = self._lib.agnocast_discovery_agent_should_exit(self._domain_id)
+        if ret < 0:
+            self._idle_tracker.reset()
+            return
+        if self._idle_tracker.update(ret == 1):
+            if self._lib.agnocast_discovery_agent_commit_exit(self._domain_id) == 1:
+                self.get_logger().info(
+                    f'no Agnocast node in (ipc_ns={self._ipc_ns_inode}, domain={self._domain_id}) '
+                    f'for {EXIT_WHEN_IDLE_GRACE_SEC:.0f}s; exiting.')
+                raise ExternalShutdownException()
+            # A process raced in during the grace period; the kmod vetoed the exit.
+            self._idle_tracker.reset()
 
     def _prune_stale_remote_states(
             self, now_sec: float | None = None,
@@ -352,10 +420,20 @@ class DiscoveryAgent(Node):
         for key in stale_keys:
             del self._remote_states[key]
 
-    def publish_snapshot(self) -> None:
+    def publish_snapshot(self) -> AgnocastDaemonState:
         """Build and publish the current local AgnocastDaemonState."""
         msg = self.build_state()
         self._pub.publish(msg)
+        return msg
+
+    def _dispatch_bridge_requests(self, local_state: AgnocastDaemonState) -> None:
+        if not self._remote_states:
+            return
+        remote_states = {key: msg for key, (msg, _received_at) in self._remote_states.items()}
+        requests = bridge_decider.decide_bridges(local_state, remote_states)
+        if requests:
+            bridge_decider.dispatch_requests(
+                requests, self._ipc_ns_inode, logger=self.get_logger())
 
     def build_state(self) -> AgnocastDaemonState:
         msg = AgnocastDaemonState()
@@ -364,7 +442,7 @@ class DiscoveryAgent(Node):
         msg.host_uuid = self._host_uuid
         msg.host_hostname = self._host_hostname
         msg.ipc_ns_inode = self._ipc_ns_inode
-        msg.topics = read_local_topics(self._lib, self._registry)
+        msg.topics = read_local_topics(self._lib, self._registry, self._domain_id)
         return msg
 
     def _on_remote_state(self, msg: AgnocastDaemonState) -> None:
@@ -380,34 +458,33 @@ class DiscoveryAgent(Node):
 
 
 def main(argv=None) -> int:
-    # Singleton check before DDS / ioctl bring-up so duplicate launches stay
-    # passive instead of polluting the gossip topic or hammering the kmod.
+    # Claim the per-(IPC namespace, domain) singleton in the kmod before any DDS / ioctl work.
+    # The kmod decides the claim atomically, so a duplicate loses and exits cleanly (0); an
+    # ioctl error exits 1.
     #
-    # Duplicates DO NOT exit early: launch supervisors (especially
-    # `launch_test` running parallel sample-app tests) treat a Node exit as a
-    # process-died event and propagate teardown to the rest of the launch
-    # tree. So when the lock is held, we sit idle on `signal.pause()` —
-    # SIGINT / SIGTERM still tears the duplicate down cleanly with the rest
-    # of its parent launch.
-    ipc_ns_inode = _read_ipc_ns_inode()
-    lock_attempt = _try_acquire_singleton_lock(ipc_ns_inode)
-    if lock_attempt.status == LockStatus.HELD:
+    # A duplicate that exits early *could* make launch_test treat it as a crashed node and tear
+    # down the launch tree. That's not a risk here: the launch emits one agent per tree, so a lost
+    # claim always means a separate launch/run — never a same-tree sibling — which exiting can't
+    # affect.
+    domain_id = _read_ros_domain_id()
+    try:
+        lib = _load_ioctl_wrapper()
+        claim = lib.agnocast_discovery_agent_register(domain_id)
+    except (OSError, AttributeError) as e:
+        # Missing library or symbol (e.g. version skew): fail cleanly instead of a traceback.
+        sys.stderr.write(f'agnocast_discovery_agent: cannot use the ioctl wrapper: {e}\n')
+        return 1
+    if claim == 1:
         sys.stderr.write(
-            f'agnocast_discovery_agent: another instance is already running in this '
-            f'IPC namespace (inode={ipc_ns_inode}); staying idle.\n')
-        try:
-            while True:
-                signal.pause()
-        except KeyboardInterrupt:
-            pass
+            'agnocast_discovery_agent: another instance is already running in this '
+            f'(IPC namespace, domain={domain_id}); exiting.\n')
         return 0
-    if lock_attempt.status == LockStatus.ERROR:
-        # Don't masquerade as "already running" — propagate failure so
-        # supervisors can detect it.
+    if claim < 0:
+        # Don't masquerade as "already running" — propagate failure so supervisors can detect it.
         return 1
 
     rclpy.init(args=argv)
-    node = DiscoveryAgent()
+    node = DiscoveryAgent(exit_when_idle=_exit_when_idle_enabled(argv))
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
@@ -416,9 +493,6 @@ def main(argv=None) -> int:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        # Keep `lock_attempt` referenced through shutdown so the flock
-        # outlives the spin() loop.
-        del lock_attempt
     return 0
 
 

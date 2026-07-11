@@ -67,8 +67,6 @@ This reflects the current status, and support is expected to expand in the futur
 | Linux Distribution | Ubuntu 22.04 (Jammy) / Ubuntu 24.04 (Noble)                 |
 | Linux Kernel       | 5.x / 6.x series (detailed version matrix not yet available) |
 
-> **Warning**: Agnocast service/client is not officially supported yet and the API may change in the future. Use at your own risk.
-
 ---
 
 ## For Users
@@ -202,7 +200,6 @@ rm /dev/shm/agnocast@*
 
 # Remove leftover message queues
 rm /dev/mqueue/agnocast@*
-rm /dev/mqueue/agnocast_bridge_manager@*
 ```
 
 If you encounter `mq_open failed: No space left on device`, the system has reached the maximum number of message queues. Run the cleanup commands above, and if the error persists, increase the system-wide `queues_max` limit (e.g., `sudo sysctl -w fs.mqueue.queues_max=1024`). See [System Configuration](https://autowarefoundation.github.io/agnocast_doc/environment-setup/configuration/) for details.

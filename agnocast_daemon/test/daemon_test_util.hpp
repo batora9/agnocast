@@ -88,6 +88,8 @@ public:
     std::strncpy(dst, src, sizeof(dst) - 1);
   }
 
+  static TopicKey topic_key(const char * topic) { return TopicKey{topic, 0}; }
+
   int add_process(
     pid_t pid, uint64_t * shm_addr = nullptr, uint64_t * shm_size = nullptr,
     bool is_performance_bridge_manager = false)
@@ -180,30 +182,33 @@ public:
 
   int topic_entries_num(const char * topic) const
   {
-    auto it = store_.topic_map_.find(topic);
+    auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return 0;
     return static_cast<int>(it->second->topic.entries.size());
   }
 
-  bool topic_exists(const char * topic) const { return store_.topic_map_.count(topic) > 0; }
+  bool topic_exists(const char * topic) const
+  {
+    return store_.topic_map_.count(topic_key(topic)) > 0;
+  }
 
   bool publisher_exists(const char * topic, int32_t id) const
   {
-    auto it = store_.topic_map_.find(topic);
+    auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return false;
     return it->second->topic.pub_info_map.count(id) > 0;
   }
 
   bool subscriber_exists(const char * topic, int32_t id) const
   {
-    auto it = store_.topic_map_.find(topic);
+    auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return false;
     return it->second->topic.sub_info_map.count(id) > 0;
   }
 
   int64_t latest_received_entry_id(const char * topic, int32_t sub_id) const
   {
-    auto it = store_.topic_map_.find(topic);
+    auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return -2;
     auto sit = it->second->topic.sub_info_map.find(sub_id);
     if (sit == it->second->topic.sub_info_map.end()) return -2;
@@ -212,7 +217,7 @@ public:
 
   int entry_rc(const char * topic, int64_t entry_id, int32_t sub_id) const
   {
-    auto it = store_.topic_map_.find(topic);
+    auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return -1;
     auto eit = it->second->topic.entries.find(entry_id);
     if (eit == it->second->topic.entries.end()) return -1;

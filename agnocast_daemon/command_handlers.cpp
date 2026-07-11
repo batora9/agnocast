@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "command_handlers.hpp"
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <shared_mutex>
 #include <string>
 #include <vector>
-
-#include <sys/socket.h>
-#include <unistd.h>
 
 #ifndef AGNOCAST_VERSION
 #define AGNOCAST_VERSION "2.3.4"
@@ -68,6 +68,7 @@ int insert_subscriber_info(
   const int32_t new_id = wrapper->topic.current_pubsub_id++;
   SubscriberInfo info;
   info.id = new_id;
+  info.domain_id = wrapper->domain_id;
   info.pid = subscriber_pid;
   info.qos_depth = qos_depth;
   info.qos_is_transient_local = qos_is_transient_local;
@@ -100,6 +101,7 @@ int insert_publisher_info(
   const int32_t new_id = wrapper->topic.current_pubsub_id++;
   PublisherInfo info;
   info.id = new_id;
+  info.domain_id = wrapper->domain_id;
   info.pid = publisher_pid;
   info.node_name = node_name;
   info.qos_depth = qos_depth;
@@ -246,9 +248,9 @@ void cleanup_unreferenced_entries_from_exited_publishers(
   }
 }
 
-void try_remove_empty_topic(MetadataStore & store, const std::string & topic_name)
+void try_remove_empty_topic(MetadataStore & store, const TopicKey & key)
 {
-  auto it = store.topic_map_.find(topic_name);
+  auto it = store.topic_map_.find(key);
   if (it == store.topic_map_.end()) return;
   TopicWrapper * wrapper = it->second.get();
   if (!wrapper->topic.pub_info_map.empty() || !wrapper->topic.sub_info_map.empty()) return;
@@ -256,16 +258,36 @@ void try_remove_empty_topic(MetadataStore & store, const std::string & topic_nam
   store.topic_map_.erase(it);
 }
 
+const char * notify_mq_topic_name(const TopicWrapper * wrapper)
+{
+  // Without a domain-bridge rename rule, the canonical MQ topic name equals the wrapper key.
+  return wrapper->key.c_str();
+}
+
 int get_process_num(const MetadataStore & store)
 {
   return static_cast<int>(store.proc_info_map_.size());
 }
 
-bool has_alive_performance_bridge_manager(const MetadataStore & store)
+int get_process_num_in_domain(const MetadataStore & store, uint32_t domain_id)
+{
+  int count = 0;
+  for (const auto & [pid, proc] : store.proc_info_map_) {
+    (void)pid;
+    if (!proc.exited && proc.domain_id == domain_id) {
+      count++;
+    }
+  }
+  return count;
+}
+
+bool has_alive_performance_bridge_manager(const MetadataStore & store, uint32_t domain_id)
 {
   for (const auto & [pid, proc] : store.proc_info_map_) {
     (void)pid;
-    if (proc.is_performance_bridge_manager && !proc.exited) return true;
+    if (proc.domain_id == domain_id && proc.is_performance_bridge_manager && !proc.exited) {
+      return true;
+    }
   }
   return false;
 }
@@ -323,10 +345,10 @@ void CommandHandlers::dispatch(
       handle_add_publisher(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_RELEASE_SUB_REF:
-      handle_release_sub_ref(client_fd, payload);
+      handle_release_sub_ref(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_PUBLISH_MSG:
-      handle_publish_msg(client_fd, payload);
+      handle_publish_msg(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_RECEIVE_MSG:
       handle_receive_msg(client_fd, client_pid, payload);
@@ -341,10 +363,10 @@ void CommandHandlers::dispatch(
       handle_get_exit_process(client_fd);
       break;
     case AGNOCAST_CMD_GET_SUBSCRIBER_QOS:
-      handle_get_subscriber_qos(client_fd, payload);
+      handle_get_subscriber_qos(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_GET_PUBLISHER_QOS:
-      handle_get_publisher_qos(client_fd, payload);
+      handle_get_publisher_qos(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_ADD_BRIDGE:
       handle_add_bridge(client_fd, client_pid, payload);
@@ -353,13 +375,13 @@ void CommandHandlers::dispatch(
       handle_remove_bridge(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_GET_PUBLISHER_NUM:
-      handle_get_publisher_num(client_fd, payload);
+      handle_get_publisher_num(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_REMOVE_SUBSCRIBER:
-      handle_remove_subscriber(client_fd, payload);
+      handle_remove_subscriber(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_REMOVE_PUBLISHER:
-      handle_remove_publisher(client_fd, payload);
+      handle_remove_publisher(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN:
       handle_check_and_request_bridge_shutdown(client_fd, client_pid);
@@ -368,22 +390,22 @@ void CommandHandlers::dispatch(
       handle_get_topic_list(client_fd);
       break;
     case AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO:
-      handle_get_topic_subscriber_info(client_fd, payload);
+      handle_get_topic_subscriber_info(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_GET_TOPIC_PUBLISHER_INFO:
-      handle_get_topic_publisher_info(client_fd, payload);
+      handle_get_topic_publisher_info(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_GET_NODE_SUBSCRIBER_TOPICS:
-      handle_get_node_subscriber_topics(client_fd, payload);
+      handle_get_node_subscriber_topics(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_GET_NODE_PUBLISHER_TOPICS:
-      handle_get_node_publisher_topics(client_fd, payload);
+      handle_get_node_publisher_topics(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM:
-      handle_set_ros2_subscriber_num(client_fd, payload);
+      handle_set_ros2_subscriber_num(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM:
-      handle_set_ros2_publisher_num(client_fd, payload);
+      handle_set_ros2_publisher_num(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN:
       handle_notify_bridge_shutdown(client_fd, client_pid);
@@ -418,7 +440,9 @@ void CommandHandlers::handle_add_process(int fd, pid_t pid, const void * payload
 
   AddProcessResponse resp{};
   resp.unlink_daemon_exist = (get_process_num(store_) > 0);
-  resp.performance_bridge_daemon_exist = has_alive_performance_bridge_manager(store_);
+  resp.performance_bridge_daemon_exist =
+    has_alive_performance_bridge_manager(store_, req->domain_id);
+  resp.discovery_agent_exist = false;
 
   if (req->is_performance_bridge_manager && resp.performance_bridge_daemon_exist) {
     send_response(fd, 0, &resp, sizeof(resp));
@@ -428,6 +452,7 @@ void CommandHandlers::handle_add_process(int fd, pid_t pid, const void * payload
   ProcessInfo proc;
   proc.exited = false;
   proc.is_performance_bridge_manager = req->is_performance_bridge_manager;
+  proc.domain_id = req->domain_id;
   proc.pid = pid;
   proc.mempool_entry = allocator_.assign_memory(pid);
   if (!proc.mempool_entry) {
@@ -451,7 +476,7 @@ void CommandHandlers::handle_add_subscriber(int fd, pid_t pid, const void * payl
   const auto * req = static_cast<const AddSubscriberRequest *>(payload);
 
   std::unique_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_or_create_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
 
   SubscriberInfo * sub_info = nullptr;
   const int ret = insert_subscriber_info(
@@ -464,6 +489,8 @@ void CommandHandlers::handle_add_subscriber(int fd, pid_t pid, const void * payl
 
   AddSubscriberResponse resp{};
   resp.subscriber_id = sub_info->id;
+  strncpy(
+    resp.mq_topic_name, notify_mq_topic_name(wrapper), AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
@@ -476,7 +503,7 @@ void CommandHandlers::handle_add_publisher(int fd, pid_t pid, const void * paylo
   const auto * req = static_cast<const AddPublisherRequest *>(payload);
 
   std::unique_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_or_create_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
 
   PublisherInfo * pub_info = nullptr;
   const int ret = insert_publisher_info(
@@ -494,10 +521,12 @@ void CommandHandlers::handle_add_publisher(int fd, pid_t pid, const void * paylo
 
   AddPublisherResponse resp{};
   resp.publisher_id = pub_info->id;
+  strncpy(
+    resp.mq_topic_name, notify_mq_topic_name(wrapper), AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_release_sub_ref(int fd, const void * payload)
+void CommandHandlers::handle_release_sub_ref(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -506,7 +535,7 @@ void CommandHandlers::handle_release_sub_ref(int fd, const void * payload)
   const auto * req = static_cast<const ReleaseSubRefRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -519,7 +548,9 @@ void CommandHandlers::handle_release_sub_ref(int fd, const void * payload)
     return;
   }
 
-  if (req->pubsub_id < 0 || req->pubsub_id >= static_cast<int32_t>(AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID)) {
+  if (
+    req->pubsub_id < 0 ||
+    req->pubsub_id >= static_cast<int32_t>(AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID)) {
     send_response(fd, EINVAL);
     return;
   }
@@ -533,7 +564,7 @@ void CommandHandlers::handle_release_sub_ref(int fd, const void * payload)
   send_response(fd, 0);
 }
 
-void CommandHandlers::handle_publish_msg(int fd, const void * payload)
+void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -542,7 +573,7 @@ void CommandHandlers::handle_publish_msg(int fd, const void * payload)
   const auto * req = static_cast<const PublishMsgRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -596,7 +627,7 @@ void CommandHandlers::handle_publish_msg(int fd, const void * payload)
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_receive_msg(int fd, pid_t /*pid*/, const void * payload)
+void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -605,7 +636,7 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t /*pid*/, const void * pay
   const auto * req = static_cast<const ReceiveMsgRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -642,7 +673,7 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t /*pid*/, const void * pay
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_take_msg(int fd, pid_t /*pid*/, const void * payload)
+void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -651,7 +682,7 @@ void CommandHandlers::handle_take_msg(int fd, pid_t /*pid*/, const void * payloa
   const auto * req = static_cast<const TakeMsgRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -741,7 +772,7 @@ void CommandHandlers::handle_get_subscriber_num(int fd, pid_t pid, const void * 
   GetSubscriberNumResponse resp{};
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, 0, &resp, sizeof(resp));
     return;
@@ -822,7 +853,7 @@ void CommandHandlers::handle_get_exit_process(int fd)
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_subscriber_qos(int fd, const void * payload)
+void CommandHandlers::handle_get_subscriber_qos(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -831,7 +862,7 @@ void CommandHandlers::handle_get_subscriber_qos(int fd, const void * payload)
   const auto * req = static_cast<const GetSubscriberQosRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -851,7 +882,7 @@ void CommandHandlers::handle_get_subscriber_qos(int fd, const void * payload)
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_publisher_qos(int fd, const void * payload)
+void CommandHandlers::handle_get_publisher_qos(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -860,7 +891,7 @@ void CommandHandlers::handle_get_publisher_qos(int fd, const void * payload)
   const auto * req = static_cast<const GetPublisherQosRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -954,7 +985,7 @@ void CommandHandlers::handle_remove_bridge(int fd, pid_t pid, const void * paylo
   send_response(fd, 0);
 }
 
-void CommandHandlers::handle_get_publisher_num(int fd, const void * payload)
+void CommandHandlers::handle_get_publisher_num(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -965,7 +996,7 @@ void CommandHandlers::handle_get_publisher_num(int fd, const void * payload)
   GetPublisherNumResponse resp{};
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, 0, &resp, sizeof(resp));
     return;
@@ -991,7 +1022,7 @@ void CommandHandlers::handle_get_publisher_num(int fd, const void * payload)
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_remove_subscriber(int fd, const void * payload)
+void CommandHandlers::handle_remove_subscriber(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1000,7 +1031,7 @@ void CommandHandlers::handle_remove_subscriber(int fd, const void * payload)
   const auto * req = static_cast<const RemoveSubscriberRequest *>(payload);
 
   std::unique_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -1014,11 +1045,11 @@ void CommandHandlers::handle_remove_subscriber(int fd, const void * payload)
 
   wrapper->topic.sub_info_map.erase(req->subscriber_id);
   cleanup_unreferenced_entries_from_exited_publishers(wrapper, req->subscriber_id, store_);
-  try_remove_empty_topic(store_, req->topic_name);
+  try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
   send_response(fd, 0);
 }
 
-void CommandHandlers::handle_remove_publisher(int fd, const void * payload)
+void CommandHandlers::handle_remove_publisher(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1027,7 +1058,7 @@ void CommandHandlers::handle_remove_publisher(int fd, const void * payload)
   const auto * req = static_cast<const RemovePublisherRequest *>(payload);
 
   std::unique_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, EINVAL);
     return;
@@ -1055,7 +1086,7 @@ void CommandHandlers::handle_remove_publisher(int fd, const void * payload)
   if (pub_info->entries_num == 0) {
     wrapper->topic.pub_info_map.erase(req->publisher_id);
   }
-  try_remove_empty_topic(store_, req->topic_name);
+  try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
   send_response(fd, 0);
 }
 
@@ -1064,8 +1095,9 @@ void CommandHandlers::handle_check_and_request_bridge_shutdown(int fd, pid_t pid
   CheckAndRequestBridgeShutdownResponse resp{};
 
   std::unique_lock glock(store_.global_mutex_);
-  if (get_process_num(store_) <= 1) {
-    ProcessInfo * proc = store_.find_process(pid);
+  ProcessInfo * proc = store_.find_process(pid);
+  const uint32_t domain_id = proc ? proc->domain_id : 0;
+  if (get_process_num_in_domain(store_, domain_id) <= 1) {
     if (proc) proc->is_performance_bridge_manager = false;
     resp.should_shutdown = true;
   } else {
@@ -1080,21 +1112,21 @@ void CommandHandlers::handle_get_topic_list(int fd)
   resp.topic_num = 0;
 
   std::shared_lock glock(store_.global_mutex_);
-  for (const auto & [name, wrapper] : store_.topic_map_) {
+  for (const auto & [key, wrapper] : store_.topic_map_) {
     (void)wrapper;
     if (resp.topic_num >= AGNOCAST_PROTO_MAX_TOPIC_NUM) {
       send_response(fd, ENOBUFS);
       return;
     }
     strncpy(
-      resp.topic_names[resp.topic_num], name.c_str(),
+      resp.topic_names[resp.topic_num], key.name.c_str(),
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
     resp.topic_num++;
   }
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_topic_subscriber_info(int fd, const void * payload)
+void CommandHandlers::handle_get_topic_subscriber_info(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1106,7 +1138,7 @@ void CommandHandlers::handle_get_topic_subscriber_info(int fd, const void * payl
   resp.entry_num = 0;
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, 0, &resp, sizeof(resp));
     return;
@@ -1132,7 +1164,7 @@ void CommandHandlers::handle_get_topic_subscriber_info(int fd, const void * payl
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_topic_publisher_info(int fd, const void * payload)
+void CommandHandlers::handle_get_topic_publisher_info(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1144,7 +1176,7 @@ void CommandHandlers::handle_get_topic_publisher_info(int fd, const void * paylo
   resp.entry_num = 0;
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, 0, &resp, sizeof(resp));
     return;
@@ -1170,7 +1202,7 @@ void CommandHandlers::handle_get_topic_publisher_info(int fd, const void * paylo
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_node_subscriber_topics(int fd, const void * payload)
+void CommandHandlers::handle_get_node_subscriber_topics(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1182,7 +1214,7 @@ void CommandHandlers::handle_get_node_subscriber_topics(int fd, const void * pay
   resp.topic_num = 0;
 
   std::shared_lock glock(store_.global_mutex_);
-  for (const auto & [topic_name, wrapper_ptr] : store_.topic_map_) {
+  for (const auto & [key, wrapper_ptr] : store_.topic_map_) {
     TopicWrapper * wrapper = wrapper_ptr.get();
     std::shared_lock tlock(wrapper->topic_rwsem);
     bool found = false;
@@ -1201,14 +1233,14 @@ void CommandHandlers::handle_get_node_subscriber_topics(int fd, const void * pay
       return;
     }
     strncpy(
-      resp.topic_names[resp.topic_num], topic_name.c_str(),
+      resp.topic_names[resp.topic_num], key.name.c_str(),
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
     resp.topic_num++;
   }
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_get_node_publisher_topics(int fd, const void * payload)
+void CommandHandlers::handle_get_node_publisher_topics(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1220,7 +1252,7 @@ void CommandHandlers::handle_get_node_publisher_topics(int fd, const void * payl
   resp.topic_num = 0;
 
   std::shared_lock glock(store_.global_mutex_);
-  for (const auto & [topic_name, wrapper_ptr] : store_.topic_map_) {
+  for (const auto & [key, wrapper_ptr] : store_.topic_map_) {
     TopicWrapper * wrapper = wrapper_ptr.get();
     std::shared_lock tlock(wrapper->topic_rwsem);
     bool found = false;
@@ -1239,14 +1271,14 @@ void CommandHandlers::handle_get_node_publisher_topics(int fd, const void * payl
       return;
     }
     strncpy(
-      resp.topic_names[resp.topic_num], topic_name.c_str(),
+      resp.topic_names[resp.topic_num], key.name.c_str(),
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
     resp.topic_num++;
   }
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_set_ros2_subscriber_num(int fd, const void * payload)
+void CommandHandlers::handle_set_ros2_subscriber_num(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1255,7 +1287,7 @@ void CommandHandlers::handle_set_ros2_subscriber_num(int fd, const void * payloa
   const auto * req = static_cast<const SetRos2SubscriberNumRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, ENOENT);
     return;
@@ -1266,7 +1298,7 @@ void CommandHandlers::handle_set_ros2_subscriber_num(int fd, const void * payloa
   send_response(fd, 0);
 }
 
-void CommandHandlers::handle_set_ros2_publisher_num(int fd, const void * payload)
+void CommandHandlers::handle_set_ros2_publisher_num(int fd, pid_t pid, const void * payload)
 {
   if (!payload) {
     send_response(fd, EINVAL);
@@ -1275,7 +1307,7 @@ void CommandHandlers::handle_set_ros2_publisher_num(int fd, const void * payload
   const auto * req = static_cast<const SetRos2PublisherNumRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
-  TopicWrapper * wrapper = store_.find_topic(req->topic_name);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
     send_response(fd, ENOENT);
     return;
@@ -1304,9 +1336,9 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
   proc_info->exited = true;
   allocator_.free_memory(pid);
 
-  std::vector<std::string> topics_to_remove;
+  std::vector<TopicKey> topics_to_remove;
 
-  for (auto & [topic_name, wrapper_ptr] : store_.topic_map_) {
+  for (auto & [key, wrapper_ptr] : store_.topic_map_) {
     TopicWrapper * wrapper = wrapper_ptr.get();
     std::unique_lock tlock(wrapper->topic_rwsem);
 
@@ -1337,7 +1369,7 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
 
       if (proc_info->exit_subscriptions.size() < AGNOCAST_PROTO_MAX_SUBSCRIPTION_NUM_PER_PROCESS) {
         ExitSubscriptionEntry entry;
-        entry.topic_name = topic_name;
+        entry.topic_name = key.name;
         entry.subscriber_id = sub_id;
         proc_info->exit_subscriptions.push_back(std::move(entry));
       }
@@ -1351,12 +1383,12 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
 
     if (wrapper->topic.pub_info_map.empty() && wrapper->topic.sub_info_map.empty()) {
       wrapper->topic.entries.clear();
-      topics_to_remove.push_back(topic_name);
+      topics_to_remove.push_back(key);
     }
   }
 
-  for (const auto & topic_name : topics_to_remove) {
-    store_.topic_map_.erase(topic_name);
+  for (const auto & key : topics_to_remove) {
+    store_.topic_map_.erase(key);
   }
 
   std::vector<std::string> bridges_to_remove;

@@ -27,7 +27,11 @@ public:
     rclcpp::Node::SharedPtr node, const std::string & topic_name, const std::string & message_type,
     const rclcpp::QoS & qos);
 
-  PerformanceServiceBridgeResult create_r2a_service_bridge(
+  ServiceBridgeEntity create_r2a_service_bridge(
+    rclcpp::Node::SharedPtr node, const std::string & service_name,
+    const std::string & service_type, const rclcpp::QoS & qos);
+
+  ServiceBridgeEntity create_a2r_service_bridge(
     rclcpp::Node::SharedPtr node, const std::string & service_name,
     const std::string & service_type, const rclcpp::QoS & qos);
 
@@ -37,9 +41,17 @@ private:
   // path -> handle
   std::unordered_map<std::string, void *> loaded_libraries_;
 
+  static PerformancePubsubBridgeResult create_r2a_pubsub_bridge_generic(
+    const rclcpp::Node::SharedPtr & node, const std::string & topic_name,
+    const std::string & message_type, const rclcpp::QoS & qos);
+
+  static PerformancePubsubBridgeResult create_a2r_pubsub_bridge_generic(
+    const rclcpp::Node::SharedPtr & node, const std::string & topic_name,
+    const std::string & message_type, const rclcpp::QoS & qos);
+
   static std::string convert_type_to_snake_case(const std::string & message_type);
   static std::vector<std::string> generate_library_paths();
-  void * load_library_from_paths(const std::vector<std::string> & paths);
+  void * load_library_from_paths(const std::vector<std::string> & paths, std::string & last_error);
   void * get_bridge_factory_symbol(
     const std::string & type_name, const std::string & symbol_name_prefix, bool is_service);
 };
