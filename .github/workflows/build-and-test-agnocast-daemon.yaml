@@ -1,0 +1,47 @@
+name: build-and-test-agnocast-daemon
+
+on:
+  pull_request:
+    types:
+      - labeled
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-test-daemon:
+    if: ${{ github.event_name == 'push' || github.event.label.name == 'run-build-test' }}
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Set PR fetch depth
+      if: github.event_name == 'pull_request'
+      run: echo "PR_FETCH_DEPTH=$(( ${{ github.event.pull_request.commits }} + 1 ))" >> "${GITHUB_ENV}"
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: ${{ github.event_name == 'pull_request' && env.PR_FETCH_DEPTH || 1 }}
+
+    - name: Check for agnocast_daemon changes
+      if: github.event_name == 'pull_request'
+      id: check_changes
+      run: |
+        set -euo pipefail
+        if git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+          | grep -qE '^agnocast_daemon/'; then
+          echo "daemon_changed=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "daemon_changed=false" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Install build dependencies
+      if: github.event_name == 'push' || steps.check_changes.outputs.daemon_changed == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake libgtest-dev
+
+    - name: Build and test agnocast_daemon
+      if: github.event_name == 'push' || steps.check_changes.outputs.daemon_changed == 'true'
+      run: bash scripts/test/run_daemon_unit_tests.bash
