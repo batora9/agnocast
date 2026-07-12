@@ -151,9 +151,45 @@ void SocketServer::accept_client()
 
 void SocketServer::handle_client(int client_fd, pid_t client_pid)
 {
+  const int client_epoll = epoll_create1(EPOLL_CLOEXEC);
+  if (client_epoll < 0) {
+    fprintf(
+      stderr, "agnocast_daemon: epoll_create1() failed (pid=%d): %s\n", client_pid,
+      strerror(errno));
+    handlers_.on_client_disconnect(client_pid);
+    return;
+  }
+
+  epoll_event cev{};
+  cev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+  cev.data.fd = client_fd;
+  if (epoll_ctl(client_epoll, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+    fprintf(
+      stderr, "agnocast_daemon: epoll_ctl(ADD) failed (pid=%d): %s\n", client_pid, strerror(errno));
+    close(client_epoll);
+    handlers_.on_client_disconnect(client_pid);
+    return;
+  }
+
   std::vector<uint8_t> buf(kMaxRequestSize);
 
   while (!shutdown_requested_) {
+    epoll_event events[1];
+    const int nfds = epoll_wait(client_epoll, events, 1, kEpollTimeoutMs);
+    if (nfds < 0) {
+      if (errno == EINTR) continue;
+      fprintf(
+        stderr, "agnocast_daemon: epoll_wait() failed (pid=%d): %s\n", client_pid, strerror(errno));
+      break;
+    }
+    if (nfds == 0) continue;  // timeout — re-check shutdown_requested_
+
+    const uint32_t ev = events[0].events;
+    if (ev & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+      break;  // peer closed / hang-up / error → cleanup
+    }
+    if (!(ev & EPOLLIN)) continue;
+
     // For SOCK_SEQPACKET, one recv() delivers exactly one message (the full
     // packet sent by the client).  MSG_TRUNC would indicate buffer overflow.
     const ssize_t n = recv(client_fd, buf.data(), buf.size(), MSG_TRUNC);
@@ -192,5 +228,6 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     handlers_.dispatch(client_fd, client_pid, hdr, payload);
   }
 
+  close(client_epoll);
   handlers_.on_client_disconnect(client_pid);
 }
