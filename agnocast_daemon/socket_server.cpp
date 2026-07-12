@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "socket_server.hpp"
 
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <vector>
-
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 static constexpr int kMaxEpollEvents = 64;
 static constexpr int kEpollTimeoutMs = 1000;
@@ -127,6 +127,18 @@ void SocketServer::accept_client()
     return;
   }
 
+  const int buf = AGNOCAST_DAEMON_SOCKET_BUF_SIZE;
+  if (setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) < 0) {
+    fprintf(stderr, "agnocast_daemon: setsockopt(SO_SNDBUF) failed: %s\n", strerror(errno));
+    close(client_fd);
+    return;
+  }
+  if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf)) < 0) {
+    fprintf(stderr, "agnocast_daemon: setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+    close(client_fd);
+    return;
+  }
+
   std::thread([this, client_fd, pid = cred.pid]() {
     handle_client(client_fd, pid);
     close(client_fd);
@@ -153,11 +165,13 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     }
     if (static_cast<size_t>(n) > kMaxRequestSize) {
       // MSG_TRUNC caused truncation — reject the oversized message.
-      fprintf(stderr, "agnocast_daemon: oversized message from pid=%d (%zd bytes)\n", client_pid, n);
+      fprintf(
+        stderr, "agnocast_daemon: oversized message from pid=%d (%zd bytes)\n", client_pid, n);
       break;
     }
     if (static_cast<size_t>(n) < sizeof(RequestHeader)) {
-      fprintf(stderr, "agnocast_daemon: message too short from pid=%d (%zd bytes)\n", client_pid, n);
+      fprintf(
+        stderr, "agnocast_daemon: message too short from pid=%d (%zd bytes)\n", client_pid, n);
       break;
     }
 
@@ -167,7 +181,8 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     const size_t expected = sizeof(RequestHeader) + hdr.payload_size;
     if (static_cast<size_t>(n) != expected) {
       fprintf(
-        stderr, "agnocast_daemon: payload size mismatch from pid=%d "
+        stderr,
+        "agnocast_daemon: payload size mismatch from pid=%d "
         "(got %zd, expected %zu)\n",
         client_pid, n, expected);
       break;

@@ -23,7 +23,7 @@
 namespace agnocast_test
 {
 
-inline constexpr size_t kResponseBufferSize = 2 * 1024 * 1024;
+inline constexpr size_t kResponseBufferSize = AGNOCAST_DAEMON_SOCKET_BUF_SIZE;
 
 class DaemonHarness
 {
