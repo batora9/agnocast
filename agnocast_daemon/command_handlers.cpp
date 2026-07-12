@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "command_handlers.hpp"
 
+#include <fcntl.h>
+#include <mqueue.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <shared_mutex>
 #include <string>
@@ -28,6 +32,49 @@ PublisherInfo * find_publisher_info(TopicWrapper * wrapper, int32_t publisher_id
 {
   auto it = wrapper->topic.pub_info_map.find(publisher_id);
   return (it != wrapper->topic.pub_info_map.end()) ? &it->second : nullptr;
+}
+
+// Mirrors agnocastlib create_shm_name / create_mq_name_for_agnocast_publish.
+std::string make_shm_name(pid_t pid)
+{
+  return "/agnocast@" + std::to_string(pid);
+}
+
+std::string make_mq_name_for_publish(const std::string & topic_name, int32_t subscriber_id)
+{
+  if (topic_name.empty() || topic_name[0] != '/') {
+    return {};
+  }
+  std::string mq_name = topic_name;
+  mq_name[0] = '@';
+  mq_name = "/agnocast" + mq_name + "@" + std::to_string(subscriber_id);
+  for (size_t i = 1; i < mq_name.size(); ++i) {
+    if (mq_name[i] == '/') {
+      mq_name[i] = '_';
+    }
+  }
+  return mq_name;
+}
+
+void unlink_posix_resources_for_exit(
+  pid_t pid, const std::vector<ExitSubscriptionEntry> & exit_subscriptions)
+{
+  const std::string shm_name = make_shm_name(pid);
+  if (shm_unlink(shm_name.c_str()) < 0 && errno != ENOENT) {
+    fprintf(
+      stderr, "agnocast_daemon: shm_unlink(%s) failed (pid=%d): %s\n", shm_name.c_str(), pid,
+      strerror(errno));
+  }
+
+  for (const auto & entry : exit_subscriptions) {
+    const std::string mq_name = make_mq_name_for_publish(entry.topic_name, entry.subscriber_id);
+    if (mq_name.empty()) continue;
+    if (mq_unlink(mq_name.c_str()) < 0 && errno != ENOENT) {
+      fprintf(
+        stderr, "agnocast_daemon: mq_unlink(%s) failed (pid=%d): %s\n", mq_name.c_str(), pid,
+        strerror(errno));
+    }
+  }
 }
 
 EntryNode * find_message_entry(TopicStruct & topic, int64_t entry_id)
@@ -1328,76 +1375,86 @@ void CommandHandlers::handle_notify_bridge_shutdown(int fd, pid_t pid)
 
 void CommandHandlers::process_exit_cleanup(pid_t pid)
 {
-  std::unique_lock glock(store_.global_mutex_);
+  std::vector<ExitSubscriptionEntry> unlink_subscriptions;
 
-  ProcessInfo * proc_info = store_.find_process(pid);
-  if (!proc_info) return;
+  {
+    std::unique_lock glock(store_.global_mutex_);
 
-  proc_info->exited = true;
-  allocator_.free_memory(pid);
+    ProcessInfo * proc_info = store_.find_process(pid);
+    if (!proc_info) return;
 
-  std::vector<TopicKey> topics_to_remove;
+    proc_info->exited = true;
+    allocator_.free_memory(pid);
 
-  for (auto & [key, wrapper_ptr] : store_.topic_map_) {
-    TopicWrapper * wrapper = wrapper_ptr.get();
-    std::unique_lock tlock(wrapper->topic_rwsem);
+    std::vector<TopicKey> topics_to_remove;
 
-    // Publisher exit cleanup
-    std::vector<int32_t> pubs_to_remove;
-    for (auto & [pub_id, pub_info] : wrapper->topic.pub_info_map) {
-      if (pub_info.pid != pid) continue;
+    for (auto & [key, wrapper_ptr] : store_.topic_map_) {
+      TopicWrapper * wrapper = wrapper_ptr.get();
+      std::unique_lock tlock(wrapper->topic_rwsem);
 
-      std::vector<int64_t> entries_to_remove;
-      for (auto & [entry_id, en] : wrapper->topic.entries) {
-        if (en.publisher_id != pub_id) continue;
-        if (!is_referenced(en)) entries_to_remove.push_back(entry_id);
+      // Publisher exit cleanup
+      std::vector<int32_t> pubs_to_remove;
+      for (auto & [pub_id, pub_info] : wrapper->topic.pub_info_map) {
+        if (pub_info.pid != pid) continue;
+
+        std::vector<int64_t> entries_to_remove;
+        for (auto & [entry_id, en] : wrapper->topic.entries) {
+          if (en.publisher_id != pub_id) continue;
+          if (!is_referenced(en)) entries_to_remove.push_back(entry_id);
+        }
+        for (int64_t eid : entries_to_remove) {
+          wrapper->topic.entries.erase(eid);
+          pub_info.entries_num--;
+        }
+        if (pub_info.entries_num == 0) pubs_to_remove.push_back(pub_id);
       }
-      for (int64_t eid : entries_to_remove) {
-        wrapper->topic.entries.erase(eid);
-        pub_info.entries_num--;
-      }
-      if (pub_info.entries_num == 0) pubs_to_remove.push_back(pub_id);
-    }
-    for (int32_t pub_id : pubs_to_remove) {
-      wrapper->topic.pub_info_map.erase(pub_id);
-    }
-
-    // Subscriber exit cleanup
-    std::vector<int32_t> subs_to_remove;
-    for (auto & [sub_id, sub_info] : wrapper->topic.sub_info_map) {
-      if (sub_info.pid != pid) continue;
-
-      if (proc_info->exit_subscriptions.size() < AGNOCAST_PROTO_MAX_SUBSCRIPTION_NUM_PER_PROCESS) {
-        ExitSubscriptionEntry entry;
-        entry.topic_name = key.name;
-        entry.subscriber_id = sub_id;
-        proc_info->exit_subscriptions.push_back(std::move(entry));
+      for (int32_t pub_id : pubs_to_remove) {
+        wrapper->topic.pub_info_map.erase(pub_id);
       }
 
-      subs_to_remove.push_back(sub_id);
-    }
-    for (int32_t sub_id : subs_to_remove) {
-      wrapper->topic.sub_info_map.erase(sub_id);
-      cleanup_unreferenced_entries_from_exited_publishers(wrapper, sub_id, store_);
+      // Subscriber exit cleanup
+      std::vector<int32_t> subs_to_remove;
+      for (auto & [sub_id, sub_info] : wrapper->topic.sub_info_map) {
+        if (sub_info.pid != pid) continue;
+
+        if (
+          proc_info->exit_subscriptions.size() < AGNOCAST_PROTO_MAX_SUBSCRIPTION_NUM_PER_PROCESS) {
+          ExitSubscriptionEntry entry;
+          entry.topic_name = key.name;
+          entry.subscriber_id = sub_id;
+          proc_info->exit_subscriptions.push_back(std::move(entry));
+        }
+
+        subs_to_remove.push_back(sub_id);
+      }
+      for (int32_t sub_id : subs_to_remove) {
+        wrapper->topic.sub_info_map.erase(sub_id);
+        cleanup_unreferenced_entries_from_exited_publishers(wrapper, sub_id, store_);
+      }
+
+      if (wrapper->topic.pub_info_map.empty() && wrapper->topic.sub_info_map.empty()) {
+        wrapper->topic.entries.clear();
+        topics_to_remove.push_back(key);
+      }
     }
 
-    if (wrapper->topic.pub_info_map.empty() && wrapper->topic.sub_info_map.empty()) {
-      wrapper->topic.entries.clear();
-      topics_to_remove.push_back(key);
+    for (const auto & key : topics_to_remove) {
+      store_.topic_map_.erase(key);
     }
+
+    std::vector<std::string> bridges_to_remove;
+    for (auto & [name, br] : store_.bridge_map_) {
+      if (br.pid == pid) bridges_to_remove.push_back(name);
+    }
+    for (const auto & name : bridges_to_remove) {
+      store_.bridge_map_.erase(name);
+    }
+
+    // Snapshot for POSIX unlink after releasing metadata locks.
+    unlink_subscriptions = proc_info->exit_subscriptions;
   }
 
-  for (const auto & key : topics_to_remove) {
-    store_.topic_map_.erase(key);
-  }
-
-  std::vector<std::string> bridges_to_remove;
-  for (auto & [name, br] : store_.bridge_map_) {
-    if (br.pid == pid) bridges_to_remove.push_back(name);
-  }
-  for (const auto & name : bridges_to_remove) {
-    store_.bridge_map_.erase(name);
-  }
+  unlink_posix_resources_for_exit(pid, unlink_subscriptions);
 }
 
 void CommandHandlers::on_client_disconnect(pid_t client_pid)
