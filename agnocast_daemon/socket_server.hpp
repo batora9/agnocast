@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <atomic>
+#include "command_handlers.hpp"
+#include "memory_allocator.hpp"
+#include "metadata_store.hpp"
+#include "protocol.h"
 
 #include <sys/types.h>
 
-#include "command_handlers.hpp"
-#include "metadata_store.hpp"
-#include "memory_allocator.hpp"
-#include "protocol.h"
+#include <atomic>
 
 // Unix Domain Socket server for the Agnocast daemon.
 //
 // Architecture:
 //   Main thread  — epoll-based accept loop (non-blocking).
 //   Client threads — one detached std::thread per connected client; each
-//                    performs blocking recv/send on the client socket.
+//                    waits on its own epoll (EPOLLIN | EPOLLRDHUP) then
+//                    performs recv/send on the client socket.
 //
 // This separates the concerns cleanly: the event loop is never blocked by
 // request processing, while per-client serialisation is handled naturally
-// by the thread owning that socket.
+// by the thread owning that socket.  EPOLLRDHUP detects peer hang-up even
+// when the client process is killed without a clean shutdown handshake.
 //
 // TODO: replace per-client threads with a thread pool if connection count
 //       becomes a scalability concern.
