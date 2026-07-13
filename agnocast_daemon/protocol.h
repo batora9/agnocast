@@ -44,6 +44,12 @@
  * -------------------------------------------------------------------------- */
 #define AGNOCAST_DAEMON_SOCKET_PATH "/tmp/agnocast_daemon.sock"
 
+/* Socket send/recv buffer size for daemon UDS connections.
+ * Sized above the largest response (GetTopicSubscriberInfoResponse ≈ 811 KB)
+ * with margin; both client and server set SO_SNDBUF/SO_RCVBUF to this value
+ * on connect/accept. */
+#define AGNOCAST_DAEMON_SOCKET_BUF_SIZE (2 * 1024 * 1024)
+
 /* --------------------------------------------------------------------------
  * Protocol-level constants
  *
@@ -560,8 +566,8 @@ struct CheckAndRequestBridgeShutdownResponse
 /* The topic_name_buffer_addr/size in the ioctl is a userspace pointer pair;
  * topic names are returned as a flat 2-D inline array.
  * Maximum response size = MAX_TOPIC_NUM × TOPIC_NAME_BUFFER_SIZE = 256 KB + 4 bytes.
- * Callers must ensure SO_RCVBUF >= sizeof(GetTopicListResponse) when the topic
- * count is expected to be large (default kernel buffer ≈ 208 KB).
+ * Client and daemon set SO_RCVBUF/SO_SNDBUF to AGNOCAST_DAEMON_SOCKET_BUF_SIZE
+ * on connect/accept so large responses fit without truncation.
  */
 /* Request: no payload */
 struct GetTopicListResponse

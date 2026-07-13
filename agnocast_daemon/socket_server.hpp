@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <atomic>
+#include "command_handlers.hpp"
+#include "memory_allocator.hpp"
+#include "metadata_store.hpp"
+#include "protocol.h"
 
 #include <sys/types.h>
 
-#include "command_handlers.hpp"
-#include "metadata_store.hpp"
-#include "memory_allocator.hpp"
-#include "protocol.h"
+#include <atomic>
 
 // Unix Domain Socket server for the Agnocast daemon.
 //

@@ -484,6 +484,21 @@ static void connect_to_daemon_socket()
     RCLCPP_ERROR(logger, "socket() failed: %s", strerror(errno));
     exit(EXIT_FAILURE);
   }
+
+  const int buf = AGNOCAST_DAEMON_SOCKET_BUF_SIZE;
+  if (setsockopt(agnocast_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) < 0) {
+    RCLCPP_ERROR(logger, "setsockopt(SO_SNDBUF) failed: %s", strerror(errno));
+    close(agnocast_fd);
+    agnocast_fd = -1;
+    exit(EXIT_FAILURE);
+  }
+  if (setsockopt(agnocast_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf)) < 0) {
+    RCLCPP_ERROR(logger, "setsockopt(SO_RCVBUF) failed: %s", strerror(errno));
+    close(agnocast_fd);
+    agnocast_fd = -1;
+    exit(EXIT_FAILURE);
+  }
+
   sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, AGNOCAST_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);

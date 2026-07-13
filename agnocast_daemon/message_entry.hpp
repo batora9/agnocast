@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "protocol.h"
+
 #include <bitset>
 #include <cstdint>
-
-#include "protocol.h"
 
 // Equivalent of agnocast_kmod::entry_node.
 // The red-black tree (struct rb_root) is replaced by std::map<int64_t, EntryNode>
@@ -12,7 +12,7 @@
 struct EntryNode
 {
   int64_t entry_id = 0;
-  int32_t publisher_id = 0;   // topic_local_id_t
+  int32_t publisher_id = 0;  // topic_local_id_t
   uint64_t msg_virtual_address = 0;
 
   // Equivalent of DECLARE_BITMAP(referencing_subscribers, MAX_TOPIC_LOCAL_ID).
