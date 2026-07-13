@@ -16,6 +16,7 @@ add_library(agnocast_daemon_core STATIC
 )
 target_compile_definitions(agnocast_daemon_core PUBLIC AGNOCAST_VERSION="${AGNOCAST_VERSION_RAW}")
 target_include_directories(agnocast_daemon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(agnocast_daemon_core PUBLIC rt)
 target_compile_options(agnocast_daemon_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(agnocast_daemon

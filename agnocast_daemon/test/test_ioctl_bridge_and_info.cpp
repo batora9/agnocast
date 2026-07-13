@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon_test_util.hpp"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <mqueue.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <string>
@@ -293,6 +297,42 @@ TEST(IoctlBridgeInfo, DoExitAndGetExitProcess)
   ASSERT_EQ(
     h.call(AGNOCAST_CMD_GET_EXIT_PROCESS, 0, nullptr, 0, &exit_resp2, sizeof(exit_resp2)), 0);
   EXPECT_NE(exit_resp2.pid, kExitedPid);
+}
+
+TEST(IoctlBridgeInfo, DisconnectUnlinksShmAndSubscriptionMq)
+{
+  DaemonHarness h;
+  ASSERT_EQ(h.add_process(kExitedPid), 0);
+
+  int32_t sub_id = -1;
+  ASSERT_EQ(h.add_subscriber(kTopic, kNode, kExitedPid, 1, &sub_id, true), 0);
+  ASSERT_GE(sub_id, 0);
+
+  const std::string shm_name = "/agnocast@" + std::to_string(kExitedPid);
+  // Topic "/kunit_test_topic" -> mq "/agnocast@kunit_test_topic@<id>"
+  const std::string mq_name = "/agnocast@kunit_test_topic@" + std::to_string(sub_id);
+
+  const int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0600);
+  ASSERT_GE(shm_fd, 0);
+  close(shm_fd);
+
+  struct mq_attr attr
+  {
+  };
+  attr.mq_flags = 0;
+  attr.mq_maxmsg = 1;
+  attr.mq_msgsize = 8;
+  attr.mq_curmsgs = 0;
+  const mqd_t mqd = mq_open(mq_name.c_str(), O_CREAT | O_RDWR, 0600, &attr);
+  ASSERT_NE(mqd, static_cast<mqd_t>(-1));
+  mq_close(mqd);
+
+  h.disconnect(kExitedPid);
+
+  EXPECT_EQ(shm_open(shm_name.c_str(), O_RDONLY, 0), -1);
+  EXPECT_EQ(errno, ENOENT);
+  EXPECT_EQ(mq_open(mq_name.c_str(), O_RDONLY), static_cast<mqd_t>(-1));
+  EXPECT_EQ(errno, ENOENT);
 }
 
 TEST(IoctlBridgeInfo, TopicInfoAndNodeTopicQueriesCoveredByState)
