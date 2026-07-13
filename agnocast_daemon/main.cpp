@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <stdexcept>
-
 #include "memory_allocator.hpp"
 #include "metadata_store.hpp"
 #include "protocol.h"
 #include "socket_server.hpp"
+
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 
 // Global pointer used by the signal handler to request a graceful shutdown.
 // Written once (before run()) and read from signal context — safe in practice
@@ -28,7 +28,9 @@ int main()
   signal(SIGPIPE, SIG_IGN);
 
   // Register graceful-shutdown handlers before creating any resources.
-  struct sigaction sa{};
+  struct sigaction sa
+  {
+  };
   sa.sa_handler = signal_handler;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGTERM, &sa, nullptr);
@@ -41,8 +43,7 @@ int main()
 
     g_server = &server;
 
-    fprintf(
-      stderr, "agnocast_daemon: started (socket: %s)\n", AGNOCAST_DAEMON_SOCKET_PATH);
+    fprintf(stderr, "agnocast_daemon: started (socket: %s)\n", AGNOCAST_DAEMON_SOCKET_PATH);
 
     server.run();
 

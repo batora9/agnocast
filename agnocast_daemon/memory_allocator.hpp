@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <sys/types.h>
+
 #include <cstdint>
 #include <mutex>
 #include <vector>
-
-#include <sys/types.h>
 
 // Userspace port of agnocast_kmod/agnocast_memory_allocator.c.
 //
@@ -32,8 +32,7 @@ public:
   };
 
   explicit MemoryAllocator(
-    int mempool_num = kDefaultMempoolNum,
-    uint64_t start_addr = kDefaultStartAddr,
+    int mempool_num = kDefaultMempoolNum, uint64_t start_addr = kDefaultStartAddr,
     int size_gb = kDefaultSizeGb);
 
   // Assign a free slot to pid.  Returns nullptr if all slots are occupied.
