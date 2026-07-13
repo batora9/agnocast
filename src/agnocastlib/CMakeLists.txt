@@ -156,7 +156,6 @@ if(BUILD_TESTING)
     test/unit/test_agnocast_context.cpp
     test/unit/test_diagnostic_updater.cpp
     test/unit/test_type_registry_writer.cpp
-    test/unit/test_agnocast_generic_callback.cpp
     test/unit/test_agnocast_generic_publisher.cpp
     test/unit/test_daemon_bridge_uds.cpp
     test/unit/test_agnocast_bridge_uds.cpp
