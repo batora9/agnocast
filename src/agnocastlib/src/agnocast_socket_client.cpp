@@ -233,7 +233,7 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
   return r;
 }
 
-int agnocast_ipc_release_sub_ref(struct ioctl_update_entry_args * args)
+int agnocast_ipc_release_sub_ref(const struct ioctl_update_entry_args * args)
 {
   ReleaseSubRefRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -242,7 +242,7 @@ int agnocast_ipc_release_sub_ref(struct ioctl_update_entry_args * args)
   return daemon_call(AGNOCAST_CMD_RELEASE_SUB_REF, &req, sizeof(req), nullptr, 0);
 }
 
-int agnocast_ipc_remove_publisher(struct ioctl_remove_publisher_args * args)
+int agnocast_ipc_remove_publisher(const struct ioctl_remove_publisher_args * args)
 {
   RemovePublisherRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -250,7 +250,7 @@ int agnocast_ipc_remove_publisher(struct ioctl_remove_publisher_args * args)
   return daemon_call(AGNOCAST_CMD_REMOVE_PUBLISHER, &req, sizeof(req), nullptr, 0);
 }
 
-int agnocast_ipc_remove_subscriber(struct ioctl_remove_subscriber_args * args)
+int agnocast_ipc_remove_subscriber(const struct ioctl_remove_subscriber_args * args)
 {
   RemoveSubscriberRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -359,7 +359,7 @@ int agnocast_ipc_add_bridge(struct ioctl_add_bridge_args * args)
   return r;
 }
 
-int agnocast_ipc_remove_bridge(struct ioctl_remove_bridge_args * args)
+int agnocast_ipc_remove_bridge(const struct ioctl_remove_bridge_args * args)
 {
   RemoveBridgeRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -384,7 +384,7 @@ int agnocast_ipc_notify_bridge_shutdown()
   return daemon_call(AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN, nullptr, 0, nullptr, 0);
 }
 
-int agnocast_ipc_set_ros2_subscriber_num(struct ioctl_set_ros2_subscriber_num_args * args)
+int agnocast_ipc_set_ros2_subscriber_num(const struct ioctl_set_ros2_subscriber_num_args * args)
 {
   SetRos2SubscriberNumRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -392,7 +392,7 @@ int agnocast_ipc_set_ros2_subscriber_num(struct ioctl_set_ros2_subscriber_num_ar
   return daemon_call(AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM, &req, sizeof(req), nullptr, 0);
 }
 
-int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args * args)
+int agnocast_ipc_set_ros2_publisher_num(const struct ioctl_set_ros2_publisher_num_args * args)
 {
   SetRos2PublisherNumRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
