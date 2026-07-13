@@ -12,7 +12,7 @@
 #include <vector>
 
 #ifndef AGNOCAST_VERSION
-#define AGNOCAST_VERSION "2.3.4"
+#define AGNOCAST_VERSION "2.3.5"
 #endif
 
 namespace
