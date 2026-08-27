@@ -108,8 +108,8 @@ struct TopicWrapper
   uint32_t domain_id = 0;
 
   // Lock ordering: global_mutex_ (MetadataStore) → topic_rwsem → mutex_ (MemoryAllocator).
-  // shared_lock  for read-only operations within the topic.
-  // unique_lock  for publish/subscribe/modify operations.
+  // shared_lock  for queries, receive/take, and release_ref (entry ref bits are atomic).
+  // unique_lock  for publish and other operations that change the entries map.
   mutable std::shared_mutex topic_rwsem;
 
   TopicStruct topic;

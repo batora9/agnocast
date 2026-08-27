@@ -3,7 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cerrno>
+#include <thread>
+#include <vector>
 
 using agnocast_test::DaemonHarness;
 
@@ -512,4 +515,111 @@ TEST(IoctlCore, GetSubscriberQosVolatileReliable)
   EXPECT_EQ(sub_qos_resp.depth, 9U);
   EXPECT_FALSE(sub_qos_resp.is_transient_local);
   EXPECT_TRUE(sub_qos_resp.is_reliable);
+}
+
+// ---- concurrent receive / release (shared topic lock) ---------------------
+
+TEST(IoctlCore, ConcurrentReceiveSameEntry)
+{
+  constexpr int kSubs = 8;
+  DaemonHarness h;
+  uint64_t pub_addr = 0;
+  ASSERT_EQ(h.add_process(1000, &pub_addr), 0);
+  int32_t pub_id = -1;
+  ASSERT_EQ(h.add_publisher(kTopic, kNode, 1000, 10, &pub_id), 0);
+
+  std::vector<pid_t> pids(kSubs);
+  std::vector<int32_t> sub_ids(kSubs, -1);
+  for (int i = 0; i < kSubs; ++i) {
+    pids[i] = 2000 + i;
+    ASSERT_EQ(h.add_process(pids[i]), 0);
+    ASSERT_EQ(h.add_subscriber(kTopic, kNode, pids[i], 10, &sub_ids[i]), 0);
+  }
+
+  PublishMsgResponse pub_resp{};
+  ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr, &pub_resp), 0);
+
+  std::vector<ReceiveMsgResponse> recvs(kSubs);
+  std::vector<int> rets(kSubs, -1);
+  std::atomic<int> arrived{0};
+  std::atomic<bool> go{false};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kSubs);
+  for (int i = 0; i < kSubs; ++i) {
+    threads.emplace_back([&, i]() {
+      arrived.fetch_add(1, std::memory_order_relaxed);
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      rets[i] = h.receive_isolated(kTopic, sub_ids[i], &recvs[i], pids[i]);
+    });
+  }
+  while (arrived.load(std::memory_order_relaxed) < kSubs) {
+    std::this_thread::yield();
+  }
+  go.store(true, std::memory_order_release);
+  for (auto & t : threads) {
+    t.join();
+  }
+
+  for (int i = 0; i < kSubs; ++i) {
+    EXPECT_EQ(rets[i], 0) << "subscriber " << i;
+    EXPECT_EQ(recvs[i].entry_num, 1U) << "subscriber " << i;
+    EXPECT_EQ(recvs[i].entry_ids[0], pub_resp.entry_id) << "subscriber " << i;
+    EXPECT_EQ(h.entry_rc(kTopic, pub_resp.entry_id, sub_ids[i]), 1) << "subscriber " << i;
+  }
+}
+
+TEST(IoctlCore, ConcurrentReleaseAfterReceive)
+{
+  constexpr int kSubs = 8;
+  DaemonHarness h;
+  uint64_t pub_addr = 0;
+  ASSERT_EQ(h.add_process(1000, &pub_addr), 0);
+  int32_t pub_id = -1;
+  ASSERT_EQ(h.add_publisher(kTopic, kNode, 1000, 10, &pub_id), 0);
+
+  std::vector<pid_t> pids(kSubs);
+  std::vector<int32_t> sub_ids(kSubs, -1);
+  for (int i = 0; i < kSubs; ++i) {
+    pids[i] = 2000 + i;
+    ASSERT_EQ(h.add_process(pids[i]), 0);
+    ASSERT_EQ(h.add_subscriber(kTopic, kNode, pids[i], 10, &sub_ids[i]), 0);
+  }
+
+  PublishMsgResponse pub_resp{};
+  ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr, &pub_resp), 0);
+  for (int i = 0; i < kSubs; ++i) {
+    ReceiveMsgResponse recv_resp{};
+    ASSERT_EQ(h.receive(kTopic, sub_ids[i], &recv_resp, pids[i]), 0);
+    ASSERT_EQ(recv_resp.entry_num, 1U);
+  }
+
+  std::vector<int> rets(kSubs, -1);
+  std::atomic<int> arrived{0};
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kSubs);
+  for (int i = 0; i < kSubs; ++i) {
+    threads.emplace_back([&, i]() {
+      arrived.fetch_add(1, std::memory_order_relaxed);
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      rets[i] = h.release_sub_ref_isolated(kTopic, sub_ids[i], pub_resp.entry_id, pids[i]);
+    });
+  }
+  while (arrived.load(std::memory_order_relaxed) < kSubs) {
+    std::this_thread::yield();
+  }
+  go.store(true, std::memory_order_release);
+  for (auto & t : threads) {
+    t.join();
+  }
+
+  for (int i = 0; i < kSubs; ++i) {
+    EXPECT_EQ(rets[i], 0) << "subscriber " << i;
+    EXPECT_EQ(h.entry_rc(kTopic, pub_resp.entry_id, sub_ids[i]), 0) << "subscriber " << i;
+  }
 }

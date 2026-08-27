@@ -95,10 +95,9 @@ int add_subscriber_reference(EntryNode & en, int32_t id)
   if (id < 0 || id >= static_cast<int32_t>(AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID)) {
     return -EINVAL;
   }
-  if (en.referencing_subscribers.test(static_cast<size_t>(id))) {
+  if (en.referencing_subscribers.test_and_set(static_cast<size_t>(id))) {
     return -EALREADY;
   }
-  en.referencing_subscribers.set(static_cast<size_t>(id));
   return 0;
 }
 
@@ -276,7 +275,7 @@ void cleanup_unreferenced_entries_from_exited_publishers(
   std::vector<int64_t> to_remove;
   for (auto & [entry_id, en] : wrapper->topic.entries) {
     (void)entry_id;
-    en.referencing_subscribers.reset(static_cast<size_t>(subscriber_id));
+    en.referencing_subscribers.test_and_clear(static_cast<size_t>(subscriber_id));
 
     if (is_referenced(en)) continue;
 
@@ -611,12 +610,11 @@ void CommandHandlers::handle_release_sub_ref(int fd, pid_t pid, const void * pay
     return;
   }
 
-  if (!en->referencing_subscribers.test(static_cast<size_t>(req->pubsub_id))) {
+  if (!en->referencing_subscribers.test_and_clear(static_cast<size_t>(req->pubsub_id))) {
     send_response(fd, EINVAL);
     return;
   }
 
-  en->referencing_subscribers.reset(static_cast<size_t>(req->pubsub_id));
   send_response(fd, 0);
 }
 
@@ -658,12 +656,16 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
   }
 
   PublishMsgResponse resp{};
-  EntryNode node;
-  node.entry_id = wrapper->topic.current_entry_id++;
-  node.publisher_id = pub_info->id;
-  node.msg_virtual_address = req->msg_virtual_address;
-  resp.entry_id = node.entry_id;
-  wrapper->topic.entries.emplace(node.entry_id, std::move(node));
+  const int64_t entry_id = wrapper->topic.current_entry_id++;
+  auto [it, inserted] = wrapper->topic.entries.try_emplace(entry_id);
+  if (!inserted) {
+    send_response(fd, EEXIST);
+    return;
+  }
+  it->second.entry_id = entry_id;
+  it->second.publisher_id = pub_info->id;
+  it->second.msg_virtual_address = req->msg_virtual_address;
+  resp.entry_id = entry_id;
   pub_info->entries_num++;
 
   int ret = release_msgs_to_meet_depth(wrapper, pub_info, &resp);
@@ -699,7 +701,7 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
     return;
   }
 
-  std::unique_lock tlock(wrapper->topic_rwsem);
+  std::shared_lock tlock(wrapper->topic_rwsem);
   AGNOCAST_DAEMON_BENCH_STAMP_WORK();
 
   SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
@@ -747,7 +749,7 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
     return;
   }
 
-  std::unique_lock tlock(wrapper->topic_rwsem);
+  std::shared_lock tlock(wrapper->topic_rwsem);
   SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
   if (!sub_info) {
     send_response(fd, EINVAL);

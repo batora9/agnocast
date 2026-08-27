@@ -76,6 +76,41 @@ public:
     return rhdr.error_code == 0 ? 0 : -static_cast<int>(rhdr.error_code);
   }
 
+  // Thread-safe variant of call(): uses a dedicated socketpair so concurrent
+  // dispatches to the same CommandHandlers do not share recv state.
+  int call_isolated(
+    uint32_t cmd, pid_t pid, const void * req, uint32_t req_size, void * resp_out = nullptr,
+    uint32_t resp_capacity = 0)
+  {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+      return -errno;
+    }
+    int buf = static_cast<int>(kResponseBufferSize);
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+
+    std::unique_ptr<uint8_t[]> recv_buf(new uint8_t[kResponseBufferSize]);
+    RequestHeader hdr{cmd, req_size};
+    ssize_t recv_n = -1;
+    std::thread reader([&]() { recv_n = recv(sv[1], recv_buf.get(), kResponseBufferSize, 0); });
+    handlers_.dispatch(sv[0], pid, hdr, req);
+    reader.join();
+    close(sv[0]);
+    close(sv[1]);
+
+    if (recv_n < static_cast<ssize_t>(sizeof(ResponseHeader))) {
+      return -EPROTO;
+    }
+    ResponseHeader rhdr{};
+    std::memcpy(&rhdr, recv_buf.get(), sizeof(ResponseHeader));
+    if (resp_out && rhdr.payload_size > 0) {
+      uint32_t copy_size = std::min(rhdr.payload_size, resp_capacity);
+      std::memcpy(resp_out, recv_buf.get() + sizeof(ResponseHeader), copy_size);
+    }
+    return rhdr.error_code == 0 ? 0 : -static_cast<int>(rhdr.error_code);
+  }
+
   void disconnect(pid_t pid) { handlers_.on_client_disconnect(pid); }
 
   static void set_topic(char (&dst)[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE], const char * src)
@@ -160,6 +195,15 @@ public:
     return call(AGNOCAST_CMD_RECEIVE_MSG, pid, &req, sizeof(req), out, sizeof(*out));
   }
 
+  int receive_isolated(
+    const char * topic, int32_t subscriber_id, ReceiveMsgResponse * out, pid_t pid = 0)
+  {
+    ReceiveMsgRequest req{};
+    set_topic(req.topic_name, topic);
+    req.subscriber_id = subscriber_id;
+    return call_isolated(AGNOCAST_CMD_RECEIVE_MSG, pid, &req, sizeof(req), out, sizeof(*out));
+  }
+
   int take(
     const char * topic, int32_t subscriber_id, bool allow_same_message, TakeMsgResponse * out,
     pid_t pid = 0)
@@ -178,6 +222,16 @@ public:
     req.pubsub_id = pubsub_id;
     req.entry_id = entry_id;
     return call(AGNOCAST_CMD_RELEASE_SUB_REF, 0, &req, sizeof(req));
+  }
+
+  int release_sub_ref_isolated(
+    const char * topic, int32_t pubsub_id, int64_t entry_id, pid_t pid = 0)
+  {
+    ReleaseSubRefRequest req{};
+    set_topic(req.topic_name, topic);
+    req.pubsub_id = pubsub_id;
+    req.entry_id = entry_id;
+    return call_isolated(AGNOCAST_CMD_RELEASE_SUB_REF, pid, &req, sizeof(req));
   }
 
   int topic_entries_num(const char * topic) const
