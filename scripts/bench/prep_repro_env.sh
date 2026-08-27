@@ -3,9 +3,10 @@ set -euo pipefail
 #
 # Lock the machine into a reproducible state, or restore it afterwards.
 #
-#   sudo bash scripts/prep_repro_env.sh            # apply
-#   sudo bash scripts/prep_repro_env.sh --restore  # undo
-#   bash scripts/prep_repro_env.sh --status        # inspect
+#   sudo bash scripts/bench/prep_repro_env.sh            # apply
+#   sudo bash scripts/bench/prep_repro_env.sh --no-cstate  # apply without C-state lock
+#   sudo bash scripts/bench/prep_repro_env.sh --restore  # undo
+#   bash scripts/bench/prep_repro_env.sh --status        # inspect
 #
 # What it controls:
 #   - Turbo Boost off and the frequency pinned to base, so a run's latency does
@@ -40,7 +41,16 @@ require_root() {
   }
 }
 
-mode=${1:-apply}
+SKIP_CSTATE=0
+MODE_ARGS=()
+for arg in "$@"; do
+  case "${arg}" in
+  --no-cstate) SKIP_CSTATE=1 ;;
+  *) MODE_ARGS+=("${arg}") ;;
+  esac
+done
+
+mode=${MODE_ARGS[0]:-apply}
 
 # --- status ------------------------------------------------------------------
 
@@ -140,9 +150,12 @@ for cpufreq in /sys/devices/system/cpu/cpu*/cpufreq; do
 done
 echo "  CPU frequency   -> pinned at ${TARGET_FREQ_KHZ} kHz"
 
-# The kernel resets the DMA-latency limit once every writer closes its fd, so a
-# process has to stay alive holding it open for the duration of the experiment.
-cat >"${DMA_HOLDER}" <<'PYEOF'
+if [[ "${SKIP_CSTATE}" -eq 1 ]]; then
+  echo "  cpu_dma_latency -> skipped (--no-cstate; deep C-states allowed)"
+else
+  # The kernel resets the DMA-latency limit once every writer closes its fd, so a
+  # process has to stay alive holding it open for the duration of the experiment.
+  cat >"${DMA_HOLDER}" <<'PYEOF'
 import os, signal, struct, sys, time
 
 fd = os.open('/dev/cpu_dma_latency', os.O_RDWR)
@@ -163,16 +176,17 @@ while True:
     time.sleep(3600)
 PYEOF
 
-if [[ ! -f "${DMA_PID_FILE}" ]] || ! kill -0 "$(cat ${DMA_PID_FILE} 2>/dev/null)" 2>/dev/null; then
-  nohup python3 "${DMA_HOLDER}" >"${DMA_LOG}" 2>&1 &
-  echo $! >"${DMA_PID_FILE}"
-  for _ in $(seq 1 20); do
-    grep -q ready "${DMA_LOG}" 2>/dev/null && break
-    sleep 0.1
-  done
-  echo "  cpu_dma_latency -> 0 (held by PID $(cat ${DMA_PID_FILE}); C-state <= C1)"
-else
-  echo "  cpu_dma_latency -> already held by PID $(cat ${DMA_PID_FILE})"
+  if [[ ! -f "${DMA_PID_FILE}" ]] || ! kill -0 "$(cat ${DMA_PID_FILE} 2>/dev/null)" 2>/dev/null; then
+    nohup python3 "${DMA_HOLDER}" >"${DMA_LOG}" 2>&1 &
+    echo $! >"${DMA_PID_FILE}"
+    for _ in $(seq 1 20); do
+      grep -q ready "${DMA_LOG}" 2>/dev/null && break
+      sleep 0.1
+    done
+    echo "  cpu_dma_latency -> 0 (held by PID $(cat ${DMA_PID_FILE}); C-state <= C1)"
+  else
+    echo "  cpu_dma_latency -> already held by PID $(cat ${DMA_PID_FILE})"
+  fi
 fi
 
 sysctl -w fs.mqueue.msg_max="${TARGET_MSG_MAX}" >/dev/null

@@ -5,7 +5,7 @@ set -euo pipefail
 #
 #   scripts/run_bench.bash --backend kmod \
 #     --num-topics 10 --num-subscribers 4 --rate-hz 100 \
-#     --duration 10 --warmup 5 --iterations 5 --output-dir results/foo
+#     --duration 10 --warmup 2 --iterations 5 --output-dir results/foo
 #
 # Launches one publisher process per topic and one subscriber process per
 # (topic, subscriber) pair, releases them all from a file barrier so that every
@@ -21,13 +21,16 @@ NUM_TOPICS=10
 NUM_SUBSCRIBERS=4
 RATE_HZ=100
 DURATION=10
-WARMUP=5 # lets RT threads reach steady state after barrier release
+WARMUP=2 # paper §VII-A; membership settles before measurement starts
 QOS_DEPTH=10
 ITERATIONS=5
 OUTPUT_DIR=""
 TOPIC_PREFIX="/bench/topic"
 USE_RT=true
 PUB_KEEP_ALIVE=3
+# 0 = M0 (daemon stays SCHED_OTHER). N > 0 launches the daemon with
+# `chrt -f N` so worker threads inherit SCHED_FIFO N (M1).
+DAEMON_RT_PRIORITY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +44,7 @@ while [[ $# -gt 0 ]]; do
   --iterations) ITERATIONS="$2"; shift 2 ;;
   --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
   --topic-prefix) TOPIC_PREFIX="$2"; shift 2 ;;
+  --daemon-rt-priority) DAEMON_RT_PRIORITY="$2"; shift 2 ;;
   --no-rt) USE_RT=false; shift ;;
   -h | --help) sed -n '3,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
   *) die "unknown option: $1" ;;
@@ -87,7 +91,12 @@ ORIGINAL_RT_RUNTIME=""
 if [[ "${USE_RT}" == "true" ]]; then
   RT_PREFIX="sudo chrt -f 80"
   RT_ENV="AGNOCAST_BENCH_RT_PRIORITY=80"
-  DAEMON_LAUNCH_PREFIX="sudo"
+  DAEMON_STOP_PREFIX="sudo"
+  if [[ "${DAEMON_RT_PRIORITY}" -gt 0 ]]; then
+    DAEMON_LAUNCH_PREFIX="sudo chrt -f ${DAEMON_RT_PRIORITY}"
+  else
+    DAEMON_LAUNCH_PREFIX="sudo"
+  fi
 
   # Linux reserves 5% of each second for non-RT tasks by default. That shows up
   # as a ~50 ms spike on every tail-latency plot — an artifact of kernel policy
@@ -97,6 +106,9 @@ if [[ "${USE_RT}" == "true" ]]; then
   if [[ "${ORIGINAL_RT_RUNTIME}" -ne 999500 ]]; then
     sudo sysctl -w kernel.sched_rt_runtime_us=999500 >/dev/null
   fi
+elif [[ "${DAEMON_RT_PRIORITY}" -gt 0 ]]; then
+  DAEMON_STOP_PREFIX="sudo"
+  DAEMON_LAUNCH_PREFIX="sudo chrt -f ${DAEMON_RT_PRIORITY}"
 fi
 
 cleanup() {
@@ -134,6 +146,11 @@ echo "  Duration:    ${WARMUP}s warmup + ${DURATION}s measurement + ${PUB_KEEP_A
 echo "  Iterations:  ${ITERATIONS}"
 echo "  QoS depth:   ${QOS_DEPTH}"
 echo "  RT sched:    ${USE_RT}"
+if [[ "${DAEMON_RT_PRIORITY}" -gt 0 ]]; then
+  echo "  Daemon RT:   SCHED_FIFO ${DAEMON_RT_PRIORITY}"
+else
+  echo "  Daemon RT:   SCHED_OTHER (M0)"
+fi
 echo "  Output:      ${OUTPUT_DIR}"
 echo ""
 

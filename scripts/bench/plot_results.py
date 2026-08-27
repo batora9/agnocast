@@ -65,10 +65,12 @@ METRIC_TITLES = {
     "receive_ipc": "Receive IPC round trip",
 }
 
+# 1-D paper sweeps A/B. Sweep C is the T×S heatmap below. "rate" is optional
+# and not in the paper; it lives under sweep_rate/.
 SWEEPS = {
     "a": ("sweep_a", r"num_topics_(\d+)", "Number of topics", "topics"),
     "b": ("sweep_b", r"num_subscribers_(\d+)", "Number of subscribers", "subscribers"),
-    "c": ("sweep_c", r"rate_hz_(\d+)", "Publish rate (Hz)", "rate"),
+    "rate": ("sweep_rate", r"rate_hz_(\d+)", "Publish rate (Hz)", "rate"),
 }
 
 
@@ -274,7 +276,7 @@ def write_stats_table(all_stats, output_dir):
         if subset.empty or subset["label"].nunique() < 2:
             continue
         print(f"\n  {METRIC_TITLES[metric]} (us), pooled:")
-        pivot = subset.pivot_table(
+        pivot = subset[subset["sweep"] != "c"].pivot_table(
             index=["sweep", "sweep_value"], columns="label", values=["p50", "p999"]
         )
         print(pivot.to_string(float_format=lambda v: f"{v:8.3f}"))
@@ -286,7 +288,9 @@ def parse_args():
     parser.add_argument("--label", action="append", help="label per --data")
     parser.add_argument("--color", action="append", help="color per --data")
     parser.add_argument("--output-dir", default="figures")
-    parser.add_argument("--sweep", choices=["a", "b", "c", "d", "cdf", "all"], default="all")
+    parser.add_argument(
+        "--sweep", choices=["a", "b", "c", "rate", "cdf", "all"], default="all"
+    )
     return parser.parse_args()
 
 
@@ -322,14 +326,24 @@ def main():
         for metric in METRIC_COLUMNS:
             plot_vs_sweep(datasets, metric, xlabel, f"{metric}_vs_{short}", output_dir)
 
-    if args.sweep in ("d", "all"):
-        print("Sweep D: topics x subscribers")
+    if args.sweep in ("c", "all"):
+        print("Sweep C: topics x subscribers")
         datasets_2d = []
         for data_dir, label in zip(args.data, labels):
-            sweep_dir = Path(data_dir) / "sweep_d"
+            sweep_dir = Path(data_dir) / "sweep_c"
             if not sweep_dir.is_dir():
                 sweep_dir = Path(data_dir)
-            datasets_2d.append((label, pooled_stats_2d(sweep_dir)))
+            stats_2d = pooled_stats_2d(sweep_dir)
+            datasets_2d.append((label, stats_2d))
+            if not stats_2d.empty:
+                collected.append(
+                    stats_2d.assign(
+                        label=label,
+                        sweep="c",
+                        sweep_value=stats_2d["num_topics"] * 1000
+                        + stats_2d["num_subscribers"],
+                    )
+                )
         for metric in ("e2e", "publish_ipc", "receive_ipc"):
             plot_heatmaps(datasets_2d, metric, output_dir)
 

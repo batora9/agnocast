@@ -16,10 +16,13 @@ AGNOCAST_DAEMON_BIN="${AGNOCAST_DAEMON_BIN:-${AGNOCAST_ROOT}/agnocast_daemon/bui
 # PID of a daemon started by this shell (empty when we did not start one).
 BENCH_DAEMON_PID=""
 
-# Prefix used to launch/kill the daemon. Set to "sudo" by the runner when the
-# bench processes themselves run as root under chrt, so that the daemon and its
-# clients agree on the ownership of the shared memory they create.
+# Prefix used to launch the daemon. Set to "sudo" by the runner when the bench
+# processes themselves run as root under chrt, so that the daemon and its
+# clients agree on the ownership of the shared memory they create. M1 sets this
+# to "sudo chrt -f N" so the daemon matches the clients' SCHED_FIFO priority.
 DAEMON_LAUNCH_PREFIX="${DAEMON_LAUNCH_PREFIX:-}"
+# stop_daemon must not reuse a chrt prefix (that would nice pkill, not the daemon).
+DAEMON_STOP_PREFIX="${DAEMON_STOP_PREFIX:-}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -88,7 +91,14 @@ start_daemon() {
 
   for _ in $(seq 1 50); do
     if daemon_running; then
-      echo "  agnocast_daemon: started (pid=${BENCH_DAEMON_PID})"
+      local sched=""
+      local dpid
+      dpid=$(pgrep -n -x agnocast_daemon 2>/dev/null || true)
+      if [[ -n "${dpid}" ]]; then
+        sched=$(${DAEMON_STOP_PREFIX:-} chrt -p "${dpid}" 2>/dev/null | tr '\n' ' ' || true)
+      fi
+      echo "  agnocast_daemon: started (pid=${BENCH_DAEMON_PID}${dpid:+, daemon_pid=${dpid}})"
+      [[ -n "${sched}" ]] && echo "  agnocast_daemon: ${sched}"
       return 0
     fi
     kill -0 "${BENCH_DAEMON_PID}" 2>/dev/null ||
@@ -102,8 +112,8 @@ start_daemon() {
 stop_daemon() {
   if [[ -n "${BENCH_DAEMON_PID}" ]] && kill -0 "${BENCH_DAEMON_PID}" 2>/dev/null; then
     # shellcheck disable=SC2086
-    ${DAEMON_LAUNCH_PREFIX} pkill -TERM -P "${BENCH_DAEMON_PID}" 2>/dev/null || true
-    kill -TERM "${BENCH_DAEMON_PID}" 2>/dev/null || true
+    ${DAEMON_STOP_PREFIX} pkill -TERM -P "${BENCH_DAEMON_PID}" 2>/dev/null || true
+    ${DAEMON_STOP_PREFIX} kill -TERM "${BENCH_DAEMON_PID}" 2>/dev/null || true
     wait "${BENCH_DAEMON_PID}" 2>/dev/null || true
     echo "  agnocast_daemon: stopped (pid=${BENCH_DAEMON_PID})"
   fi
@@ -115,11 +125,15 @@ stop_daemon() {
 # process-table drain that kernel-module mode gets from poll_for_unlink.
 restart_daemon() {
   stop_daemon
+  # A leftover daemon from a previous run would be reused as-is, including
+  # SCHED_OTHER when this run asked for FIFO. Kill by name so the next start
+  # is always a fresh process with DAEMON_LAUNCH_PREFIX applied.
+  ${DAEMON_STOP_PREFIX} pkill -TERM -x agnocast_daemon 2>/dev/null || true
   for _ in $(seq 1 50); do
     daemon_running || break
     sleep 0.1
   done
-  rm -f "${AGNOCAST_DAEMON_SOCKET_PATH}" 2>/dev/null || true
+  ${DAEMON_STOP_PREFIX} rm -f "${AGNOCAST_DAEMON_SOCKET_PATH}" 2>/dev/null || true
   start_daemon
 }
 

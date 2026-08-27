@@ -6,11 +6,13 @@ set -euo pipefail
 #   scripts/run_sweeps.bash --backend kmod --output-dir results/kmod --iterations 5
 #   scripts/run_sweeps.bash --backend daemon --sweeps a,b
 #
-# Sweeps:
-#   A  num_topics        (subscribers=2, 100 Hz)
-#   B  num_subscribers   (topics=10, 100 Hz)
-#   C  rate_hz           (topics=10, subscribers=4)
-#   D  topics x subscribers grid (100 Hz)
+# Sweeps follow ipc_shared_ptr paper §VII TABLE IV (R=100 Hz throughout):
+#   A     num_topics              (subscribers=2, 100 Hz)
+#   B     num_subscribers         (topics=10, 100 Hz)
+#   C     topics x subscribers    (100 Hz)
+#   rate  rate_hz                 (topics=10, subscribers=4)  — not in the paper
+#
+# Default is a,b,c. Pass --sweeps rate to add the extra rate axis.
 #
 # Configurations whose event rate exceeds EVENT_BUDGET are skipped, so a sweep
 # never reports numbers that are really just a saturated machine. The event rate
@@ -25,9 +27,9 @@ BACKEND=""
 OUTPUT_ROOT=""
 ITERATIONS=5
 DURATION=10
-WARMUP=5
+WARMUP=2
 QOS_DEPTH=10
-SWEEPS="a,b,c,d"
+SWEEPS="a,b,c"
 EXTRA_ARGS=()
 
 # Empirical capacity of this host, derated to 60%. The reference 8C/16T Xeon
@@ -46,7 +48,8 @@ while [[ $# -gt 0 ]]; do
   --sweeps) SWEEPS="$2"; shift 2 ;;
   --event-budget) EVENT_BUDGET="$2"; shift 2 ;;
   --no-rt) EXTRA_ARGS+=(--no-rt); shift ;;
-  -h | --help) sed -n '3,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
+  --daemon-rt-priority) EXTRA_ARGS+=(--daemon-rt-priority "$2"); shift 2 ;;
+  -h | --help) sed -n '3,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
   *) die "unknown option: $1" ;;
   esac
 done
@@ -89,6 +92,7 @@ echo "========================================================"
 echo " Sweeps for backend: ${BACKEND} ($(backend_label "${BACKEND}"))"
 echo " Output:       ${OUTPUT_ROOT}"
 echo " Sweeps:       ${SWEEPS}"
+echo " Warmup:       ${WARMUP}s"
 echo " Event budget: ${EVENT_BUDGET} events/s"
 echo "========================================================"
 
@@ -96,7 +100,7 @@ echo "========================================================"
 # confounded by subscriber fan-out; fan-out is what sweep B measures.
 if wants_sweep a; then
   echo "==== Sweep A: num_topics ===="
-  for nt in 1 25 50 75 100 125 150; do
+  for nt in 1 25 50 75 100 125 150 175 200; do
     run_one "${nt}" 2 100 "${OUTPUT_ROOT}/sweep_a/num_topics_${nt}"
   done
 fi
@@ -109,18 +113,18 @@ if wants_sweep b; then
 fi
 
 if wants_sweep c; then
-  echo "==== Sweep C: rate_hz ===="
-  for rate in 10 50 100 200 500 1000; do
-    run_one 10 4 "${rate}" "${OUTPUT_ROOT}/sweep_c/rate_hz_${rate}"
+  echo "==== Sweep C: num_topics x num_subscribers ===="
+  for nt in 10 20 40 60 80 100; do
+    for ns in 2 4 8 12 16; do
+      run_one "${nt}" "${ns}" 100 "${OUTPUT_ROOT}/sweep_c/nt_${nt}_ns_${ns}"
+    done
   done
 fi
 
-if wants_sweep d; then
-  echo "==== Sweep D: num_topics x num_subscribers ===="
-  for nt in 10 20 40 60 80; do
-    for ns in 2 4 8 12 16; do
-      run_one "${nt}" "${ns}" 100 "${OUTPUT_ROOT}/sweep_d/nt_${nt}_ns_${ns}"
-    done
+if wants_sweep rate; then
+  echo "==== Sweep rate: rate_hz (not in the paper) ===="
+  for rate in 10 50 100 200 500 1000; do
+    run_one 10 4 "${rate}" "${OUTPUT_ROOT}/sweep_rate/rate_hz_${rate}"
   done
 fi
 
