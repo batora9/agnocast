@@ -80,6 +80,23 @@ scripts/bench/run_paper_sweeps.bash --no-prep --output-dir results/paper_sweeps_
 
 Set `AGNOCAST_NO_DISCOVERY_AGENT=1` (handled by runner scripts) to avoid fork storms during multi-process sweeps.
 
+### UDS response wait (`AGNOCAST_UDS_RECV_SPIN_NS`)
+
+Daemon-backend clients always try `recvmsg(MSG_DONTWAIT)` once after `sendmsg`,
+so a reply already in the socket buffer does not sleep in blocking `recvmsg`.
+A short busy-wait (pause + DONTWAIT) can follow; if it misses, the call falls
+back to blocking `recvmsg` (hangup is still `n == 0` on that path).
+
+| `AGNOCAST_UDS_RECV_SPIN_NS` | Behavior |
+|-----------------------------|----------|
+| unset | Adaptive AIMD, hard cap 50 µs. Starts at 0; grows on fast replies, halves after a full spin miss. |
+| `0` | No busy-wait (one DONTWAIT, then blocking). |
+| `N>0` | Fixed busy-wait of N nanoseconds (e.g. `20000` for a 20 µs window). |
+
+The daemon still blocks in `recv()`; this env only affects the client. Do not
+expect SHM-style `down ≈ 0.1 µs`: UDS still needs the daemon's `sendmsg` to
+finish before DONTWAIT can hit.
+
 ### Event budget and skipped points
 
 A configuration whose event rate exceeds `EVENT_BUDGET` is skipped, so the sweep
