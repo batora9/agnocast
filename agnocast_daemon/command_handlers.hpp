@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "hot_channel.hpp"
 #include "memory_allocator.hpp"
 #include "metadata_store.hpp"
 #include "protocol.h"
@@ -14,6 +15,10 @@ public:
   CommandHandlers(MetadataStore & store, MemoryAllocator & allocator);
 
   void dispatch(int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload);
+
+  // Bind this thread's send_response() to a HotChannel. Pass nullptr to write
+  // to the Unix socket (unit tests).
+  static void bind_hot_channel(HotChannel * channel);
 
   // Called when a client disconnects its Unix socket.
   void on_client_disconnect(pid_t client_pid);

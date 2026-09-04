@@ -2,6 +2,7 @@
 #include "command_handlers.hpp"
 
 #include "bench_timing.hpp"
+#include "hot_channel.hpp"
 
 #include <fcntl.h>
 #include <mqueue.h>
@@ -352,9 +353,19 @@ BridgeInfo * find_bridge_info(MetadataStore & store, const std::string & topic_n
 // CommandHandlers
 // ============================================================
 
+namespace
+{
+thread_local HotChannel * t_hot_channel = nullptr;
+}
+
 CommandHandlers::CommandHandlers(MetadataStore & store, MemoryAllocator & allocator)
 : store_(store), allocator_(allocator)
 {
+}
+
+void CommandHandlers::bind_hot_channel(HotChannel * channel)
+{
+  t_hot_channel = channel;
 }
 
 void CommandHandlers::send_response(int fd, int32_t error_code)
@@ -365,6 +376,38 @@ void CommandHandlers::send_response(int fd, int32_t error_code)
 void CommandHandlers::send_response(
   int fd, int32_t error_code, const void * payload, uint32_t payload_size)
 {
+  if (t_hot_channel != nullptr) {
+    HotChannel * ch = t_hot_channel;
+    if (payload != nullptr && payload_size > 0) {
+      if (payload_size > AGNOCAST_HOT_PAYLOAD_SIZE) {
+        ch->error_code = ENOBUFS;
+        ch->response_size = 0;
+      } else {
+        std::memcpy(ch->payload, payload, payload_size);
+        ch->error_code = error_code;
+        ch->response_size = payload_size;
+      }
+    } else {
+      ch->error_code = error_code;
+      ch->response_size = 0;
+    }
+#ifdef AGNOCAST_BENCH_TIMING
+    ch->recv_ns = ::agnocast_daemon_bench::t_recv_ns;
+    ch->lock_begin_ns = ::agnocast_daemon_bench::t_lock_begin_ns;
+    ch->work_ns = ::agnocast_daemon_bench::t_work_ns;
+    ch->send_ns = ::agnocast_daemon_bench::now_ns();
+#else
+    ch->recv_ns = 0;
+    ch->lock_begin_ns = 0;
+    ch->work_ns = 0;
+    ch->send_ns = 0;
+#endif
+    const uint32_t seq = ch->request_seq.load(std::memory_order_relaxed);
+    ch->response_seq.store(seq, std::memory_order_release);
+    hot_futex_wake(&ch->response_seq, 1);
+    return;
+  }
+
   ResponseHeader hdr{error_code, payload_size};
   iovec iov[3];
   int n_iov = 0;
@@ -633,6 +676,7 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
     return;
   }
 
+  AGNOCAST_DAEMON_BENCH_STAMP_LOCK_BEGIN();
   std::unique_lock tlock(wrapper->topic_rwsem);
   AGNOCAST_DAEMON_BENCH_STAMP_WORK();
 
@@ -701,6 +745,7 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
     return;
   }
 
+  AGNOCAST_DAEMON_BENCH_STAMP_LOCK_BEGIN();
   std::shared_lock tlock(wrapper->topic_rwsem);
   AGNOCAST_DAEMON_BENCH_STAMP_WORK();
 
@@ -749,7 +794,10 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
     return;
   }
 
+  AGNOCAST_DAEMON_BENCH_STAMP_LOCK_BEGIN();
   std::shared_lock tlock(wrapper->topic_rwsem);
+  AGNOCAST_DAEMON_BENCH_STAMP_WORK();
+
   SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
   if (!sub_info) {
     send_response(fd, EINVAL);

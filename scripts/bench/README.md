@@ -120,12 +120,13 @@ work. Both `summary.csv` (rows named `<metric>_<segment>`) and the raw
 | Segment | Covers |
 |---------|--------|
 | `req` | client marshals the request and zeroes the response struct |
-| `up` | `sendmsg` until the daemon's `recv` returns: transport plus wakeup |
-| `lock` | daemon dispatch, topic lookup and lock acquisition |
-| `work` | daemon handler body and response fill |
-| `down` | daemon's reply until the client's `recvmsg` returns |
+| `up` | client posts `request_seq` until the daemon observes it (wakeup) |
+| `prep` | daemon dispatch, `global_mutex`, and topic lookup |
+| `lock` | daemon `topic_rwsem` wait |
+| `work` | daemon handler body and response fill (lock held) |
+| `down` | daemon publishes `response_seq` until the client observes it |
 | `post` | client unmarshals the response into the caller's args |
-| `send_syscall` | `sendmsg` alone; nested inside `up`, never summed |
+| `send_syscall` | `futex_wake` of the daemon; nested inside `up`, never summed |
 
 The split needs stamps taken inside the daemon and returned in a response
 trailer, so `agnocast_daemon` must also be built with `AGNOCAST_BENCH_TIMING`

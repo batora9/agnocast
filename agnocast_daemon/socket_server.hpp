@@ -14,15 +14,13 @@
 //
 // Architecture:
 //   Main thread  — epoll-based accept loop (non-blocking).
-//   Client threads — one detached std::thread per connected client; each
-//                    performs blocking recv/send on the client socket.
+//   Client threads — one detached std::thread per connected client. After
+//                    handing the client a memfd HotChannel, each thread waits
+//                    (spin then futex) on that slot instead of recv().
 //
-// This separates the concerns cleanly: the event loop is never blocked by
-// request processing, while per-client serialisation is handled naturally
-// by the thread owning that socket.
-//
-// TODO: replace per-client threads with a thread pool if connection count
-//       becomes a scalability concern.
+// The Unix socket stays open for credentials, the memfd handshake, and hangup
+// detection. Request payloads travel in the HotChannel so the client can spin
+// for the reply without sleeping in recvmsg.
 class SocketServer
 {
 public:
@@ -42,8 +40,8 @@ private:
   // Accept one client from server_fd_ and spawn a handler thread.
   void accept_client();
 
-  // Runs in a per-client thread.  Loops reading requests until the client
-  // disconnects or an error occurs.
+  // Runs in a per-client thread.  Hands the client a HotChannel memfd, then
+  // services requests from that slot until hangup.
   void handle_client(int client_fd, pid_t client_pid);
 
   int server_fd_ = -1;

@@ -6,12 +6,13 @@
  *
  * Transport
  * ---------
- * SOCK_SEQPACKET (Unix Domain Socket) at AGNOCAST_DAEMON_SOCKET_PATH.
+ * Handshake: SOCK_SEQPACKET Unix socket at AGNOCAST_DAEMON_SOCKET_PATH. After
+ * accept() the daemon creates a memfd HotChannel (see hot_channel.hpp) and
+ * passes it with SCM_RIGHTS. Subsequent commands are posted in that mapping
+ * (spin + futex); the socket is kept only for credentials and hangup.
  *
- * SOCK_SEQPACKET is chosen over SOCK_STREAM because it preserves message boundaries:
- * each send()/recv() pair corresponds to exactly one logical request or response,
- * eliminating any need for a length-prefix framing layer.  Unlike SOCK_DGRAM it is
- * connection-oriented and guarantees reliable, in-order delivery within the same host.
+ * SOCK_SEQPACKET is used for the handshake because it is connection-oriented.
+ * PID is still taken from SO_PEERCRED and cannot be spoofed.
  *
  * PID acquisition
  * ---------------
@@ -132,15 +133,15 @@ struct ResponseHeader
  *
  * A daemon built with AGNOCAST_BENCH_TIMING appends this block after the
  * response payload so that a client can split the round trip it observes into
- * "waiting for the daemon to be scheduled" and "work the daemon actually did".
- * All stamps are CLOCK_MONOTONIC nanoseconds, which is system-wide and
- * therefore directly comparable against the client's own stamps.
+ * wakeup (up), prep (dispatch / global_mutex / topic lookup), topic_rwsem wait
+ * (lock), and held-lock work. All stamps are CLOCK_MONOTONIC nanoseconds, which
+ * is system-wide and therefore directly comparable against the client's own
+ * stamps.
  *
- * The trailer is detected by the magic value rather than by size, so a daemon
- * and a client may be built with different settings without corrupting the
- * framing: a client that does not expect it simply lets the extra bytes be
- * truncated, and a client that does expect it sees a zeroed buffer (magic
- * mismatch) when the daemon does not send one.
+ * The trailer is detected by the magic value rather than by a version field. A
+ * client built without AGNOCAST_BENCH_TIMING does not read it (the daemon still
+ * appends it when timing is enabled). Daemon and client builds that both enable
+ * timing must use the same trailer layout/size.
  * -------------------------------------------------------------------------- */
 #define AGNOCAST_BENCH_TRAILER_MAGIC 0x41474254u /* "AGBT" */
 
@@ -148,9 +149,10 @@ struct BenchTimingTrailer
 {
   uint32_t magic;
   uint32_t _pad;
-  int64_t recv_ns; /* recv() for this request returned */
-  int64_t work_ns; /* handler passed dispatch and acquired its locks; 0 if unstamped */
-  int64_t send_ns; /* immediately before the reply is written to the socket */
+  int64_t recv_ns;       /* recv() for this request returned */
+  int64_t lock_begin_ns; /* about to block on topic_rwsem; 0 if unstamped */
+  int64_t work_ns;       /* topic_rwsem held; 0 if unstamped */
+  int64_t send_ns;       /* immediately before the reply is written to the socket */
 };
 
 /* --------------------------------------------------------------------------
@@ -683,7 +685,7 @@ struct SetRos2PublisherNumRequest
 #ifdef __cplusplus
 static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-static_assert(sizeof(struct BenchTimingTrailer) == 32, "BenchTimingTrailer must be 32 bytes");
+static_assert(sizeof(struct BenchTimingTrailer) == 40, "BenchTimingTrailer must be 40 bytes");
 static_assert(
   sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
 static_assert(
@@ -713,7 +715,7 @@ static_assert(
 #else
 _Static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 _Static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-_Static_assert(sizeof(struct BenchTimingTrailer) == 32, "BenchTimingTrailer must be 32 bytes");
+_Static_assert(sizeof(struct BenchTimingTrailer) == 40, "BenchTimingTrailer must be 40 bytes");
 _Static_assert(
   sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
 _Static_assert(

@@ -23,14 +23,15 @@ from pathlib import Path
 # (segment, column, explanation)
 SEGMENTS = [
     ("req", "ipc_req_ns", "client: marshal request, zero response struct"),
-    ("up", "ipc_up_ns", "sendmsg -> daemon's recv returns (transport + wakeup)"),
-    ("lock", "ipc_lock_ns", "daemon: dispatch, topic lookup, lock acquisition"),
-    ("work", "ipc_work_ns", "daemon: handler body and response fill"),
-    ("down", "ipc_down_ns", "daemon's reply -> client's recvmsg returns"),
+    ("up", "ipc_up_ns", "post request_seq -> daemon observes it (wakeup)"),
+    ("prep", "ipc_prep_ns", "daemon: dispatch, global_mutex, topic lookup"),
+    ("lock", "ipc_lock_ns", "daemon: topic_rwsem wait"),
+    ("work", "ipc_work_ns", "daemon: handler body and response fill (lock held)"),
+    ("down", "ipc_down_ns", "daemon publishes response_seq -> client observes it"),
     ("post", "ipc_post_ns", "client: unmarshal response into caller args"),
 ]
 
-NESTED = [("send_syscall", "ipc_send_syscall_ns", "sendmsg() itself, nested inside up")]
+NESTED = [("send_syscall", "ipc_send_syscall_ns", "futex_wake of the daemon, nested inside up")]
 
 METRICS = [
     ("publish_ipc", "publisher_*_latencies.csv", "publish_ipc_ns"),

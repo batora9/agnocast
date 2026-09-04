@@ -28,6 +28,7 @@ inline int64_t now_ns()
 }
 
 inline thread_local int64_t t_recv_ns = 0;
+inline thread_local int64_t t_lock_begin_ns = 0;
 inline thread_local int64_t t_work_ns = 0;
 
 inline void fill_trailer(BenchTimingTrailer & trailer)
@@ -35,6 +36,7 @@ inline void fill_trailer(BenchTimingTrailer & trailer)
   trailer.magic = AGNOCAST_BENCH_TRAILER_MAGIC;
   trailer._pad = 0;
   trailer.recv_ns = t_recv_ns;
+  trailer.lock_begin_ns = t_lock_begin_ns;
   trailer.work_ns = t_work_ns;
   trailer.send_ns = now_ns();
 }
@@ -46,18 +48,28 @@ inline void fill_trailer(BenchTimingTrailer & trailer)
 #define AGNOCAST_DAEMON_BENCH_STAMP_RECV() \
   (::agnocast_daemon_bench::t_recv_ns = ::agnocast_daemon_bench::now_ns())
 
-// Stamped by a handler once it is past dispatch and holds its locks, so that
-// lock acquisition is separated from the metadata work itself.
+// Stamped immediately before constructing the topic_rwsem lock, so the wait on
+// that lock is separated from dispatch / global_mutex / topic lookup.
+#define AGNOCAST_DAEMON_BENCH_STAMP_LOCK_BEGIN() \
+  (::agnocast_daemon_bench::t_lock_begin_ns = ::agnocast_daemon_bench::now_ns())
+
+// Stamped once topic_rwsem is held, so that lock wait is separated from the
+// metadata work itself.
 #define AGNOCAST_DAEMON_BENCH_STAMP_WORK() \
   (::agnocast_daemon_bench::t_work_ns = ::agnocast_daemon_bench::now_ns())
 
-// Handlers that do not stamp their work start report 0, which the client reads
-// as "not decomposed"; clear it so a previous request cannot leak into this one.
-#define AGNOCAST_DAEMON_BENCH_CLEAR_WORK() (::agnocast_daemon_bench::t_work_ns = 0)
+// Handlers that do not stamp lock/work report 0, which the client reads as
+// "not decomposed"; clear them so a previous request cannot leak into this one.
+#define AGNOCAST_DAEMON_BENCH_CLEAR_WORK()        \
+  do {                                            \
+    ::agnocast_daemon_bench::t_lock_begin_ns = 0; \
+    ::agnocast_daemon_bench::t_work_ns = 0;       \
+  } while (0)
 
 #else  // AGNOCAST_BENCH_TIMING
 
 #define AGNOCAST_DAEMON_BENCH_STAMP_RECV() static_cast<void>(0)
+#define AGNOCAST_DAEMON_BENCH_STAMP_LOCK_BEGIN() static_cast<void>(0)
 #define AGNOCAST_DAEMON_BENCH_STAMP_WORK() static_cast<void>(0)
 #define AGNOCAST_DAEMON_BENCH_CLEAR_WORK() static_cast<void>(0)
 

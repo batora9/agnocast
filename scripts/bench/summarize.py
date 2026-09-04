@@ -41,6 +41,7 @@ IPC_SEGMENTS = [
     ("req", "ipc_req_ns"),
     ("send_syscall", "ipc_send_syscall_ns"),
     ("up", "ipc_up_ns"),
+    ("prep", "ipc_prep_ns"),
     ("lock", "ipc_lock_ns"),
     ("work", "ipc_work_ns"),
     ("down", "ipc_down_ns"),
