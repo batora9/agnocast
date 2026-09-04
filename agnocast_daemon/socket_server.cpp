@@ -2,26 +2,27 @@
 #include "socket_server.hpp"
 
 #include "bench_timing.hpp"
+#include "hot_channel.hpp"
 
+#include <linux/memfd.h>
+#include <poll.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 static constexpr int kMaxEpollEvents = 64;
 static constexpr int kEpollTimeoutMs = 1000;
-
-// Maximum size of a single request message (RequestHeader + largest payload).
-// AddSubscriberRequest (524 bytes) is the largest payload; 600 adds margin.
-static constexpr size_t kMaxRequestSize = sizeof(RequestHeader) + 600;
 
 // ============================================================
 // Construction / destruction
@@ -151,50 +152,125 @@ void SocketServer::accept_client()
 // Per-client request loop
 // ============================================================
 
+static int create_hot_memfd()
+{
+  const int fd = static_cast<int>(syscall(SYS_memfd_create, "agnocast-hot", MFD_CLOEXEC));
+  if (fd < 0) return -1;
+  if (ftruncate(fd, static_cast<off_t>(sizeof(HotChannel))) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static bool send_memfd(int sock, int memfd)
+{
+  char dummy = 0;
+  iovec iov{};
+  iov.iov_base = &dummy;
+  iov.iov_len = 1;
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof(cbuf);
+  cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  std::memcpy(CMSG_DATA(cmsg), &memfd, sizeof(int));
+  return sendmsg(sock, &msg, MSG_NOSIGNAL) >= 0;
+}
+
+static bool socket_hung_up(int client_fd)
+{
+  pollfd pfd{};
+  pfd.fd = client_fd;
+  pfd.events = POLLHUP | POLLERR | POLLIN;
+  const int n = poll(&pfd, 1, 0);
+  if (n < 0) {
+    return errno != EINTR;
+  }
+  if (n == 0) return false;
+  if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+  if (pfd.revents & POLLIN) {
+    char discard;
+    const ssize_t r = recv(client_fd, &discard, 1, MSG_DONTWAIT);
+    return r == 0;
+  }
+  return false;
+}
+
 void SocketServer::handle_client(int client_fd, pid_t client_pid)
 {
-  std::vector<uint8_t> buf(kMaxRequestSize);
+  const int memfd = create_hot_memfd();
+  if (memfd < 0) {
+    fprintf(
+      stderr, "agnocast_daemon: memfd_create failed (pid=%d): %s\n", client_pid, strerror(errno));
+    return;
+  }
+  void * map = mmap(nullptr, sizeof(HotChannel), PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  if (map == MAP_FAILED) {
+    fprintf(
+      stderr, "agnocast_daemon: mmap hot channel failed (pid=%d): %s\n", client_pid,
+      strerror(errno));
+    close(memfd);
+    return;
+  }
+  auto * channel = new (map) HotChannel{};
+  if (!send_memfd(client_fd, memfd)) {
+    fprintf(
+      stderr, "agnocast_daemon: send memfd failed (pid=%d): %s\n", client_pid, strerror(errno));
+    munmap(map, sizeof(HotChannel));
+    close(memfd);
+    return;
+  }
+  close(memfd);
+
+  CommandHandlers::bind_hot_channel(channel);
+  uint32_t served = 0;
 
   while (!shutdown_requested_) {
-    // For SOCK_SEQPACKET, one recv() delivers exactly one message (the full
-    // packet sent by the client).  MSG_TRUNC would indicate buffer overflow.
-    const ssize_t n = recv(client_fd, buf.data(), buf.size(), MSG_TRUNC);
+    if (channel->request_seq.load(std::memory_order_acquire) != served) {
+      // fall through to handle
+    } else if (hot_spin_until(&channel->request_seq, served + 1, AGNOCAST_HOT_DAEMON_SPIN_NS)) {
+      // next seq arrived during the spin; served+1 may skip if client ever
+      // posts by more than 1, so re-read below
+    } else {
+      if (socket_hung_up(client_fd)) break;
+      const uint32_t expected = channel->request_seq.load(std::memory_order_relaxed);
+      if (expected != served) {
+        // posted while we checked hangup
+      } else {
+        timespec ts{};
+        ts.tv_nsec = 50000000;  // 50 ms, so shutdown and hangup are noticed
+        hot_futex_wait(&channel->request_seq, expected, &ts);
+        continue;
+      }
+    }
+
+    const uint32_t posted = channel->request_seq.load(std::memory_order_acquire);
+    if (posted == served) continue;
+
     AGNOCAST_DAEMON_BENCH_STAMP_RECV();
     AGNOCAST_DAEMON_BENCH_CLEAR_WORK();
-    if (n == 0) break;  // client closed the connection
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      fprintf(stderr, "agnocast_daemon: recv() failed (pid=%d): %s\n", client_pid, strerror(errno));
-      break;
-    }
-    if (static_cast<size_t>(n) > kMaxRequestSize) {
-      // MSG_TRUNC caused truncation — reject the oversized message.
-      fprintf(
-        stderr, "agnocast_daemon: oversized message from pid=%d (%zd bytes)\n", client_pid, n);
-      break;
-    }
-    if (static_cast<size_t>(n) < sizeof(RequestHeader)) {
-      fprintf(
-        stderr, "agnocast_daemon: message too short from pid=%d (%zd bytes)\n", client_pid, n);
-      break;
-    }
 
     RequestHeader hdr{};
-    memcpy(&hdr, buf.data(), sizeof(hdr));
-
-    const size_t expected = sizeof(RequestHeader) + hdr.payload_size;
-    if (static_cast<size_t>(n) != expected) {
+    hdr.command = channel->command;
+    hdr.payload_size = channel->request_size;
+    if (hdr.payload_size > AGNOCAST_HOT_PAYLOAD_SIZE) {
       fprintf(
-        stderr,
-        "agnocast_daemon: payload size mismatch from pid=%d "
-        "(got %zd, expected %zu)\n",
-        client_pid, n, expected);
+        stderr, "agnocast_daemon: oversized hot payload from pid=%d (%u bytes)\n", client_pid,
+        hdr.payload_size);
       break;
     }
-
-    const void * payload = (hdr.payload_size > 0) ? buf.data() + sizeof(RequestHeader) : nullptr;
+    const void * payload = (hdr.payload_size > 0) ? channel->payload : nullptr;
     handlers_.dispatch(client_fd, client_pid, hdr, payload);
+    served = posted;
   }
 
+  CommandHandlers::bind_hot_channel(nullptr);
+  munmap(map, sizeof(HotChannel));
   handlers_.on_client_disconnect(client_pid);
 }

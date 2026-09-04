@@ -167,13 +167,13 @@ private:
     // The ipc_* columns decompose receive_ipc_ns; they are all zero under the
     // kernel-module backend, which has no separate servicing entity to attribute.
     ofs << "topic_idx,seq,e2e_latency_ns,receive_ipc_ns,"
-        << "ipc_total_ns,ipc_req_ns,ipc_send_syscall_ns,ipc_up_ns,ipc_lock_ns,"
+        << "ipc_total_ns,ipc_req_ns,ipc_send_syscall_ns,ipc_up_ns,ipc_prep_ns,ipc_lock_ns,"
         << "ipc_work_ns,ipc_down_ns,ipc_post_ns,ipc_daemon_stamped\n";
     for (const Sample & s : samples_) {
       ofs << topic_index_ << "," << s.seq << "," << s.e2e_latency_ns << "," << s.receive_ipc_ns
           << "," << s.ipc.total_ns << "," << s.ipc.req_ns << "," << s.ipc.send_syscall_ns << ","
-          << s.ipc.up_ns << "," << s.ipc.lock_ns << "," << s.ipc.work_ns << "," << s.ipc.down_ns
-          << "," << s.ipc.post_ns << "," << s.ipc.daemon_stamped << "\n";
+          << s.ipc.up_ns << "," << s.ipc.prep_ns << "," << s.ipc.lock_ns << "," << s.ipc.work_ns
+          << "," << s.ipc.down_ns << "," << s.ipc.post_ns << "," << s.ipc.daemon_stamped << "\n";
     }
   }
 

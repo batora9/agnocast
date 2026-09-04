@@ -20,9 +20,9 @@ int64_t get_last_receive_ipc_ns();
 
 // Non-overlapping segments of one metadata round trip, in nanoseconds.
 //
-// req + up + lock + work + down + post == total, so the segments can be stacked
-// directly. `send_syscall` is a nested measurement inside `up` and is reported
-// separately rather than added.
+// req + up + prep + lock + work + down + post == total, so the segments can be
+// stacked directly. `send_syscall` is a nested measurement inside `up` and is
+// reported separately rather than added.
 //
 // Only the user-daemon backend can fill this in: the split relies on stamps
 // taken inside the daemon and carried back in the response trailer. Under the
@@ -33,15 +33,16 @@ struct IpcBreakdown
 {
   int64_t total_ns;         // whole agnocast_ipc_* call
   int64_t req_ns;           // marshal the request and zero the response struct
-  int64_t send_syscall_ns;  // sendmsg() itself; nested inside up_ns
-  int64_t up_ns;            // sendmsg .. daemon's recv() returning (transport + wakeup)
-  int64_t lock_ns;          // daemon: dispatch, topic lookup, lock acquisition
-  int64_t work_ns;          // daemon: handler body and response fill
-  int64_t down_ns;          // daemon's reply .. client's recvmsg returning
+  int64_t send_syscall_ns;  // futex_wake of the daemon; nested inside up_ns
+  int64_t up_ns;            // post request_seq .. daemon observes it (wakeup)
+  int64_t prep_ns;          // daemon: dispatch, global_mutex, topic lookup
+  int64_t lock_ns;          // daemon: topic_rwsem wait
+  int64_t work_ns;          // daemon: handler body and response fill (lock held)
+  int64_t down_ns;          // daemon publishes response_seq .. client observes it
   int64_t post_ns;          // unmarshal the response into the caller's args
   // 1 when the daemon supplied its stamps. When 0, up_ns holds the entire
-  // sendmsg-to-recvmsg span and lock/work/down are 0, so the segments still sum
-  // to total_ns but the daemon-internal split is unavailable.
+  // sendmsg-to-recvmsg span and prep/lock/work/down are 0, so the segments still
+  // sum to total_ns but the daemon-internal split is unavailable.
   int64_t daemon_stamped;
 };
 

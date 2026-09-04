@@ -4,13 +4,17 @@
 #include "agnocast/agnocast_bench_timing.hpp"
 #include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_utils.hpp"
+#include "hot_channel.hpp"
 #include "protocol.h"
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -18,6 +22,60 @@ namespace agnocast
 {
 
 static std::mutex socket_mtx;
+static HotChannel * g_hot_channel = nullptr;
+static size_t g_hot_channel_size = 0;
+
+void unmap_daemon_hot_channel()
+{
+  if (g_hot_channel != nullptr) {
+    munmap(g_hot_channel, g_hot_channel_size);
+    g_hot_channel = nullptr;
+    g_hot_channel_size = 0;
+  }
+}
+
+static int recv_memfd(int sock)
+{
+  char dummy = 0;
+  iovec iov{};
+  iov.iov_base = &dummy;
+  iov.iov_len = 1;
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof(cbuf);
+  if (recvmsg(sock, &msg, 0) < 0) {
+    return -1;
+  }
+  cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+  if (cmsg == nullptr || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+    errno = EPROTO;
+    return -1;
+  }
+  int memfd = -1;
+  std::memcpy(&memfd, CMSG_DATA(cmsg), sizeof(int));
+  return memfd;
+}
+
+void map_daemon_hot_channel(int sock)
+{
+  unmap_daemon_hot_channel();
+  const int memfd = recv_memfd(sock);
+  if (memfd < 0) {
+    RCLCPP_ERROR(logger, "recv hot-channel memfd failed: %s", std::strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  void * map = mmap(nullptr, sizeof(HotChannel), PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  close(memfd);
+  if (map == MAP_FAILED) {
+    RCLCPP_ERROR(logger, "mmap hot channel failed: %s", std::strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  g_hot_channel = static_cast<HotChannel *>(map);
+  g_hot_channel_size = sizeof(HotChannel);
+}
 
 #ifdef AGNOCAST_BENCH_TIMING
 namespace
@@ -28,10 +86,11 @@ namespace
 // overwrite them.
 struct CallStamps
 {
-  int64_t send_begin;   // client, immediately before sendmsg
-  int64_t send_end;     // client, immediately after sendmsg
-  int64_t recv_end;     // client, immediately after recvmsg
-  int64_t daemon_recv;  // daemon stamps, 0 when the response carried no trailer
+  int64_t send_begin;   // client, immediately before posting the SHM slot
+  int64_t send_end;     // client, immediately after publishing request_seq
+  int64_t recv_end;     // client, immediately after observing response_seq
+  int64_t daemon_recv;  // daemon stamps, 0 when the slot carried none
+  int64_t daemon_lock_begin;
   int64_t daemon_work;
   int64_t daemon_send;
 };
@@ -60,7 +119,13 @@ void finalize_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
   out.up_ns = s.daemon_recv - s.send_begin;
   out.down_ns = s.recv_end - s.daemon_send;
   if (s.daemon_work != 0) {
-    out.lock_ns = s.daemon_work - s.daemon_recv;
+    if (s.daemon_lock_begin != 0) {
+      out.prep_ns = s.daemon_lock_begin - s.daemon_recv;
+      out.lock_ns = s.daemon_work - s.daemon_lock_begin;
+    } else {
+      // Older daemon without lock_begin: fold prep into lock.
+      out.lock_ns = s.daemon_work - s.daemon_recv;
+    }
     out.work_ns = s.daemon_send - s.daemon_work;
   } else {
     out.work_ns = s.daemon_send - s.daemon_recv;
@@ -86,57 +151,51 @@ static int daemon_call(
 {
   std::lock_guard<std::mutex> lock(socket_mtx);
 
-  // --- send request ---
-  RequestHeader req_hdr{cmd, req_size};
-  iovec iov[2];
-  iov[0] = {&req_hdr, sizeof(req_hdr)};
-  iov[1] = {const_cast<void *>(req_payload), req_size};
-  msghdr send_msg{};
-  send_msg.msg_iov = iov;
-  send_msg.msg_iovlen = (req_size > 0) ? 2 : 1;
+  if (g_hot_channel == nullptr) {
+    errno = ENOTCONN;
+    return -1;
+  }
+  if (req_size > AGNOCAST_HOT_PAYLOAD_SIZE) {
+    errno = ENOBUFS;
+    return -1;
+  }
+
+  HotChannel * ch = g_hot_channel;
+  const uint32_t seq = ch->request_seq.load(std::memory_order_relaxed) + 1;
+  if (req_payload != nullptr && req_size > 0) {
+    std::memcpy(ch->payload, req_payload, req_size);
+  }
+  ch->command = cmd;
+  ch->request_size = req_size;
 #ifdef AGNOCAST_BENCH_TIMING
   g_stamps = CallStamps{};
   g_stamps.send_begin = bench_timing_now_ns();
 #endif
-  if (sendmsg(agnocast_fd, &send_msg, MSG_NOSIGNAL) < 0) {
-    return -1;
-  }
+  ch->request_seq.store(seq, std::memory_order_release);
 #ifdef AGNOCAST_BENCH_TIMING
   g_stamps.send_end = bench_timing_now_ns();
 #endif
+  hot_futex_wake(&ch->request_seq, 1);
 
-  // --- receive response ---
-  ResponseHeader resp_hdr{};
-  iovec riov[3];
-  int n_riov = 0;
-  riov[n_riov++] = {&resp_hdr, sizeof(resp_hdr)};
-  if (resp_size > 0 && resp_payload != nullptr) {
-    riov[n_riov++] = {resp_payload, resp_size};
-  }
-#ifdef AGNOCAST_BENCH_TIMING
-  // Filled only if the daemon appends a trailer; stays zeroed otherwise, which
-  // finalize_breakdown() detects through the magic value.
-  BenchTimingTrailer trailer{};
-  riov[n_riov++] = {&trailer, sizeof(trailer)};
-#endif
-  msghdr recv_msg{};
-  recv_msg.msg_iov = riov;
-  recv_msg.msg_iovlen = static_cast<size_t>(n_riov);
-  if (recvmsg(agnocast_fd, &recv_msg, 0) < 0) {
+  if (!hot_wait_until(&ch->response_seq, seq, AGNOCAST_HOT_CLIENT_SPIN_NS, 1000000000LL)) {
+    errno = ETIMEDOUT;
     return -1;
   }
 #ifdef AGNOCAST_BENCH_TIMING
   g_stamps.recv_end = bench_timing_now_ns();
-  if (trailer.magic == AGNOCAST_BENCH_TRAILER_MAGIC) {
-    g_stamps.daemon_recv = trailer.recv_ns;
-    g_stamps.daemon_work = trailer.work_ns;
-    g_stamps.daemon_send = trailer.send_ns;
-  }
+  g_stamps.daemon_recv = ch->recv_ns;
+  g_stamps.daemon_lock_begin = ch->lock_begin_ns;
+  g_stamps.daemon_work = ch->work_ns;
+  g_stamps.daemon_send = ch->send_ns;
 #endif
 
-  if (resp_hdr.error_code != 0) {
-    errno = resp_hdr.error_code;
+  if (ch->error_code != 0) {
+    errno = ch->error_code;
     return -1;
+  }
+  if (resp_payload != nullptr && resp_size > 0 && ch->response_size > 0) {
+    const uint32_t n = (ch->response_size < resp_size) ? ch->response_size : resp_size;
+    std::memcpy(resp_payload, ch->payload, n);
   }
   return 0;
 }

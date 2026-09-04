@@ -37,6 +37,11 @@ const char * agnocast_get_version()
 namespace agnocast
 {
 
+#ifdef AGNOCAST_USE_DAEMON
+void map_daemon_hot_channel(int sock);
+void unmap_daemon_hot_channel();
+#endif
+
 int agnocast_fd = -1;
 std::vector<int> shm_fds;
 std::mutex shm_fds_mtx;
@@ -458,14 +463,8 @@ pid_t spawn_daemon_process(Func && func)
     }
 
 #ifdef AGNOCAST_USE_DAEMON
-    // The daemon identifies each client per connection, using the PID reported
-    // by SO_PEERCRED at connect time. A forked child inherits the parent's single
-    // socket connection, so without a fresh connection the daemon would attribute
-    // the child's requests to the parent PID (breaking add_process, memory
-    // assignment, and exit cleanup) and the two processes would interleave
-    // requests/responses on one stream. Drop the inherited connection and open a
-    // dedicated one for this child.
     close(agnocast_fd);
+    unmap_daemon_hot_channel();
     connect_to_daemon_socket();
 #endif
 
@@ -508,6 +507,7 @@ static void connect_to_daemon_socket()
     agnocast_fd = -1;
     exit(EXIT_FAILURE);
   }
+  map_daemon_hot_channel(agnocast_fd);
 }
 #endif
 
