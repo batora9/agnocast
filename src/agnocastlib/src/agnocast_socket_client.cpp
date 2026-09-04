@@ -8,9 +8,14 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -79,6 +84,161 @@ void finalize_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
 #define AGNOCAST_BENCH_CALL_LEAVE(slot) static_cast<void>(0)
 #endif  // AGNOCAST_BENCH_TIMING
 
+// Client-side wait for the daemon reply. Always tries MSG_DONTWAIT once so a
+// datagram already in the socket buffer does not require a blocking recvmsg
+// wakeup. Optional busy-wait (pause + DONTWAIT) is AIMD-capped, disabled, or
+// a fixed window via AGNOCAST_UDS_RECV_SPIN_NS.
+namespace
+{
+
+constexpr int64_t kAdaptiveSpinCapNs = 50000;  // 50 us; stay far below a timeslice
+constexpr int64_t kAdaptiveSpinAddNs = 2000;   // 2 us
+constexpr int64_t kAdaptiveSpinFloorNs = 1000;
+
+enum class RecvSpinMode {
+  Adaptive,
+  Fixed,
+  Disabled,
+};
+
+struct RecvSpinConfig
+{
+  RecvSpinMode mode = RecvSpinMode::Adaptive;
+  int64_t fixed_ns = 0;
+};
+
+void cpu_relax()
+{
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+int64_t monotonic_now_ns()
+{
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+RecvSpinConfig load_recv_spin_config()
+{
+  const char * v = std::getenv("AGNOCAST_UDS_RECV_SPIN_NS");
+  if (v == nullptr || v[0] == '\0') {
+    return {};
+  }
+  char * end = nullptr;
+  const long long n = std::strtoll(v, &end, 10);
+  if (end == v || *end != '\0' || n < 0) {
+    RCLCPP_WARN(
+      logger, "AGNOCAST_UDS_RECV_SPIN_NS='%s' is invalid; using adaptive spin (cap %lld ns)", v,
+      static_cast<long long>(kAdaptiveSpinCapNs));
+    return {};
+  }
+  RecvSpinConfig cfg{};
+  if (n == 0) {
+    cfg.mode = RecvSpinMode::Disabled;
+  } else {
+    cfg.mode = RecvSpinMode::Fixed;
+    cfg.fixed_ns = static_cast<int64_t>(n);
+  }
+  return cfg;
+}
+
+const RecvSpinConfig & recv_spin_config()
+{
+  static const RecvSpinConfig cfg = load_recv_spin_config();
+  return cfg;
+}
+
+void adaptive_on_hit(int64_t & budget)
+{
+  budget = std::min(kAdaptiveSpinCapNs, budget + kAdaptiveSpinAddNs);
+}
+
+void adaptive_on_spin_miss(int64_t & budget)
+{
+  budget /= 2;
+  if (budget < kAdaptiveSpinFloorNs) {
+    budget = 0;
+  }
+}
+
+thread_local int64_t t_spin_budget_ns = 0;
+
+ssize_t recvmsg_dontwait(int fd, msghdr * msg)
+{
+  while (true) {
+    const ssize_t n = recvmsg(fd, msg, MSG_DONTWAIT);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    return n;
+  }
+}
+
+// 0 on a complete datagram, -1 on error (errno set).
+int recv_response(msghdr * recv_msg)
+{
+  const RecvSpinConfig & cfg = recv_spin_config();
+
+  ssize_t n = recvmsg_dontwait(agnocast_fd, recv_msg);
+  if (n >= 0) {
+    if (cfg.mode == RecvSpinMode::Adaptive) {
+      adaptive_on_hit(t_spin_budget_ns);
+    }
+    return 0;
+  }
+  if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    return -1;
+  }
+
+  int64_t budget = 0;
+  if (cfg.mode == RecvSpinMode::Fixed) {
+    budget = cfg.fixed_ns;
+  } else if (cfg.mode == RecvSpinMode::Adaptive) {
+    budget = t_spin_budget_ns;
+  }
+
+  const bool spun = budget > 0;
+  if (spun) {
+    const int64_t start = monotonic_now_ns();
+    while (monotonic_now_ns() - start < budget) {
+      cpu_relax();
+      n = recvmsg_dontwait(agnocast_fd, recv_msg);
+      if (n >= 0) {
+        if (cfg.mode == RecvSpinMode::Adaptive) {
+          adaptive_on_hit(t_spin_budget_ns);
+        }
+        return 0;
+      }
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        return -1;
+      }
+    }
+  }
+
+  const int64_t block_begin = monotonic_now_ns();
+  n = recvmsg(agnocast_fd, recv_msg, 0);
+  if (n < 0) {
+    return -1;
+  }
+  if (cfg.mode == RecvSpinMode::Adaptive) {
+    if (spun) {
+      adaptive_on_spin_miss(t_spin_budget_ns);
+    } else if (monotonic_now_ns() - block_begin < kAdaptiveSpinCapNs) {
+      // Budget was 0 so we never spun; a short blocking wait means a small
+      // window would have hit. Grow so the next call can busy-wait.
+      adaptive_on_hit(t_spin_budget_ns);
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
 // Returns 0 on success, sets errno on failure.
 static int daemon_call(
   uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
@@ -122,7 +282,7 @@ static int daemon_call(
   msghdr recv_msg{};
   recv_msg.msg_iov = riov;
   recv_msg.msg_iovlen = static_cast<size_t>(n_riov);
-  if (recvmsg(agnocast_fd, &recv_msg, 0) < 0) {
+  if (recv_response(&recv_msg) < 0) {
     return -1;
   }
 #ifdef AGNOCAST_BENCH_TIMING
