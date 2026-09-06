@@ -102,9 +102,17 @@ inline int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_n
 {
   return ioctl(agnocast_fd, AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD, args);
 }
+inline int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args)
+{
+  return ioctl(agnocast_fd, AGNOCAST_GET_TOPIC_LIST_CMD, args);
+}
 inline int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args)
 {
   return ioctl(agnocast_fd, AGNOCAST_GET_TOPIC_SUBSCRIBER_INFO_CMD, args);
+}
+inline int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args)
+{
+  return ioctl(agnocast_fd, AGNOCAST_GET_TOPIC_PUBLISHER_INFO_CMD, args);
 }
 
 #else  // AGNOCAST_USE_DAEMON
@@ -134,7 +142,9 @@ int agnocast_ipc_check_and_request_bridge_shutdown(
 int agnocast_ipc_notify_bridge_shutdown();
 int agnocast_ipc_set_ros2_subscriber_num(struct ioctl_set_ros2_subscriber_num_args * args);
 int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args * args);
+int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args);
 int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args);
+int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args);
 
 #endif  // AGNOCAST_USE_DAEMON
 

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 namespace agnocast
@@ -653,29 +654,83 @@ int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args
   return daemon_call(AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM, &req, sizeof(req), nullptr, 0);
 }
 
+int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args)
+{
+  const uint64_t name_buf_addr = args->topic_name_buffer_addr;
+  const uint64_t domain_buf_addr = args->domain_id_buffer_addr;
+  const uint32_t name_buf_size = args->topic_name_buffer_size;
+
+  GetTopicListResponse resp{};
+  int r = daemon_call(AGNOCAST_CMD_GET_TOPIC_LIST, nullptr, 0, &resp, sizeof(resp));
+  if (r == 0) {
+    uint32_t copy_count = resp.topic_num;
+    if (copy_count > name_buf_size) {
+      copy_count = name_buf_size;
+    }
+    auto * name_buf = reinterpret_cast<char *>(name_buf_addr);
+    if (name_buf != nullptr) {
+      for (uint32_t i = 0; i < copy_count; i++) {
+        char * dst = name_buf + static_cast<size_t>(i) * TOPIC_NAME_BUFFER_SIZE;
+        std::strncpy(dst, resp.topic_names[i], TOPIC_NAME_BUFFER_SIZE - 1);
+        dst[TOPIC_NAME_BUFFER_SIZE - 1] = '\0';
+      }
+    }
+    auto * domain_buf = reinterpret_cast<uint32_t *>(domain_buf_addr);
+    if (domain_buf != nullptr) {
+      for (uint32_t i = 0; i < copy_count; i++) {
+        domain_buf[i] = 0;
+      }
+    }
+    args->ret_topic_num = copy_count;
+  }
+  return r;
+}
+
+static void copy_topic_info_entries(
+  union ioctl_topic_info_args * args, uint32_t entry_num, const AgnocastTopicInfoEntry * entries)
+{
+  const uint64_t buf_addr = args->topic_info_ret_buffer_addr;
+  const uint32_t buf_size = args->topic_info_ret_buffer_size;
+  uint32_t copy_count = (entry_num < buf_size) ? entry_num : buf_size;
+  auto * buf = reinterpret_cast<topic_info_ret *>(buf_addr);
+  if (buf != nullptr) {
+    for (uint32_t i = 0; i < copy_count; i++) {
+      std::strncpy(buf[i].node_name, entries[i].node_name, NODE_NAME_BUFFER_SIZE - 1);
+      buf[i].node_name[NODE_NAME_BUFFER_SIZE - 1] = '\0';
+      buf[i].qos_depth = entries[i].qos_depth;
+      buf[i].qos_is_transient_local = entries[i].qos_is_transient_local;
+      buf[i].qos_is_reliable = entries[i].qos_is_reliable;
+      buf[i].is_bridge = entries[i].is_bridge;
+    }
+  }
+  args->ret_topic_info_ret_num = copy_count;
+}
+
 int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args)
 {
   GetTopicSubscriberInfoRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
-  GetTopicSubscriberInfoResponse resp{};
-  int r =
-    daemon_call(AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO, &req, sizeof(req), &resp, sizeof(resp));
+  // Heap-allocate: the inline entry array is ~811 KiB and must not live on the stack.
+  auto resp = std::make_unique<GetTopicSubscriberInfoResponse>();
+  std::memset(resp.get(), 0, sizeof(*resp));
+  int r = daemon_call(
+    AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO, &req, sizeof(req), resp.get(), sizeof(*resp));
   if (r == 0) {
-    args->ret_topic_info_ret_num = resp.entry_num;
-    auto * buf = reinterpret_cast<topic_info_ret *>(args->topic_info_ret_buffer_addr);
-    if (buf != nullptr) {
-      uint32_t copy_count = (resp.entry_num < args->topic_info_ret_buffer_size)
-                              ? resp.entry_num
-                              : args->topic_info_ret_buffer_size;
-      for (uint32_t i = 0; i < copy_count; i++) {
-        std::strncpy(buf[i].node_name, resp.entries[i].node_name, NODE_NAME_BUFFER_SIZE - 1);
-        buf[i].node_name[NODE_NAME_BUFFER_SIZE - 1] = '\0';
-        buf[i].qos_depth = resp.entries[i].qos_depth;
-        buf[i].qos_is_transient_local = resp.entries[i].qos_is_transient_local;
-        buf[i].qos_is_reliable = resp.entries[i].qos_is_reliable;
-        buf[i].is_bridge = resp.entries[i].is_bridge;
-      }
-    }
+    copy_topic_info_entries(args, resp->entry_num, resp->entries);
+  }
+  return r;
+}
+
+int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args)
+{
+  GetTopicPublisherInfoRequest req{};
+  copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
+  auto resp = std::make_unique<GetTopicPublisherInfoResponse>();
+  std::memset(resp.get(), 0, sizeof(*resp));
+  int r = daemon_call(
+    AGNOCAST_CMD_GET_TOPIC_PUBLISHER_INFO, &req, sizeof(req), resp.get(), sizeof(*resp));
+  if (r == 0) {
+    copy_topic_info_entries(args, resp->entry_num, resp->entries);
   }
   return r;
 }

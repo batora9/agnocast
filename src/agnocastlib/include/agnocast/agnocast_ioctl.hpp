@@ -21,6 +21,7 @@ namespace agnocast
 #define VERSION_BUFFER_LEN 32  // Maximum size of version number represented as a string
 
 #define MAX_TOPIC_INFO_RET_NUM std::max(MAX_PUBLISHER_NUM, MAX_SUBSCRIBER_NUM)
+#define MAX_TOPIC_NUM 1024
 
 #define NODE_NAME_BUFFER_SIZE 256
 #define TOPIC_NAME_BUFFER_SIZE 256
@@ -251,6 +252,21 @@ struct topic_info_ret
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
+union ioctl_topic_list_args {
+  struct
+  {
+    uint64_t topic_name_buffer_addr;
+    // Parallel array of uint32 domain_ids (one per topic name). Pass 0 to skip.
+    // Must mirror agnocast_kmod/agnocast.h so _IOWR encodes the same size.
+    uint64_t domain_id_buffer_addr;
+    uint32_t topic_name_buffer_size;
+  };
+  uint32_t ret_topic_num;
+};
+#pragma GCC diagnostic pop
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 union ioctl_topic_info_args {
   struct
   {
@@ -372,7 +388,9 @@ struct ioctl_set_ros2_publisher_num_args
 #define AGNOCAST_REMOVE_PUBLISHER_CMD _IOW(0xA6, 18, struct ioctl_remove_publisher_args)
 #define AGNOCAST_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN_CMD \
   _IOR(0xA6, 19, struct ioctl_check_and_request_bridge_shutdown_args)
+#define AGNOCAST_GET_TOPIC_LIST_CMD _IOWR(0xA6, 20, union ioctl_topic_list_args)
 #define AGNOCAST_GET_TOPIC_SUBSCRIBER_INFO_CMD _IOWR(0xA6, 21, union ioctl_topic_info_args)
+#define AGNOCAST_GET_TOPIC_PUBLISHER_INFO_CMD _IOWR(0xA6, 22, union ioctl_topic_info_args)
 #define AGNOCAST_SET_ROS2_SUBSCRIBER_NUM_CMD \
   _IOW(0xA6, 25, struct ioctl_set_ros2_subscriber_num_args)
 #define AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD _IOW(0xA6, 26, struct ioctl_set_ros2_publisher_num_args)

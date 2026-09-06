@@ -53,6 +53,13 @@ void decrement_borrowed_publisher_num()
   borrowed_publisher_num--;
 }
 
+thread_local uint32_t last_publish_released_num = 0;
+
+uint32_t get_last_publish_released_num()
+{
+  return last_publish_released_num;
+}
+
 topic_local_id_t initialize_publisher(
   const std::string & topic_name, const std::string & node_name, const rclcpp::QoS & qos,
   const bool is_bridge, const std::string & type_name, std::string & out_mq_topic_name)
@@ -103,7 +110,10 @@ union ioctl_publish_msg_args publish_core(
 
   {
     AGNOCAST_BENCH_TIME_PUBLISH_IPC();
-    if (agnocast_ipc_publish_msg(&publish_msg_args) < 0) {
+    while (agnocast_ipc_publish_msg(&publish_msg_args) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       RCLCPP_ERROR(logger, "AGNOCAST_PUBLISH_MSG_CMD failed: %s", strerror(errno));
       close(agnocast_fd);
       exit(EXIT_FAILURE);
@@ -169,6 +179,7 @@ union ioctl_publish_msg_args publish_core(
     }
   }
 
+  last_publish_released_num = publish_msg_args.ret_released_num;
   return publish_msg_args;
 }
 

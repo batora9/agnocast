@@ -605,7 +605,9 @@ struct GetTopicListResponse
 /* ---- AGNOCAST_CMD_GET_TOPIC_SUBSCRIBER_INFO (21) ---- */
 /* The topic_info_ret_buffer_addr/size in the ioctl is a userspace pointer pair;
  * entries are returned inline.
- * Maximum response size ≈ MAX_SUBSCRIBER_NUM × 264 bytes ≈ 811 KB.
+ * Maximum response size ≈ MAX_SUBSCRIBER_NUM × 264 bytes ≈ 811 KB if the
+ * unused slots are sent. The daemon sends only entry_num used entries so the
+ * seqpacket fits in net.core.wmem_max.
  */
 struct GetTopicSubscriberInfoRequest
 {
