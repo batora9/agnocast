@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -56,6 +58,26 @@ std::string make_mq_name_for_publish(const std::string & topic_name, int32_t sub
     }
   }
   return mq_name;
+}
+
+// Unix seqpacket messages are capped by net.core.wmem_max (~208 KiB here). The
+// inline query responses are much larger if sent in full, so send only the
+// prefix that contains topic_num/entry_num and the used slots.
+static_assert(offsetof(GetTopicListResponse, topic_names) == sizeof(uint32_t));
+static_assert(offsetof(GetNodeTopicsResponse, topic_names) == sizeof(uint32_t));
+static_assert(offsetof(GetTopicSubscriberInfoResponse, entries) == sizeof(uint32_t));
+static_assert(offsetof(GetTopicPublisherInfoResponse, entries) == sizeof(uint32_t));
+
+uint32_t packed_topic_list_bytes(uint32_t topic_num)
+{
+  return static_cast<uint32_t>(
+    sizeof(uint32_t) + static_cast<size_t>(topic_num) * AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE);
+}
+
+uint32_t packed_topic_info_bytes(uint32_t entry_num)
+{
+  return static_cast<uint32_t>(
+    sizeof(uint32_t) + static_cast<size_t>(entry_num) * sizeof(AgnocastTopicInfoEntry));
 }
 
 void unlink_posix_resources_for_exit(
@@ -380,7 +402,11 @@ void CommandHandlers::send_response(
   msghdr msg{};
   msg.msg_iov = iov;
   msg.msg_iovlen = static_cast<size_t>(n_iov);
-  sendmsg(fd, &msg, MSG_NOSIGNAL);
+  if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) {
+    std::fprintf(
+      stderr, "agnocast_daemon: send_response failed: %s (payload_size=%u)\n", std::strerror(errno),
+      payload_size);
+  }
 }
 
 void CommandHandlers::dispatch(
@@ -1169,22 +1195,22 @@ void CommandHandlers::handle_check_and_request_bridge_shutdown(int fd, pid_t pid
 
 void CommandHandlers::handle_get_topic_list(int fd)
 {
-  GetTopicListResponse resp{};
-  resp.topic_num = 0;
+  auto resp = std::make_unique<GetTopicListResponse>();
+  std::memset(resp.get(), 0, sizeof(*resp));
 
   std::shared_lock glock(store_.global_mutex_);
   for (const auto & [key, wrapper] : store_.topic_map_) {
     (void)wrapper;
-    if (resp.topic_num >= AGNOCAST_PROTO_MAX_TOPIC_NUM) {
+    if (resp->topic_num >= AGNOCAST_PROTO_MAX_TOPIC_NUM) {
       send_response(fd, ENOBUFS);
       return;
     }
     strncpy(
-      resp.topic_names[resp.topic_num], key.name.c_str(),
+      resp->topic_names[resp->topic_num], key.name.c_str(),
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
-    resp.topic_num++;
+    resp->topic_num++;
   }
-  send_response(fd, 0, &resp, sizeof(resp));
+  send_response(fd, 0, resp.get(), packed_topic_list_bytes(resp->topic_num));
 }
 
 void CommandHandlers::handle_get_topic_subscriber_info(int fd, pid_t pid, const void * payload)
@@ -1195,13 +1221,13 @@ void CommandHandlers::handle_get_topic_subscriber_info(int fd, pid_t pid, const 
   }
   const auto * req = static_cast<const GetTopicSubscriberInfoRequest *>(payload);
 
-  GetTopicSubscriberInfoResponse resp{};
-  resp.entry_num = 0;
+  auto resp = std::make_unique<GetTopicSubscriberInfoResponse>();
+  std::memset(resp.get(), 0, sizeof(*resp));
 
   std::shared_lock glock(store_.global_mutex_);
   TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
-    send_response(fd, 0, &resp, sizeof(resp));
+    send_response(fd, 0, resp.get(), packed_topic_info_bytes(0));
     return;
   }
 
@@ -1214,15 +1240,15 @@ void CommandHandlers::handle_get_topic_subscriber_info(int fd, pid_t pid, const 
   uint32_t idx = 0;
   for (const auto & [id, sub] : wrapper->topic.sub_info_map) {
     (void)id;
-    auto & e = resp.entries[idx++];
+    auto & e = resp->entries[idx++];
     strncpy(e.node_name, sub.node_name.c_str(), AGNOCAST_PROTO_NODE_NAME_BUFFER_SIZE - 1);
     e.qos_depth = sub.qos_depth;
     e.qos_is_transient_local = sub.qos_is_transient_local;
     e.qos_is_reliable = sub.qos_is_reliable;
     e.is_bridge = sub.is_bridge;
   }
-  resp.entry_num = idx;
-  send_response(fd, 0, &resp, sizeof(resp));
+  resp->entry_num = idx;
+  send_response(fd, 0, resp.get(), packed_topic_info_bytes(idx));
 }
 
 void CommandHandlers::handle_get_topic_publisher_info(int fd, pid_t pid, const void * payload)
@@ -1233,13 +1259,13 @@ void CommandHandlers::handle_get_topic_publisher_info(int fd, pid_t pid, const v
   }
   const auto * req = static_cast<const GetTopicPublisherInfoRequest *>(payload);
 
-  GetTopicPublisherInfoResponse resp{};
-  resp.entry_num = 0;
+  auto resp = std::make_unique<GetTopicPublisherInfoResponse>();
+  std::memset(resp.get(), 0, sizeof(*resp));
 
   std::shared_lock glock(store_.global_mutex_);
   TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
   if (!wrapper) {
-    send_response(fd, 0, &resp, sizeof(resp));
+    send_response(fd, 0, resp.get(), packed_topic_info_bytes(0));
     return;
   }
 
@@ -1252,15 +1278,15 @@ void CommandHandlers::handle_get_topic_publisher_info(int fd, pid_t pid, const v
   uint32_t idx = 0;
   for (const auto & [id, pub] : wrapper->topic.pub_info_map) {
     (void)id;
-    auto & e = resp.entries[idx++];
+    auto & e = resp->entries[idx++];
     strncpy(e.node_name, pub.node_name.c_str(), AGNOCAST_PROTO_NODE_NAME_BUFFER_SIZE - 1);
     e.qos_depth = pub.qos_depth;
     e.qos_is_transient_local = pub.qos_is_transient_local;
     e.qos_is_reliable = false;
     e.is_bridge = pub.is_bridge;
   }
-  resp.entry_num = idx;
-  send_response(fd, 0, &resp, sizeof(resp));
+  resp->entry_num = idx;
+  send_response(fd, 0, resp.get(), packed_topic_info_bytes(idx));
 }
 
 void CommandHandlers::handle_get_node_subscriber_topics(int fd, pid_t pid, const void * payload)
@@ -1298,7 +1324,7 @@ void CommandHandlers::handle_get_node_subscriber_topics(int fd, pid_t pid, const
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
     resp.topic_num++;
   }
-  send_response(fd, 0, &resp, sizeof(resp));
+  send_response(fd, 0, &resp, packed_topic_list_bytes(resp.topic_num));
 }
 
 void CommandHandlers::handle_get_node_publisher_topics(int fd, pid_t pid, const void * payload)
@@ -1336,7 +1362,7 @@ void CommandHandlers::handle_get_node_publisher_topics(int fd, pid_t pid, const 
       AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
     resp.topic_num++;
   }
-  send_response(fd, 0, &resp, sizeof(resp));
+  send_response(fd, 0, &resp, packed_topic_list_bytes(resp.topic_num));
 }
 
 void CommandHandlers::handle_set_ros2_subscriber_num(int fd, pid_t pid, const void * payload)

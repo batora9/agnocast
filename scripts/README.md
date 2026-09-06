@@ -67,6 +67,17 @@ See [`bench/README.md`](bench/README.md). Builds `agnocast_bench_publisher` / `a
 | `bench/compare.bash` | Run both backends and render comparison figures. |
 | `bench/prep_repro_env.sh` | Host tuning for reproducible RT measurements (requires root). |
 
+### consistency/ — metadata consistency under process crash (kmod vs user daemon)
+
+See [`consistency/README.md`](consistency/README.md). Separate from the latency bench: 1 publisher / 4 subscribers, SIGINT golden vs SIGKILL cleanup, membership query APIs plus (subscriber crash only) outstanding entry count.
+
+| Script | Purpose |
+|---|---|
+| `consistency/build.bash` | Build harness binaries into `ws/kmod/` and `ws/daemon/`. |
+| `consistency/run.bash` | One trial (`--crash-role` sub or pub, `--signal` int or kill). |
+| `consistency/run_paper.bash` | Golden SIGINT runs then N=100 SIGKILL trials per cell. |
+| `consistency/summarize.py` | Table: membership match count and leak count. |
+
 ### test/ — tests and coverage
 
 **Backend selection.** The end-to-end scripts below (`e2e_test_1to1`, `e2e_test_2to2`, `e2e_test_many_exit`, `e2e_test_stress`) work against either backend, selected via the `AGNOCAST_USE_DAEMON` environment variable:

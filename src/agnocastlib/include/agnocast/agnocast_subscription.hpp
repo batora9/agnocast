@@ -123,6 +123,8 @@ public:
   SubscriptionBase(agnocast::Node * node, const std::string & topic_name);
 
   uint32_t get_publisher_count() const { return get_publisher_count_core(topic_name_); }
+  topic_local_id_t get_id() const { return id_; }
+  const std::string & get_topic_name() const { return topic_name_; }
 
   virtual ~SubscriptionBase()
   {

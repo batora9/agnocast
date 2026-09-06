@@ -36,6 +36,7 @@ uint32_t get_subscription_count_core(const std::string & topic_name);
 uint32_t get_intra_subscription_count_core(const std::string & topic_name);
 void increment_borrowed_publisher_num();
 void decrement_borrowed_publisher_num();
+uint32_t get_last_publish_released_num();
 
 extern int agnocast_fd;
 extern "C" uint32_t agnocast_get_borrowed_publisher_num();
