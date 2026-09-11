@@ -80,12 +80,14 @@ class BenchSubscriber : public agnocast::Node
   double rate_hz_;
   double duration_sec_;
   double warmup_sec_;
+  double keep_alive_sec_;
   int qos_depth_;
   std::string output_dir_;
   std::string sync_dir_;
 
   std::atomic<bool> warmup_done_{false};
   std::atomic<bool> measurement_done_{false};
+  std::atomic<bool> dumped_{false};
   int64_t start_ns_ = 0;
 
 public:
@@ -97,6 +99,7 @@ public:
     rate_hz_ = this->declare_parameter<double>("rate_hz", 100.0);
     duration_sec_ = this->declare_parameter<double>("duration_sec", 10.0);
     warmup_sec_ = this->declare_parameter<double>("warmup_sec", 5.0);
+    keep_alive_sec_ = this->declare_parameter<double>("keep_alive_sec", 3.0);
     qos_depth_ = this->declare_parameter<int>("qos_depth", 10);
     output_dir_ = this->declare_parameter<std::string>("output_dir", "/tmp/bench_results");
     sync_dir_ = this->declare_parameter<std::string>("sync_dir", "");
@@ -112,14 +115,25 @@ public:
     control_timer_ = this->create_wall_timer(100ms, [this]() { tick_control(); });
 
     RCLCPP_INFO(
-      get_logger(), "bench_subscriber: topic=%s, sub_idx=%d", topic_name.c_str(),
-      subscriber_index_);
+      get_logger(),
+      "bench_subscriber: topic=%s, sub_idx=%d, %.0fs warmup + %.0fs measure + %.0fs alive",
+      topic_name.c_str(), subscriber_index_, warmup_sec_, duration_sec_, keep_alive_sec_);
   }
 
   void reset_start_time() { start_ns_ = now_ns(); }
   const std::string & sync_dir() const { return sync_dir_; }
   int topic_index() const { return topic_index_; }
   int subscriber_index() const { return subscriber_index_; }
+
+  // After spin(): keep CSV I/O off the measurement window and the executor.
+  void dump_results()
+  {
+    if (dumped_.exchange(true)) {
+      return;
+    }
+    write_results();
+    write_meta();
+  }
 
 private:
   void on_message(const agnocast::ipc_shared_ptr<MessageT> & msg)
@@ -149,8 +163,9 @@ private:
       !measurement_done_.load(std::memory_order_relaxed) &&
       elapsed_sec >= warmup_sec_ + duration_sec_) {
       measurement_done_.store(true, std::memory_order_relaxed);
-      write_results();
-      write_meta();
+    }
+
+    if (elapsed_sec >= warmup_sec_ + duration_sec_ + keep_alive_sec_) {
       g_executor->cancel();
     }
   }
@@ -253,5 +268,6 @@ int main(int argc, char ** argv)
   pin_cpu_if_requested();
 
   g_executor->spin();
+  node->dump_results();
   return 0;
 }

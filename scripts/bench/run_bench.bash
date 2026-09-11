@@ -255,6 +255,7 @@ for iter in $(seq 0 $((ITERATIONS - 1))); do
         -p rate_hz:="${RATE_HZ}.0" \
         -p duration_sec:="${DURATION}.0" \
         -p warmup_sec:="${WARMUP}.0" \
+        -p keep_alive_sec:="${PUB_KEEP_ALIVE}.0" \
         -p qos_depth:="${QOS_DEPTH}" \
         -p output_dir:="${ITER_DIR}" \
         -p sync_dir:="${SYNC_DIR}" \

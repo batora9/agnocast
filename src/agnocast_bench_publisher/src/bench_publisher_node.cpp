@@ -91,6 +91,7 @@ class BenchPublisher : public agnocast::Node
 
   std::atomic<bool> warmup_done_{false};
   std::atomic<bool> measurement_done_{false};
+  std::atomic<bool> dumped_{false};
   int64_t start_ns_ = 0;
 
 public:
@@ -127,6 +128,16 @@ public:
   void reset_start_time() { start_ns_ = now_ns(); }
   const std::string & sync_dir() const { return sync_dir_; }
   int topic_index() const { return topic_index_; }
+
+  // After spin(): keep CSV I/O off the measurement window and the executor.
+  void dump_results()
+  {
+    if (dumped_.exchange(true)) {
+      return;
+    }
+    write_results();
+    write_meta();
+  }
 
 private:
   void publish_once()
@@ -167,8 +178,6 @@ private:
       !measurement_done_.load(std::memory_order_relaxed) &&
       elapsed_sec >= warmup_sec_ + duration_sec_) {
       measurement_done_.store(true, std::memory_order_relaxed);
-      write_results();
-      write_meta();
     }
 
     if (elapsed_sec >= warmup_sec_ + duration_sec_ + keep_alive_sec_) {
@@ -272,5 +281,6 @@ int main(int argc, char ** argv)
   pin_cpu_if_requested();
 
   g_executor->spin();
+  node->dump_results();
   return 0;
 }

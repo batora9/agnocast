@@ -8,6 +8,8 @@ set -euo pipefail
 #   scripts/bench/build.bash
 #   scripts/bench/run_paper_sweeps.bash
 #   scripts/bench/run_paper_sweeps.bash --daemon-rt-priority 80
+#   scripts/bench/run_paper_sweeps.bash --daemon-rt-priority 90 --warmup 10 \
+#     --output-dir results/paper_fifo90_warmup10
 #
 # Skip C-state lock (Turbo off / freq pin / mqueue limits still applied):
 #   scripts/bench/run_paper_sweeps.bash --no-cstate
@@ -29,6 +31,7 @@ NO_CSTATE=0
 DAEMON_RT_PRIORITY=0
 SKIP_KMOD=0
 KMOD_DATA=""
+WARMUP=2
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,9 +40,10 @@ while [[ $# -gt 0 ]]; do
   --daemon-rt-priority) DAEMON_RT_PRIORITY="$2"; shift 2 ;;
   --skip-kmod) SKIP_KMOD=1; shift ;;
   --kmod-data) KMOD_DATA="$2"; shift 2 ;;
+  --warmup) WARMUP="$2"; shift 2 ;;
   --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
   -h | --help)
-    sed -n '3,24p' "${BASH_SOURCE[0]}"
+    sed -n '3,22p' "${BASH_SOURCE[0]}"
     exit 0
     ;;
   *)
@@ -59,7 +63,9 @@ fi
 
 [[ -n "${ROS_DISTRO:-}" ]] || die "ROS is not sourced. Run: source /opt/ros/humble/setup.bash"
 
-if ! lsmod | grep -q '^agnocast '; then
+# Do not pipe lsmod into grep -q under pipefail: grep closes the pipe on a
+# match, lsmod then exits 141 (SIGPIPE), and the check looks like a miss.
+if [[ ! -d /sys/module/agnocast ]]; then
   echo "==> Loading agnocast.ko"
   sudo insmod "${AGNOCAST_ROOT}/agnocast_kmod/agnocast.ko"
 fi
@@ -86,7 +92,7 @@ trap cleanup EXIT
 COMPARE_ARGS=(
   --sweeps a,b,c
   --iterations 5
-  --warmup 2
+  --warmup "${WARMUP}"
   --output-dir "${OUTPUT_DIR}"
 )
 if [[ "${SKIP_KMOD}" -eq 1 ]]; then
