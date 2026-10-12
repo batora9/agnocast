@@ -50,47 +50,6 @@ void validate_ld_preload()
   }
 }
 
-static std::string create_mq_name(
-  const std::string & header, const std::string & topic_name, const topic_local_id_t id)
-{
-  if (topic_name.length() == 0 || topic_name[0] != '/') {
-    RCLCPP_ERROR(logger, "create_mq_name failed");
-    close(agnocast_fd);
-    exit(EXIT_FAILURE);
-  }
-
-  std::string mq_name = topic_name;
-  mq_name[0] = '@';
-  mq_name = header + mq_name + "@" + std::to_string(id);
-
-  // As a mq_name, '/' cannot be used
-  for (size_t i = 1; i < mq_name.size(); i++) {
-    if (mq_name[i] == '/') {
-      mq_name[i] = '_';
-    }
-  }
-
-  return mq_name;
-}
-
-std::string create_mq_name_for_agnocast_publish(
-  const std::string & topic_name, const topic_local_id_t id)
-{
-  return create_mq_name("/agnocast", topic_name, id);
-}
-
-// UDS-address suffix that scopes the per-IPC-namespace bridge listener by domain.
-// An unset OR empty ROS_DOMAIN_ID means "no domain" (no suffix), keeping this in
-// sync with the Python discovery agent (bridge_decider._bridge_uds_addr).
-static std::string bridge_domain_suffix()
-{
-  const char * domain_id = getenv("ROS_DOMAIN_ID");
-  if (domain_id == nullptr || *domain_id == '\0') {
-    return "";
-  }
-  return "_d" + std::string(domain_id);
-}
-
 uint32_t get_ros_domain_id()
 {
   const char * domain_id_env = getenv("ROS_DOMAIN_ID");
@@ -106,6 +65,19 @@ uint32_t get_ros_domain_id()
     return 0;
   }
   return static_cast<uint32_t>(value);
+}
+
+// UDS-address suffix that scopes the per-IPC-namespace bridge listener by domain.
+// The kmod keys the bridge manager on the *parsed* domain, so this must use
+// get_ros_domain_id() and not the raw env string. Domain 0 takes no suffix,
+// matching the Python discovery agent (bridge_decider._bridge_uds_addr).
+static std::string bridge_domain_suffix()
+{
+  const uint32_t domain_id = get_ros_domain_id();
+  if (domain_id == 0) {
+    return "";
+  }
+  return "_d" + std::to_string(domain_id);
 }
 
 std::string create_uds_addr_for_bridge()
@@ -142,9 +114,11 @@ std::string create_service_request_topic_name(const std::string & service_name)
 }
 
 std::string create_service_response_topic_name(
-  const std::string & service_name, const std::string & client_node_name)
+  const std::string & service_name, const std::string & client_node_name,
+  const topic_local_id_t client_publisher_id)
 {
-  return "/AGNOCAST_SRV_RESPONSE" + service_name + "_SEP_" + client_node_name;
+  return "/AGNOCAST_SRV_RESPONSE" + service_name + "_SEP_" + client_node_name + "_SEP_" +
+         std::to_string(client_publisher_id);
 }
 
 uint64_t agnocast_get_timestamp()

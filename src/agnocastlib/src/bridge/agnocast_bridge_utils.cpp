@@ -6,6 +6,9 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <rmw/validate_node_name.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -13,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -46,6 +50,40 @@ BridgeMode get_bridge_mode()
 
   RCLCPP_WARN_ONCE(logger, "Unknown AGNOCAST_BRIDGE_MODE: %s. Fallback to ON.", env_val);
   return BridgeMode::On;
+}
+
+std::string get_bridge_node_name(const uint64_t self_ipc_ns_inode)
+{
+  std::string default_name =
+    "agnocast_bridge_node_" + std::to_string(self_ipc_ns_inode) + "_" + std::to_string(getpid());
+
+  const char * env_val = std::getenv("AGNOCAST_BRIDGE_NODE_NAME_SUFFIX");
+  if (env_val == nullptr || *env_val == '\0') {
+    return default_name;
+  }
+
+  // Container names may contain '-' and '.', which are not allowed in ROS 2 node names.
+  std::string suffix = env_val;
+  std::replace(suffix.begin(), suffix.end(), '-', '_');
+  std::replace(suffix.begin(), suffix.end(), '.', '_');
+
+  std::string node_name = "agnocast_bridge_node_" + suffix;
+
+  // rmw rejects node names longer than RMW_NODE_NAME_MAX_NAME_LENGTH.
+  const bool valid = node_name.size() <= RMW_NODE_NAME_MAX_NAME_LENGTH &&
+                     std::all_of(suffix.begin(), suffix.end(), [](const unsigned char c) {
+                       return std::isalnum(c) != 0 || c == '_';
+                     });
+  if (!valid) {
+    RCLCPP_WARN(
+      logger,
+      "AGNOCAST_BRIDGE_NODE_NAME_SUFFIX='%s' does not form a valid ROS 2 node name. "
+      "Falling back to the default node name '%s'.",
+      env_val, default_name.c_str());
+    return default_name;
+  }
+
+  return node_name;
 }
 
 rclcpp::QoS get_subscriber_qos(const std::string & topic_name, topic_local_id_t subscriber_id)
@@ -200,6 +238,41 @@ bool has_external_ros2_subscriber(const rclcpp::Node * node, const std::string &
     });
 }
 
+#if RCLCPP_VERSION_MAJOR < 28
+std::set<std::string> collect_external_ros2_client_service_names(rclcpp::Node * node)
+{
+  std::set<std::string> service_names;
+  if (node == nullptr) {
+    return service_names;
+  }
+
+  const std::string self_name = node->get_name();
+  const std::string self_ns = node->get_namespace();
+  const auto graph = node->get_node_graph_interface();
+
+  for (const auto & full_name : node->get_node_names()) {
+    const auto [ns, name] = split_full_node_name(full_name);
+
+    // The container node holds the ROS 2 client of every A2R bridge, which is not demand for an
+    // R2A one.
+    if (name == self_name && ns == self_ns) {
+      continue;
+    }
+
+    // The node may have left the graph since get_node_names().
+    try {
+      for (const auto & entry : graph->get_client_names_and_types_by_node(name, ns)) {
+        service_names.insert(entry.first);
+      }
+    } catch (const std::exception &) {
+      continue;
+    }
+  }
+
+  return service_names;
+}
+#endif
+
 rclcpp::QoS get_service_qos(const std::string & service_name)
 {
   const std::string request_topic_name = create_service_request_topic_name(service_name);
@@ -210,6 +283,7 @@ rclcpp::QoS get_service_qos(const std::string & service_name)
   topic_info_args.topic_info_ret_buffer_addr =
     reinterpret_cast<uint64_t>(topic_info_buffer->data());
   topic_info_args.topic_info_ret_buffer_size = 1;
+  topic_info_args.domain_id = get_ros_domain_id();
 
   if (agnocast_ipc_get_topic_subscriber_info(&topic_info_args) < 0) {
     if (errno == ENOBUFS) {
@@ -409,7 +483,7 @@ void register_service_bridge(
   if (get_bridge_mode() != BridgeMode::On) {
     return;
   }
-  send_performance_service_bridge_registration_by_type_name(
+  send_service_bridge_registration_by_type_name(
     service_type, service_name, direction, shadow_node_identity);
 }
 

@@ -1,93 +1,42 @@
 #include "agnocast_cie_thread_configurator/cie_thread_configurator.hpp"
+#include "rcl/domain_id.h"
+#include "rcl/error_handling.h"
 #include "rclcpp/rclcpp.hpp"
 
-#include <array>
-#include <chrono>
-#include <cstdio>
 #include <cstdlib>
-#include <functional>
 #include <memory>
-#include <sstream>
 #include <string>
 
 namespace agnocast_cie_thread_configurator
 {
 
-namespace
-{
-// Functor deleter for popen() streams; avoids the -Wignored-attributes that
-// decltype(&pclose) triggers by carrying glibc's attributes into a type arg.
-struct PcloseDeleter
-{
-  void operator()(FILE * stream) const noexcept { pclose(stream); }
-};
-}  // namespace
-
-std::map<std::string, std::string> get_hardware_info()
-{
-  std::map<std::string, std::string> hw_info;
-
-  // Execute lscpu command and capture output
-  std::array<char, 128> buffer;
-  std::string result;
-  std::unique_ptr<FILE, PcloseDeleter> pipe(popen("/usr/bin/lscpu", "r"));
-
-  if (!pipe) {
-    return hw_info;
-  }
-
-  while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-    result += buffer.data();
-  }
-
-  // Parse lscpu output
-  std::istringstream iss(result);
-  std::string line;
-
-  while (std::getline(iss, line)) {
-    size_t colon_pos = line.find(':');
-    if (colon_pos == std::string::npos) {
-      continue;
-    }
-
-    std::string key = line.substr(0, colon_pos);
-    std::string value = line.substr(colon_pos + 1);
-
-    // Trim leading/trailing whitespace from value
-    size_t start = value.find_first_not_of(" \t");
-    size_t end = value.find_last_not_of(" \t\r\n");
-    if (start != std::string::npos && end != std::string::npos) {
-      value = value.substr(start, end - start + 1);
-    }
-
-    // Store relevant hardware information
-    if (key == "Model name") {
-      hw_info["model_name"] = value;
-    } else if (key == "CPU family") {
-      hw_info["cpu_family"] = value;
-    } else if (key == "Model") {
-      hw_info["model"] = value;
-    } else if (key == "Thread(s) per core") {
-      hw_info["threads_per_core"] = value;
-    } else if (key == "Frequency boost") {
-      hw_info["frequency_boost"] = value;
-    } else if (key == "CPU max MHz") {
-      hw_info["cpu_max_mhz"] = value;
-    } else if (key == "CPU min MHz") {
-      hw_info["cpu_min_mhz"] = value;
-    }
-  }
-
-  return hw_info;
-}
-
 size_t get_default_domain_id()
 {
-  const char * env_value = std::getenv("ROS_DOMAIN_ID");
-  if (env_value != nullptr) {
-    return static_cast<size_t>(std::stoul(env_value));
+  // Seed with 0 so unset/empty ROS_DOMAIN_ID (rcl leaves the out-param
+  // unchanged) yields the same default domain rcl ultimately uses.
+  size_t domain_id = 0;
+  const rcl_ret_t ret = rcl_get_default_domain_id(&domain_id);
+  if (ret != RCL_RET_OK) {
+    rcl_reset_error();
+    const char * env_value = std::getenv("ROS_DOMAIN_ID");
+    RCLCPP_WARN(
+      rclcpp::get_logger("cie_thread_configurator"),
+      "Invalid ROS_DOMAIN_ID '%s'; falling back to default domain ID 0",
+      env_value != nullptr ? env_value : "");
+    return 0;
   }
-  return 0;  // default domain ID
+  // rcl parses ROS_DOMAIN_ID with strtoul. A leading '-' becomes ULONG_MAX /
+  // RCL_DEFAULT_DOMAIN_ID with RCL_RET_OK; rclcpp then treats that sentinel as
+  // the default domain (0). Normalize so callers see the same domain id.
+  if (domain_id == RCL_DEFAULT_DOMAIN_ID) {
+    const char * env_value = std::getenv("ROS_DOMAIN_ID");
+    RCLCPP_WARN(
+      rclcpp::get_logger("cie_thread_configurator"),
+      "Invalid ROS_DOMAIN_ID '%s'; falling back to default domain ID 0",
+      env_value != nullptr ? env_value : "");
+    return 0;
+  }
+  return domain_id;
 }
 
 rclcpp::Node::SharedPtr create_node_for_domain(size_t domain_id)

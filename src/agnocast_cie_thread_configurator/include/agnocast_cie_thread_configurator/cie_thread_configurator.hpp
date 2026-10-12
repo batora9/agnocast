@@ -6,7 +6,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -16,10 +15,13 @@
 namespace agnocast_cie_thread_configurator
 {
 
-// Get hardware information from lscpu command
-std::map<std::string, std::string> get_hardware_info();
+// Topic on which the agnocastlib client publishers announce callback groups
+// to the daemons.
+constexpr const char * k_callback_group_info_topic =
+  "/agnocast_cie_thread_configurator/callback_group_info";
 
-// Get default domain ID from ROS_DOMAIN_ID environment variable
+// Get default domain ID via rcl_get_default_domain_id() (never throws;
+// falls back to 0 on unset, empty, unparsable, or out-of-range values).
 size_t get_default_domain_id();
 
 // Create a node for a different domain

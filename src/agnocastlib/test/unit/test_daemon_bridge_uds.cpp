@@ -54,11 +54,22 @@ TEST(DaemonBridgeUdsTest, DaemonPayloadWireLayout)
   EXPECT_EQ(offsetof(BridgeMsgDaemonPubSubPayload, qos_is_reliable), 521u);
 }
 
+// Same contract for the service variant, whose layout the daemon mirrors as
+// `_SERVICE_MSG_PACK_FORMAT`.
+TEST(DaemonBridgeUdsTest, DaemonServicePayloadWireLayout)
+{
+  using agnocast::BridgeMsgDaemonServicePayload;
+  EXPECT_EQ(sizeof(BridgeMsgDaemonServicePayload), 256u);
+  EXPECT_EQ(offsetof(BridgeMsgDaemonServicePayload, service_name), 0u);
+  EXPECT_EQ(agnocast::bridge_msg_wire_size<BridgeMsgDaemonServicePayload>(), 260u);
+}
+
 TEST(DaemonBridgeUdsTest, BridgeMsgTypeNumeric)
 {
   EXPECT_EQ(static_cast<uint32_t>(agnocast::BridgeMsgType::PubSub), 0u);
   EXPECT_EQ(static_cast<uint32_t>(agnocast::BridgeMsgType::Service), 1u);
   EXPECT_EQ(static_cast<uint32_t>(agnocast::BridgeMsgType::DaemonPubSub), 2u);
+  EXPECT_EQ(static_cast<uint32_t>(agnocast::BridgeMsgType::DaemonService), 3u);
 }
 
 TEST(DaemonBridgeUdsTest, BridgeMsgWireLayout)
@@ -113,7 +124,30 @@ TEST(DaemonBridgeUdsTest, BridgeUdsAddrUnsetDomainIdHasNoSuffix)
   EXPECT_EQ(addr.substr(1), expected);
 }
 
-// Performance-mode daemon bridges have no local endpoint to query, so the QoS
+// The kmod keys the bridge manager on get_ros_domain_id(), so every spelling that
+// parses to the same domain must produce the same address. Otherwise processes
+// sharing a domain bind/send to different sockets and never reach each other.
+TEST(DaemonBridgeUdsTest, BridgeUdsAddrIsCanonicalPerDomain)
+{
+  const ScopedRosDomainId guard;
+  const auto addr_for = [](const char * value) {
+    setenv("ROS_DOMAIN_ID", value, 1);
+    return agnocast::create_uds_addr_for_bridge();
+  };
+
+  unsetenv("ROS_DOMAIN_ID");
+  const auto domain_0 = agnocast::create_uds_addr_for_bridge();
+
+  // Spellings that get_ros_domain_id() normalizes to 0.
+  EXPECT_EQ(addr_for("0"), domain_0);
+  EXPECT_EQ(addr_for("abc"), domain_0);
+  EXPECT_EQ(addr_for("-5"), domain_0);
+  EXPECT_EQ(addr_for("4294967296"), domain_0);
+
+  EXPECT_EQ(addr_for("007"), addr_for("7"));
+}
+
+// Daemon bridges have no local endpoint to query, so the QoS
 // must be rebuilt faithfully from the request's explicit fields.
 TEST(DaemonBridgeUdsTest, DaemonRequestQosReliableTransientLocal)
 {
@@ -141,7 +175,7 @@ TEST(DaemonBridgeUdsTest, DaemonRequestQosBestEffortVolatile)
   EXPECT_EQ(qos.durability(), rclcpp::DurabilityPolicy::Volatile);
 }
 
-// The daemon-forced lease (used by the performance bridge_manager to keep a
+// The daemon-forced lease (used by the bridge manager to keep a
 // cross-NS bridge alive without a same-graph DDS counterpart) is active for the
 // half-open window [registered, registered + DAEMON_FORCE_TTL).
 TEST(DaemonBridgeUdsTest, DaemonForceLeaseWindowIsHalfOpen)

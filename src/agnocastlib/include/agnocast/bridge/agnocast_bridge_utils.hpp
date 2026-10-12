@@ -5,10 +5,13 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <rclcpp/version.h>
+
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -53,6 +56,7 @@ struct PublisherCountResult
 };
 
 BridgeMode get_bridge_mode();
+std::string get_bridge_node_name(uint64_t self_ipc_ns_inode);
 rclcpp::QoS get_subscriber_qos(const std::string & topic_name, topic_local_id_t subscriber_id);
 rclcpp::QoS get_publisher_qos(const std::string & topic_name, topic_local_id_t publisher_id);
 // Rebuild a QoS profile from the fields a daemon cross-NS request carries. The
@@ -65,6 +69,9 @@ bool update_ros2_subscriber_num(const rclcpp::Node * node, const std::string & t
 bool update_ros2_publisher_num(const rclcpp::Node * node, const std::string & topic_name);
 bool has_external_ros2_publisher(const rclcpp::Node * node, const std::string & topic_name);
 bool has_external_ros2_subscriber(const rclcpp::Node * node, const std::string & topic_name);
+#if RCLCPP_VERSION_MAJOR < 28
+std::set<std::string> collect_external_ros2_client_service_names(rclcpp::Node * node);
+#endif
 rclcpp::QoS get_service_qos(const std::string & service_name);
 bool is_agnocast_service_alive(const std::string & service_name, std::string & reason);
 std::pair<std::string, std::string> split_full_node_name(const std::string & fqn);
