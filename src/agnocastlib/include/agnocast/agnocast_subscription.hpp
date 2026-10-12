@@ -126,7 +126,6 @@ public:
 
   uint32_t get_publisher_count() const { return get_publisher_count_core(topic_name_); }
   topic_local_id_t get_id() const { return id_; }
-  const std::string & get_topic_name() const { return topic_name_; }
 
   /**
    * @brief Return the QoS passed at construction with any `qos_overriding_options` applied.
