@@ -5,10 +5,12 @@
 // Each timer tick borrows a loaned message, stamps it, publishes it, and records
 // both the publish latency and the backend IPC round trip
 // (agnocast::get_last_publish_ipc_ns()). The publish latency runs from the loan
-// to the moment the last subscriber was notified
-// (agnocast::get_last_publish_notify_end_ns()): in the client under the kernel
-// module, in the daemon under the user daemon. Releasing old messages comes
-// after that and is not counted. The same binary is built twice, once against a
+// to the moment the last subscriber was notified. Both backends now notify from
+// the central component, so the interval ends there: the daemon stamps
+// get_last_publish_notify_end_ns() after its last mq_send, while the kernel
+// module signals the subscriber eventfds inside the publish ioctl and leaves the
+// stamp at 0, which falls back to the moment publish() returns. Releasing old
+// messages comes after that and is not counted. The same binary is built twice, once against a
 // kernel-module agnocastlib and once against a user-daemon one, so the recorded
 // numbers differ only in the backend.
 

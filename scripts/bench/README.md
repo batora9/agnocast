@@ -127,11 +127,14 @@ points makes p99.9 scheduler-dominated and is not comparable.
 | `publish` | `borrow_loaned_message()` until the last subscriber `mq_send` |
 | `e2e` | publisher stamp to subscriber callback entry |
 
-Subscriber notification differs by backend. Under the kernel module the client
-`mq_send`s after the ioctl returns, so the `publish` interval ends in the client.
-The user daemon notifies the subscribers itself before replying, and `publish`
-ends at the daemon's stamp after the last `mq_send` (CLOCK_MONOTONIC, carried in
-the timing trailer). Releasing old messages happens after that in both cases and
+Both backends notify the subscribers from the central component, so `publish`
+ends there in both. Since upstream #1432 the kernel module signals each
+subscriber's eventfd inside the publish ioctl, so the interval ends when the
+ioctl returns. The user daemon notifies with `mq_send` before replying, and
+`publish` ends at the daemon's stamp after the last send (CLOCK_MONOTONIC,
+carried in the timing trailer). Numbers taken before the 2.4.1 merge used the
+old mechanism (client-side `mq_send` under the kernel module) and are not
+comparable with ones taken after it. Releasing old messages happens after that in both cases and
 is not counted. A consequence is that the daemon's `publish_ipc` round trip
 contains the notification (`notify` below) while the kernel module's does not.
 
