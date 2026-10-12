@@ -334,7 +334,9 @@ int agnocast_ipc_get_version(struct ioctl_get_version_args * args)
 int agnocast_ipc_add_process(union ioctl_add_process_args * args)
 {
   AddProcessRequest req{};
-  req.is_performance_bridge_manager = args->is_performance_bridge_manager;
+  // The daemon protocol still carries a bool; only the bridge manager role has
+  // ever set it.
+  req.is_performance_bridge_manager = (args->role == PROCESS_ROLE_BRIDGE_MANAGER);
   req.domain_id = args->domain_id;
   AddProcessResponse resp{};
   int r = daemon_call(AGNOCAST_CMD_ADD_PROCESS, &req, sizeof(req), &resp, sizeof(resp));
@@ -342,7 +344,7 @@ int agnocast_ipc_add_process(union ioctl_add_process_args * args)
     args->ret_addr = resp.shm_addr;
     args->ret_shm_size = resp.shm_size;
     args->ret_unlink_daemon_exist = resp.unlink_daemon_exist;
-    args->ret_performance_bridge_daemon_exist = resp.performance_bridge_daemon_exist;
+    args->ret_bridge_daemon_exist = resp.performance_bridge_daemon_exist;
     args->ret_discovery_agent_exist = resp.discovery_agent_exist;
   }
   return r;
@@ -360,7 +362,6 @@ int agnocast_ipc_add_publisher(union ioctl_add_publisher_args * args)
   int r = daemon_call(AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_id = resp.publisher_id;
-    copy_name_out(args->ret_mq_topic_name, sizeof(args->ret_mq_topic_name), resp.mq_topic_name);
   }
   return r;
 }
@@ -380,7 +381,6 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   int r = daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_id = resp.subscriber_id;
-    copy_name_out(args->ret_mq_topic_name, sizeof(args->ret_mq_topic_name), resp.mq_topic_name);
   }
   return r;
 }
@@ -397,9 +397,6 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
   int r = daemon_call(AGNOCAST_CMD_PUBLISH_MSG, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_entry_id = resp.entry_id;
-    // The daemon has already notified every subscriber, so leave nothing for
-    // publish_core() to mq_send.
-    args->ret_subscriber_num = 0;
     args->ret_released_num = resp.released_num;
     for (uint32_t i = 0; i < resp.released_num && i < AGNOCAST_PROTO_MAX_RELEASE_NUM; i++) {
       args->ret_released_addrs[i] = resp.released_addrs[i];
@@ -544,21 +541,6 @@ int agnocast_ipc_get_exit_process(struct ioctl_get_exit_process_args * args)
   if (r == 0) {
     args->ret_daemon_should_exit = resp.daemon_should_exit;
     args->ret_pid = resp.pid;
-    args->ret_subscription_mq_info_num = resp.subscription_mq_info_num;
-    auto * mq_buf =
-      reinterpret_cast<exit_subscription_mq_info *>(args->subscription_mq_info_buffer_addr);
-    if (mq_buf != nullptr) {
-      uint32_t copy_count = (resp.subscription_mq_info_num < args->subscription_mq_info_buffer_size)
-                              ? resp.subscription_mq_info_num
-                              : args->subscription_mq_info_buffer_size;
-      for (uint32_t i = 0; i < copy_count; i++) {
-        std::strncpy(
-          mq_buf[i].topic_name, resp.subscription_mq_infos[i].topic_name,
-          TOPIC_NAME_BUFFER_SIZE - 1);
-        mq_buf[i].topic_name[TOPIC_NAME_BUFFER_SIZE - 1] = '\0';
-        mq_buf[i].subscriber_id = resp.subscription_mq_infos[i].subscriber_id;
-      }
-    }
   }
   return r;
 }
