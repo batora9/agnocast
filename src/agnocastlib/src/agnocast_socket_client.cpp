@@ -242,9 +242,14 @@ int recv_response(msghdr * recv_msg)
 }  // namespace
 
 // Returns 0 on success, sets errno on failure.
+//
+// send_fd, when >= 0, is attached to the request with SCM_RIGHTS. The kernel
+// module reads a subscriber's notification eventfd out of the caller's own fd
+// table, which a userspace daemon cannot do, so the descriptor itself has to
+// travel with the registration. Ownership moves to the daemon on success.
 static int daemon_call(
   uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
-  uint32_t resp_size)
+  uint32_t resp_size, int send_fd = -1)
 {
   std::lock_guard<std::mutex> lock(socket_mtx);
 
@@ -256,6 +261,20 @@ static int daemon_call(
   msghdr send_msg{};
   send_msg.msg_iov = iov;
   send_msg.msg_iovlen = (req_size > 0) ? 2 : 1;
+
+  union {
+    cmsghdr align;
+    char bytes[CMSG_SPACE(sizeof(int))];
+  } cmsg_buf{};
+  if (send_fd >= 0) {
+    send_msg.msg_control = cmsg_buf.bytes;
+    send_msg.msg_controllen = sizeof(cmsg_buf.bytes);
+    cmsghdr * cmsg = CMSG_FIRSTHDR(&send_msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(send_fd));
+  }
 #ifdef AGNOCAST_BENCH_TIMING
   g_stamps = CallStamps{};
   g_stamps.send_begin = bench_timing_now_ns();
@@ -378,7 +397,10 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   req.ignore_local_publications = args->ignore_local_publications;
   req.is_bridge = args->is_bridge;
   AddSubscriberResponse resp{};
-  int r = daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp));
+  // args->eventfd is the subscriber's notification eventfd; the daemon writes
+  // to it on publish, the way the kernel module signals the eventfd_ctx.
+  int r =
+    daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), args->eventfd);
   if (r == 0) {
     args->ret_id = resp.subscriber_id;
   }

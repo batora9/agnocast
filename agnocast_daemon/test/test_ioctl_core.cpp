@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <mqueue.h>
+#include <sys/eventfd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -257,7 +258,7 @@ TEST(IoctlCore, PublishMsgSimplePublishWithoutAnyRelease)
   EXPECT_EQ(pub_resp.subscriber_num, 1U);
 }
 
-TEST(IoctlCore, PublishMsgNotifiesSubscriberMq)
+TEST(IoctlCore, PublishMsgNotifiesSubscriberEventfd)
 {
   DaemonHarness h;
   uint64_t pub_addr = 0;
@@ -266,29 +267,31 @@ TEST(IoctlCore, PublishMsgNotifiesSubscriberMq)
   int32_t pub_id = -1;
   int32_t sub_id = -1;
   ASSERT_EQ(h.add_publisher(kTopic, kNode, 1000, 10, &pub_id), 0);
-  ASSERT_EQ(h.add_subscriber(kTopic, kNode, 2000, 10, &sub_id), 0);
 
-  const std::string mq_name = "/agnocast@kunit_test_topic@" + std::to_string(sub_id);
-  mq_attr attr{};
-  attr.mq_maxmsg = 1;
-  attr.mq_msgsize = 1;
-  const mqd_t mq = mq_open(mq_name.c_str(), O_CREAT | O_RDONLY | O_NONBLOCK, 0600, &attr);
-  ASSERT_NE(mq, static_cast<mqd_t>(-1));
+  const int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  ASSERT_NE(efd, -1);
+  // The daemon owns what it is handed and closes it with the subscriber, so
+  // give it a dup and keep efd to read the counter.
+  ASSERT_EQ(
+    h.add_subscriber(kTopic, kNode, 2000, 10, &sub_id, false, true, false, false, false, dup(efd)),
+    0);
 
   PublishMsgResponse pub_resp{};
   ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr, &pub_resp), 0);
-  mq_attr got{};
-  ASSERT_EQ(mq_getattr(mq, &got), 0);
-  EXPECT_EQ(got.mq_curmsgs, 1);
 
-  // A pending notification already wakes the subscriber; a full queue is not an error.
+  uint64_t counter = 0;
+  ASSERT_EQ(read(efd, &counter, sizeof(counter)), static_cast<ssize_t>(sizeof(counter)));
+  EXPECT_EQ(counter, 1u);
+
+  // Without an intervening read the counter accumulates; either way the
+  // subscriber is awake.
   ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr + 8, &pub_resp), 0);
-  ASSERT_EQ(mq_getattr(mq, &got), 0);
-  EXPECT_EQ(got.mq_curmsgs, 1);
+  ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr + 16, &pub_resp), 0);
+  ASSERT_EQ(read(efd, &counter, sizeof(counter)), static_cast<ssize_t>(sizeof(counter)));
+  EXPECT_EQ(counter, 2u);
 
   ASSERT_EQ(remove_publisher(h, pub_id), 0);
-  mq_close(mq);
-  mq_unlink(mq_name.c_str());
+  close(efd);
 }
 
 TEST(IoctlCore, PublishMsgNoTopic)

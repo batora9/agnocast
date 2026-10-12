@@ -63,93 +63,24 @@ std::string make_mq_name_for_publish(const std::string & topic_name, int32_t sub
   return mq_name;
 }
 
-// subscriber id -> (notification mq, used in the current publish round)
-using OpenedNotifyMqs = std::unordered_map<int32_t, std::pair<mqd_t, bool>>;
+// Notification targets collected under the topic lock, written to after it is
+// released. Reused across calls so the publish path allocates nothing once the
+// high-water mark is reached.
+thread_local std::vector<int> t_notify_fds;
 
-// Notification mqs opened on behalf of publishers. Each client connection is
-// served by its own thread, so a thread_local cache is per publishing process
-// and needs no locking, like agnocastlib's per-publisher opened_mqs.
-class NotifyMqCache
+// Mirrors agnocast_kmod's notify loop over publisher_info::notify_ctxs. The
+// kernel module signals each subscriber's eventfd_ctx; the daemon holds the
+// descriptors themselves (received over SCM_RIGHTS at registration) and writes
+// to them, which is the same wakeup with one write(2) per subscriber.
+void notify_subscribers(const std::vector<int> & notify_fds)
 {
-  std::map<std::pair<std::string, int32_t>, OpenedNotifyMqs> by_publisher_;
-
-public:
-  NotifyMqCache() = default;
-  NotifyMqCache(const NotifyMqCache &) = delete;
-  NotifyMqCache & operator=(const NotifyMqCache &) = delete;
-
-  ~NotifyMqCache()
-  {
-    for (auto & [key, opened] : by_publisher_) {
-      (void)key;
-      for (auto & [sub_id, mq_used] : opened) {
-        (void)sub_id;
-        mq_close(mq_used.first);
-      }
-    }
-  }
-
-  OpenedNotifyMqs & of(const std::string & mq_topic_name, int32_t publisher_id)
-  {
-    return by_publisher_[{mq_topic_name, publisher_id}];
-  }
-
-  void forget(const std::string & mq_topic_name, int32_t publisher_id)
-  {
-    auto it = by_publisher_.find({mq_topic_name, publisher_id});
-    if (it == by_publisher_.end()) return;
-    for (auto & [sub_id, mq_used] : it->second) {
-      (void)sub_id;
-      mq_close(mq_used.first);
-    }
-    by_publisher_.erase(it);
-  }
-};
-
-thread_local NotifyMqCache t_notify_mqs;
-
-// Mirrors the notification loop of agnocastlib publish_core().
-void notify_subscribers(
-  OpenedNotifyMqs & opened_mqs, const std::string & mq_topic_name, const int32_t * subscriber_ids,
-  uint32_t subscriber_num)
-{
-  for (uint32_t i = 0; i < subscriber_num; i++) {
-    const int32_t subscriber_id = subscriber_ids[i];
-    mqd_t mq = 0;
-    auto it = opened_mqs.find(subscriber_id);
-    if (it != opened_mqs.end()) {
-      mq = it->second.first;
-      it->second.second = true;
-    } else {
-      const std::string mq_name = make_mq_name_for_publish(mq_topic_name, subscriber_id);
-      if (mq_name.empty()) continue;
-      mq = mq_open(mq_name.c_str(), O_WRONLY | O_NONBLOCK);
-      // A just-added subscriber may not have created its mq yet.
-      if (mq == static_cast<mqd_t>(-1)) continue;
-      opened_mqs.emplace(subscriber_id, std::make_pair(mq, true));
-    }
-
-    // Zero-length on purpose. EAGAIN means an earlier notification is still
-    // pending, which wakes the subscriber just as well.
-    char dummy = 0;
-    if (mq_send(mq, &dummy, 0, 0) == -1 && errno != EAGAIN) {
-      fprintf(
-        stderr, "agnocast_daemon: mq_send failed (topic=%s, subscriber_id=%d): %s\n",
-        mq_topic_name.c_str(), subscriber_id, strerror(errno));
-    }
-  }
-}
-
-// A subscriber that was not notified this round has exited; drop its mq.
-void close_unused_notify_mqs(OpenedNotifyMqs & opened_mqs)
-{
-  for (auto it = opened_mqs.begin(); it != opened_mqs.end();) {
-    if (!it->second.second) {
-      mq_close(it->second.first);
-      it = opened_mqs.erase(it);
-    } else {
-      it->second.second = false;
-      ++it;
+  const uint64_t one = 1;
+  for (const int efd : notify_fds) {
+    // An eventfd counter saturates at UINT64_MAX-1 and only then returns EAGAIN,
+    // which means the subscriber has not drained an earlier notification yet —
+    // it is already awake, so there is nothing to report.
+    if (write(efd, &one, sizeof(one)) == -1 && errno != EAGAIN) {
+      fprintf(stderr, "agnocast_daemon: eventfd write failed (fd=%d): %s\n", efd, strerror(errno));
     }
   }
 }
@@ -504,8 +435,15 @@ void CommandHandlers::send_response(
 }
 
 void CommandHandlers::dispatch(
-  int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload)
+  int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd)
 {
+  // Only ADD_SUBSCRIBER has a use for an attached descriptor. Close anything
+  // that arrives on another command rather than letting it accumulate.
+  if (recv_fd >= 0 && hdr.command != AGNOCAST_CMD_ADD_SUBSCRIBER) {
+    close(recv_fd);
+    recv_fd = -1;
+  }
+
   switch (static_cast<CommandType>(hdr.command)) {
     case AGNOCAST_CMD_GET_VERSION:
       handle_get_version(client_fd);
@@ -514,7 +452,7 @@ void CommandHandlers::dispatch(
       handle_add_process(client_fd, client_pid, payload);
       break;
     case AGNOCAST_CMD_ADD_SUBSCRIBER:
-      handle_add_subscriber(client_fd, client_pid, payload);
+      handle_add_subscriber(client_fd, client_pid, payload, recv_fd);
       break;
     case AGNOCAST_CMD_ADD_PUBLISHER:
       handle_add_publisher(client_fd, client_pid, payload);
@@ -642,9 +580,11 @@ void CommandHandlers::handle_add_process(int fd, pid_t pid, const void * payload
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
-void CommandHandlers::handle_add_subscriber(int fd, pid_t pid, const void * payload)
+void CommandHandlers::handle_add_subscriber(
+  int fd, pid_t pid, const void * payload, int notify_eventfd)
 {
   if (!payload) {
+    if (notify_eventfd >= 0) close(notify_eventfd);
     send_response(fd, EINVAL);
     return;
   }
@@ -658,9 +598,14 @@ void CommandHandlers::handle_add_subscriber(int fd, pid_t pid, const void * payl
     wrapper, req->node_name, pid, req->qos_depth, req->qos_is_transient_local, req->qos_is_reliable,
     req->is_take_sub, req->ignore_local_publications, req->is_bridge, &sub_info);
   if (ret < 0) {
+    if (notify_eventfd >= 0) close(notify_eventfd);
     send_response(fd, -ret);
     return;
   }
+
+  // The daemon owns this descriptor from here on; it is closed when the
+  // subscriber is removed or its process exits.
+  sub_info->notify_eventfd = notify_eventfd;
 
   AddSubscriberResponse resp{};
   resp.subscriber_id = sub_info->id;
@@ -795,26 +740,33 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
   }
 
   uint32_t subscriber_num = 0;
+  t_notify_fds.clear();
   for (const auto & [id, sub] : wrapper->topic.sub_info_map) {
     (void)id;
     if (sub.is_take_sub) continue;
     if (sub.ignore_local_publications && (sub.pid == pub_info->pid)) continue;
     resp.subscriber_ids[subscriber_num++] = sub.id;
+    // A subscriber registered before the eventfd handshake has no descriptor;
+    // it polls instead of being woken, so there is nothing to signal.
+    if (sub.notify_eventfd >= 0) t_notify_fds.push_back(sub.notify_eventfd);
   }
   resp.subscriber_num = subscriber_num;
 
-  // The entry is committed, so a woken subscriber will find it. Notify outside
-  // the locks, as the client does after the kernel module's ioctl returns.
-  const std::string mq_topic_name = notify_mq_topic_name(wrapper);
-  const int32_t publisher_id = pub_info->id;
+  // The entry is committed, so a woken subscriber will find it. Drop the topic
+  // lock first so concurrent publishers on this topic are not blocked by the
+  // notification.
+  //
+  // glock stays held, as a shared lock, for the whole notify: the descriptors
+  // in t_notify_fds are owned by SubscriberInfo, and the two paths that close
+  // them (handle_remove_subscriber, process_exit_cleanup) both take
+  // global_mutex_ exclusively. Holding it shared keeps them out until the last
+  // write(2) lands, without blocking any other publisher or receiver, all of
+  // which take it shared too.
   tlock.unlock();
-  glock.unlock();
 
-  OpenedNotifyMqs & opened_mqs = t_notify_mqs.of(mq_topic_name, publisher_id);
   AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_BEGIN();
-  notify_subscribers(opened_mqs, mq_topic_name, resp.subscriber_ids, resp.subscriber_num);
+  notify_subscribers(t_notify_fds);
   AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_END();
-  close_unused_notify_mqs(opened_mqs);
 
   send_response(fd, 0, &resp, sizeof(resp));
 }
@@ -1232,11 +1184,13 @@ void CommandHandlers::handle_remove_subscriber(int fd, pid_t pid, const void * p
   }
 
   std::unique_lock tlock(wrapper->topic_rwsem);
-  if (!find_subscriber_info(wrapper, req->subscriber_id)) {
+  SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
+  if (!sub_info) {
     send_response(fd, ENODATA);
     return;
   }
 
+  if (sub_info->notify_eventfd >= 0) close(sub_info->notify_eventfd);
   wrapper->topic.sub_info_map.erase(req->subscriber_id);
   cleanup_unreferenced_entries_from_exited_publishers(wrapper, req->subscriber_id, store_);
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
@@ -1264,8 +1218,6 @@ void CommandHandlers::handle_remove_publisher(int fd, pid_t pid, const void * pa
     send_response(fd, ENODATA);
     return;
   }
-
-  t_notify_mqs.forget(notify_mq_topic_name(wrapper), req->publisher_id);
 
   std::vector<int64_t> to_remove;
   for (auto & [entry_id, en] : wrapper->topic.entries) {
@@ -1577,6 +1529,10 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
         subs_to_remove.push_back(sub_id);
       }
       for (int32_t sub_id : subs_to_remove) {
+        if (SubscriberInfo * dying = find_subscriber_info(wrapper, sub_id);
+            dying != nullptr && dying->notify_eventfd >= 0) {
+          close(dying->notify_eventfd);
+        }
         wrapper->topic.sub_info_map.erase(sub_id);
         cleanup_unreferenced_entries_from_exited_publishers(wrapper, sub_id, store_);
       }

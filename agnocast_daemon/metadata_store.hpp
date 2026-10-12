@@ -84,6 +84,11 @@ struct SubscriberInfo
   bool ignore_local_publications = false;
   bool need_mmap_update = false;
   bool is_bridge = false;
+  // The subscriber's notification eventfd, received over SCM_RIGHTS at
+  // registration and owned by the daemon from then on (-1 when none was sent).
+  // The kernel module resolves the caller's fd to an eventfd_ctx instead; a
+  // userspace daemon cannot, so the descriptor itself has to be passed.
+  int notify_eventfd = -1;
 };
 
 // Equivalent of agnocast_kmod::topic_struct.

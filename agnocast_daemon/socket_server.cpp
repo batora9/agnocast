@@ -16,6 +16,36 @@
 #include <thread>
 #include <vector>
 
+namespace
+{
+
+// Owns a descriptor received over SCM_RIGHTS until dispatch takes it. Every
+// path that rejects the message before dispatch therefore closes it, so a
+// malformed or oversized request cannot leak descriptors into the daemon.
+class FdGuard
+{
+public:
+  explicit FdGuard(int fd) noexcept : fd_(fd) {}
+  ~FdGuard()
+  {
+    if (fd_ >= 0) close(fd_);
+  }
+  FdGuard(const FdGuard &) = delete;
+  FdGuard & operator=(const FdGuard &) = delete;
+
+  int release() noexcept
+  {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+
+private:
+  int fd_;
+};
+
+}  // namespace
+
 static constexpr int kMaxEpollEvents = 64;
 static constexpr int kEpollTimeoutMs = 1000;
 
@@ -155,10 +185,41 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
 {
   std::vector<uint8_t> buf(kMaxRequestSize);
 
+  // Ancillary space for the single descriptor ADD_SUBSCRIBER attaches.
+  union {
+    cmsghdr align;
+    char bytes[CMSG_SPACE(sizeof(int))];
+  } cmsg_buf;
+
   while (!shutdown_requested_) {
-    // For SOCK_SEQPACKET, one recv() delivers exactly one message (the full
+    // For SOCK_SEQPACKET, one recvmsg() delivers exactly one message (the full
     // packet sent by the client).  MSG_TRUNC would indicate buffer overflow.
-    const ssize_t n = recv(client_fd, buf.data(), buf.size(), MSG_TRUNC);
+    iovec iov{buf.data(), buf.size()};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.bytes;
+    msg.msg_controllen = sizeof(cmsg_buf.bytes);
+
+    const ssize_t n = recvmsg(client_fd, &msg, MSG_TRUNC | MSG_CMSG_CLOEXEC);
+
+    // Take the descriptor before any error path, so a rejected message does not
+    // leak it. Anything beyond the first is closed: no command sends more.
+    int recv_fd = -1;
+    for (cmsghdr * c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+      if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+      const size_t fd_num = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+      for (size_t i = 0; i < fd_num; i++) {
+        int got = -1;
+        memcpy(&got, CMSG_DATA(c) + i * sizeof(int), sizeof(got));
+        if (recv_fd < 0) {
+          recv_fd = got;
+        } else {
+          close(got);
+        }
+      }
+    }
+    FdGuard recv_fd_guard{recv_fd};
     AGNOCAST_DAEMON_BENCH_STAMP_RECV();
     AGNOCAST_DAEMON_BENCH_CLEAR_WORK();
     AGNOCAST_DAEMON_BENCH_CLEAR_NOTIFY();
@@ -194,7 +255,7 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     }
 
     const void * payload = (hdr.payload_size > 0) ? buf.data() + sizeof(RequestHeader) : nullptr;
-    handlers_.dispatch(client_fd, client_pid, hdr, payload);
+    handlers_.dispatch(client_fd, client_pid, hdr, payload, recv_fd_guard.release());
   }
 
   handlers_.on_client_disconnect(client_pid);

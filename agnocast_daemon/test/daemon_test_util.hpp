@@ -52,16 +52,18 @@ public:
   DaemonHarness(const DaemonHarness &) = delete;
   DaemonHarness & operator=(const DaemonHarness &) = delete;
 
+  // send_fd stands in for a descriptor the client would attach with SCM_RIGHTS.
+  // dispatch takes ownership, so pass a dup when the test keeps its own copy.
   int call(
     uint32_t cmd, pid_t pid, const void * req, uint32_t req_size, void * resp_out = nullptr,
-    uint32_t resp_capacity = 0, uint32_t * payload_size = nullptr)
+    uint32_t resp_capacity = 0, uint32_t * payload_size = nullptr, int send_fd = -1)
   {
     RequestHeader hdr{cmd, req_size};
     ResponseHeader rhdr{};
     ssize_t recv_n = -1;
     std::thread reader([&]() { recv_n = recv(sv_[1], recv_buf_.get(), kResponseBufferSize, 0); });
 
-    handlers_.dispatch(sv_[0], pid, hdr, req);
+    handlers_.dispatch(sv_[0], pid, hdr, req, send_fd);
     reader.join();
 
     if (recv_n < static_cast<ssize_t>(sizeof(ResponseHeader))) {
@@ -94,7 +96,7 @@ public:
     RequestHeader hdr{cmd, req_size};
     ssize_t recv_n = -1;
     std::thread reader([&]() { recv_n = recv(sv[1], recv_buf.get(), kResponseBufferSize, 0); });
-    handlers_.dispatch(sv[0], pid, hdr, req);
+    handlers_.dispatch(sv[0], pid, hdr, req, -1);
     reader.join();
     close(sv[0]);
     close(sv[1]);
@@ -159,7 +161,7 @@ public:
   int add_subscriber(
     const char * topic, const char * node, pid_t pid, uint32_t qos_depth, int32_t * subscriber_id,
     bool transient_local = false, bool reliable = true, bool is_take_sub = false,
-    bool ignore_local_publications = false, bool is_bridge = false)
+    bool ignore_local_publications = false, bool is_bridge = false, int notify_eventfd = -1)
   {
     AddSubscriberRequest req{};
     set_topic(req.topic_name, topic);
@@ -171,7 +173,9 @@ public:
     req.ignore_local_publications = ignore_local_publications;
     req.is_bridge = is_bridge;
     AddSubscriberResponse resp{};
-    int ret = call(AGNOCAST_CMD_ADD_SUBSCRIBER, pid, &req, sizeof(req), &resp, sizeof(resp));
+    int ret = call(
+      AGNOCAST_CMD_ADD_SUBSCRIBER, pid, &req, sizeof(req), &resp, sizeof(resp), nullptr,
+      notify_eventfd);
     if (ret == 0 && subscriber_id) *subscriber_id = resp.subscriber_id;
     return ret;
   }

@@ -13,7 +13,12 @@ class CommandHandlers
 public:
   CommandHandlers(MetadataStore & store, MemoryAllocator & allocator);
 
-  void dispatch(int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload);
+  // recv_fd is the descriptor the client attached with SCM_RIGHTS, or -1. Only
+  // AGNOCAST_CMD_ADD_SUBSCRIBER sends one (the subscriber's notification
+  // eventfd); dispatch closes it for every other command so a client cannot
+  // leak descriptors into the daemon.
+  void dispatch(
+    int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd);
 
   // Called when a client disconnects its Unix socket.
   void on_client_disconnect(pid_t client_pid);
@@ -28,7 +33,7 @@ private:
 
   void handle_get_version(int fd);
   void handle_add_process(int fd, pid_t pid, const void * payload);
-  void handle_add_subscriber(int fd, pid_t pid, const void * payload);
+  void handle_add_subscriber(int fd, pid_t pid, const void * payload, int notify_eventfd);
   void handle_add_publisher(int fd, pid_t pid, const void * payload);
   void handle_release_sub_ref(int fd, pid_t pid, const void * payload);
   void handle_publish_msg(int fd, pid_t pid, const void * payload);
