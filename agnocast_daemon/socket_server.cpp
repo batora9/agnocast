@@ -161,6 +161,7 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     const ssize_t n = recv(client_fd, buf.data(), buf.size(), MSG_TRUNC);
     AGNOCAST_DAEMON_BENCH_STAMP_RECV();
     AGNOCAST_DAEMON_BENCH_CLEAR_WORK();
+    AGNOCAST_DAEMON_BENCH_CLEAR_NOTIFY();
     if (n == 0) break;  // client closed the connection
     if (n < 0) {
       if (errno == EINTR) continue;

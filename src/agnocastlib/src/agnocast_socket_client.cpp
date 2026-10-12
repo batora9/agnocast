@@ -39,6 +39,8 @@ struct CallStamps
   int64_t recv_end;     // client, immediately after recvmsg
   int64_t daemon_recv;  // daemon stamps, 0 when the response carried no trailer
   int64_t daemon_work;
+  int64_t daemon_notify_begin;
+  int64_t daemon_notify_end;
   int64_t daemon_send;
 };
 
@@ -65,12 +67,11 @@ void finalize_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
   out.daemon_stamped = 1;
   out.up_ns = s.daemon_recv - s.send_begin;
   out.down_ns = s.recv_end - s.daemon_send;
-  if (s.daemon_work != 0) {
-    out.lock_ns = s.daemon_work - s.daemon_recv;
-    out.work_ns = s.daemon_send - s.daemon_work;
-  } else {
-    out.work_ns = s.daemon_send - s.daemon_recv;
-  }
+  const int64_t work_begin = (s.daemon_work != 0) ? s.daemon_work : s.daemon_recv;
+  const int64_t work_end = (s.daemon_notify_begin != 0) ? s.daemon_notify_begin : s.daemon_send;
+  out.lock_ns = work_begin - s.daemon_recv;
+  out.work_ns = work_end - work_begin;
+  out.notify_ns = s.daemon_send - work_end;
 }
 
 }  // namespace
@@ -291,6 +292,8 @@ static int daemon_call(
   if (trailer.magic == AGNOCAST_BENCH_TRAILER_MAGIC) {
     g_stamps.daemon_recv = trailer.recv_ns;
     g_stamps.daemon_work = trailer.work_ns;
+    g_stamps.daemon_notify_begin = trailer.notify_begin_ns;
+    g_stamps.daemon_notify_end = trailer.notify_end_ns;
     g_stamps.daemon_send = trailer.send_ns;
   }
 #endif
@@ -386,12 +389,6 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
 {
   AGNOCAST_BENCH_CALL_ENTER();
 
-  // ioctl_publish_msg_args is a union: the output ret_released_addrs[] overlaps the input
-  // subscriber_ids_buffer_addr/size. Snapshot the caller-provided buffer pointer/size before
-  // writing any ret_* field, otherwise writing ret_released_addrs[] clobbers them.
-  const uint64_t subscriber_ids_buffer_addr = args->subscriber_ids_buffer_addr;
-  const uint32_t subscriber_ids_buffer_size = args->subscriber_ids_buffer_size;
-
   PublishMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.publisher_id = args->publisher_id;
@@ -400,21 +397,18 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
   int r = daemon_call(AGNOCAST_CMD_PUBLISH_MSG, &req, sizeof(req), &resp, sizeof(resp));
   if (r == 0) {
     args->ret_entry_id = resp.entry_id;
-    args->ret_subscriber_num = resp.subscriber_num;
+    // The daemon has already notified every subscriber, so leave nothing for
+    // publish_core() to mq_send.
+    args->ret_subscriber_num = 0;
     args->ret_released_num = resp.released_num;
     for (uint32_t i = 0; i < resp.released_num && i < AGNOCAST_PROTO_MAX_RELEASE_NUM; i++) {
       args->ret_released_addrs[i] = resp.released_addrs[i];
     }
-    // Copy subscriber IDs into the caller-provided buffer (snapshotted above).
-    auto * sub_ids = reinterpret_cast<topic_local_id_t *>(subscriber_ids_buffer_addr);
-    uint32_t copy_count = (resp.subscriber_num < subscriber_ids_buffer_size)
-                            ? resp.subscriber_num
-                            : subscriber_ids_buffer_size;
-    for (uint32_t i = 0; i < copy_count; i++) {
-      sub_ids[i] = resp.subscriber_ids[i];
-    }
   }
 
+#ifdef AGNOCAST_BENCH_TIMING
+  last_publish_notify_end_ns = g_stamps.daemon_notify_end;
+#endif
   AGNOCAST_BENCH_CALL_LEAVE(publish);
   return r;
 }

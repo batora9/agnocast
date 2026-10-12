@@ -18,11 +18,18 @@ namespace agnocast
 int64_t get_last_publish_ipc_ns();
 int64_t get_last_receive_ipc_ns();
 
+// CLOCK_MONOTONIC time at which the most recent publish() on the calling thread
+// finished notifying its subscribers (right after the last mq_send). The kernel
+// module backend stamps this in the client; the user-daemon backend, which
+// notifies from the daemon, carries the daemon's stamp back in the reply.
+// 0 when unavailable (not a bench build, or the daemon sent no stamps).
+int64_t get_last_publish_notify_end_ns();
+
 // Non-overlapping segments of one metadata round trip, in nanoseconds.
 //
-// req + up + lock + work + down + post == total, so the segments can be stacked
-// directly. `send_syscall` is a nested measurement inside `up` and is reported
-// separately rather than added.
+// req + up + lock + work + notify + down + post == total, so the segments can be
+// stacked directly. `send_syscall` is a nested measurement inside `up` and is
+// reported separately rather than added.
 //
 // Only the user-daemon backend can fill this in: the split relies on stamps
 // taken inside the daemon and carried back in the response trailer. Under the
@@ -37,6 +44,7 @@ struct IpcBreakdown
   int64_t up_ns;            // sendmsg .. daemon's recv() returning (transport + wakeup)
   int64_t lock_ns;          // daemon: dispatch, topic lookup, lock acquisition
   int64_t work_ns;          // daemon: handler body and response fill
+  int64_t notify_ns;        // daemon: subscriber mq_send loop until the reply (publish only)
   int64_t down_ns;          // daemon's reply .. client's recvmsg returning
   int64_t post_ns;          // unmarshal the response into the caller's args
   // 1 when the daemon supplied its stamps. When 0, up_ns holds the entire
@@ -52,6 +60,7 @@ const IpcBreakdown & get_last_receive_ipc_breakdown();
 
 extern thread_local int64_t last_publish_ipc_ns;
 extern thread_local int64_t last_receive_ipc_ns;
+extern thread_local int64_t last_publish_notify_end_ns;
 
 extern thread_local IpcBreakdown last_publish_ipc_breakdown;
 extern thread_local IpcBreakdown last_receive_ipc_breakdown;
@@ -88,7 +97,10 @@ public:
   {                                                               \
     &::agnocast::last_receive_ipc_ns                              \
   }
+#define AGNOCAST_BENCH_STAMP_PUBLISH_NOTIFY_END() \
+  (::agnocast::last_publish_notify_end_ns = ::agnocast::bench_timing_now_ns())
 #else
 #define AGNOCAST_BENCH_TIME_PUBLISH_IPC() static_cast<void>(0)
 #define AGNOCAST_BENCH_TIME_RECEIVE_IPC() static_cast<void>(0)
+#define AGNOCAST_BENCH_STAMP_PUBLISH_NOTIFY_END() static_cast<void>(0)
 #endif

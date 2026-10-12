@@ -124,8 +124,16 @@ points makes p99.9 scheduler-dominated and is not comparable.
 |--------|---------|
 | `publish_ipc` | `agnocast_ipc_publish_msg` round trip (ioctl vs UDS) |
 | `receive_ipc` | `agnocast_ipc_receive_msg` round trip |
-| `publish` | `borrow_loaned_message()` through `publish()` |
+| `publish` | `borrow_loaned_message()` until the last subscriber `mq_send` |
 | `e2e` | publisher stamp to subscriber callback entry |
+
+Subscriber notification differs by backend. Under the kernel module the client
+`mq_send`s after the ioctl returns, so the `publish` interval ends in the client.
+The user daemon notifies the subscribers itself before replying, and `publish`
+ends at the daemon's stamp after the last `mq_send` (CLOCK_MONOTONIC, carried in
+the timing trailer). Releasing old messages happens after that in both cases and
+is not counted. A consequence is that the daemon's `publish_ipc` round trip
+contains the notification (`notify` below) while the kernel module's does not.
 
 ## IPC breakdown
 
@@ -140,6 +148,7 @@ work. Both `summary.csv` (rows named `<metric>_<segment>`) and the raw
 | `up` | `sendmsg` until the daemon's `recv` returns: transport plus wakeup |
 | `lock` | daemon dispatch, topic lookup and lock acquisition |
 | `work` | daemon handler body and response fill |
+| `notify` | daemon `mq_send` to every subscriber, until the reply (publish only) |
 | `down` | daemon's reply until the client's `recvmsg` returns |
 | `post` | client unmarshals the response into the caller's args |
 | `send_syscall` | `sendmsg` alone; nested inside `up`, never summed |

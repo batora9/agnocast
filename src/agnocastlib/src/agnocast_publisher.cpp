@@ -160,6 +160,9 @@ union ioctl_publish_msg_args publish_core(
       }
     }
   }
+#ifndef AGNOCAST_USE_DAEMON
+  AGNOCAST_BENCH_STAMP_PUBLISH_NOTIFY_END();
+#endif
 
   // Close mqs that are no longer needed and update `opened_mqs`
   for (auto it = opened_mqs.begin(); it != opened_mqs.end();) {

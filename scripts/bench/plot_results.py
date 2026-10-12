@@ -70,8 +70,10 @@ DEFAULT_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e"]
 # metric -> (csv glob, column holding nanosecond samples)
 #
 # Paper TABLE V names map as follows (ipc_shared_ptr §VII):
-#   publish  = loan() through publish() completion (allocation, payload,
-#              publish ioctl/UDS, and subscriber notification)
+#   publish  = loan() until the last subscriber mq_send (allocation, payload,
+#              publish ioctl/UDS, and subscriber notification). The client
+#              notifies under kmod, the daemon under the user daemon, whose
+#              stamp ends the interval; releasing old messages is excluded.
 #   receive  = core receive-side ioctl / UDS receive_msg only
 #   e2e      = subscriber-callback entry minus the publisher stamp
 # publish_ipc / receive_ipc are the same columns as the metadata round trip;
@@ -173,6 +175,18 @@ def pooled_stats_2d(sweep_dir: Path, metrics) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def legend_below(ax, ncol):
+    """Place the legend under the x-axis label so it cannot cover the series."""
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.22),
+        ncol=ncol,
+        frameon=False,
+        borderaxespad=0.0,
+        columnspacing=1.2,
+    )
+
+
 def save_figure(fig, name, output_dir):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -213,7 +227,7 @@ def plot_vs_sweep(datasets, metric, xlabel, filename, output_dir):
     ax.set_ylabel("Latency (us)")
     ax.set_title(METRIC_TITLES[metric])
     ax.yaxis.set_major_formatter(COMMA_FORMATTER)
-    ax.legend(loc="best", ncol=1, framealpha=0.92)
+    legend_below(ax, ncol=2)
     save_figure(fig, filename, output_dir)
 
 
@@ -239,7 +253,7 @@ def plot_cdf(datasets, output_dir, metrics, suffix=""):
         ax.set_ylabel("CDF")
         ax.set_xscale("log")
         ax.xaxis.set_major_formatter(COMMA_FORMATTER)
-        ax.legend(loc="lower right", ncol=1, framealpha=0.92)
+        legend_below(ax, ncol=2)
         save_figure(fig, f"cdf_{metric}{suffix}", output_dir)
 
 

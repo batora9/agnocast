@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon_test_util.hpp"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <mqueue.h>
 
 #include <atomic>
 #include <cerrno>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -252,6 +255,40 @@ TEST(IoctlCore, PublishMsgSimplePublishWithoutAnyRelease)
 
   EXPECT_EQ(pub_resp.released_num, 0U);
   EXPECT_EQ(pub_resp.subscriber_num, 1U);
+}
+
+TEST(IoctlCore, PublishMsgNotifiesSubscriberMq)
+{
+  DaemonHarness h;
+  uint64_t pub_addr = 0;
+  ASSERT_EQ(h.add_process(1000, &pub_addr), 0);
+  ASSERT_EQ(h.add_process(2000), 0);
+  int32_t pub_id = -1;
+  int32_t sub_id = -1;
+  ASSERT_EQ(h.add_publisher(kTopic, kNode, 1000, 10, &pub_id), 0);
+  ASSERT_EQ(h.add_subscriber(kTopic, kNode, 2000, 10, &sub_id), 0);
+
+  const std::string mq_name = "/agnocast@kunit_test_topic@" + std::to_string(sub_id);
+  mq_attr attr{};
+  attr.mq_maxmsg = 1;
+  attr.mq_msgsize = 1;
+  const mqd_t mq = mq_open(mq_name.c_str(), O_CREAT | O_RDONLY | O_NONBLOCK, 0600, &attr);
+  ASSERT_NE(mq, static_cast<mqd_t>(-1));
+
+  PublishMsgResponse pub_resp{};
+  ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr, &pub_resp), 0);
+  mq_attr got{};
+  ASSERT_EQ(mq_getattr(mq, &got), 0);
+  EXPECT_EQ(got.mq_curmsgs, 1);
+
+  // A pending notification already wakes the subscriber; a full queue is not an error.
+  ASSERT_EQ(h.publish(kTopic, pub_id, pub_addr + 8, &pub_resp), 0);
+  ASSERT_EQ(mq_getattr(mq, &got), 0);
+  EXPECT_EQ(got.mq_curmsgs, 1);
+
+  ASSERT_EQ(remove_publisher(h, pub_id), 0);
+  mq_close(mq);
+  mq_unlink(mq_name.c_str());
 }
 
 TEST(IoctlCore, PublishMsgNoTopic)

@@ -29,6 +29,8 @@ inline int64_t now_ns()
 
 inline thread_local int64_t t_recv_ns = 0;
 inline thread_local int64_t t_work_ns = 0;
+inline thread_local int64_t t_notify_begin_ns = 0;
+inline thread_local int64_t t_notify_end_ns = 0;
 
 inline void fill_trailer(BenchTimingTrailer & trailer)
 {
@@ -36,6 +38,8 @@ inline void fill_trailer(BenchTimingTrailer & trailer)
   trailer._pad = 0;
   trailer.recv_ns = t_recv_ns;
   trailer.work_ns = t_work_ns;
+  trailer.notify_begin_ns = t_notify_begin_ns;
+  trailer.notify_end_ns = t_notify_end_ns;
   trailer.send_ns = now_ns();
 }
 
@@ -55,10 +59,22 @@ inline void fill_trailer(BenchTimingTrailer & trailer)
 // as "not decomposed"; clear it so a previous request cannot leak into this one.
 #define AGNOCAST_DAEMON_BENCH_CLEAR_WORK() (::agnocast_daemon_bench::t_work_ns = 0)
 
+// Bracket the publish handler's subscriber notification. The end stamp is what
+// the benchmark reports as publish completion.
+#define AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_BEGIN() \
+  (::agnocast_daemon_bench::t_notify_begin_ns = ::agnocast_daemon_bench::now_ns())
+#define AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_END() \
+  (::agnocast_daemon_bench::t_notify_end_ns = ::agnocast_daemon_bench::now_ns())
+#define AGNOCAST_DAEMON_BENCH_CLEAR_NOTIFY() \
+  (::agnocast_daemon_bench::t_notify_begin_ns = 0, ::agnocast_daemon_bench::t_notify_end_ns = 0)
+
 #else  // AGNOCAST_BENCH_TIMING
 
 #define AGNOCAST_DAEMON_BENCH_STAMP_RECV() static_cast<void>(0)
 #define AGNOCAST_DAEMON_BENCH_STAMP_WORK() static_cast<void>(0)
 #define AGNOCAST_DAEMON_BENCH_CLEAR_WORK() static_cast<void>(0)
+#define AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_BEGIN() static_cast<void>(0)
+#define AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_END() static_cast<void>(0)
+#define AGNOCAST_DAEMON_BENCH_CLEAR_NOTIFY() static_cast<void>(0)
 
 #endif  // AGNOCAST_BENCH_TIMING

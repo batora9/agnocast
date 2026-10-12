@@ -43,6 +43,7 @@ IPC_SEGMENTS = [
     ("up", "ipc_up_ns"),
     ("lock", "ipc_lock_ns"),
     ("work", "ipc_work_ns"),
+    ("notify", "ipc_notify_ns"),
     ("down", "ipc_down_ns"),
     ("post", "ipc_post_ns"),
 ]

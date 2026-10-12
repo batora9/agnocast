@@ -3,10 +3,14 @@
 // Benchmark publisher: one topic per process.
 //
 // Each timer tick borrows a loaned message, stamps it, publishes it, and records
-// both the total publish path and the backend IPC round trip
-// (agnocast::get_last_publish_ipc_ns()). The same binary is built twice, once
-// against a kernel-module agnocastlib and once against a user-daemon one, so the
-// recorded numbers differ only in the backend.
+// both the publish latency and the backend IPC round trip
+// (agnocast::get_last_publish_ipc_ns()). The publish latency runs from the loan
+// to the moment the last subscriber was notified
+// (agnocast::get_last_publish_notify_end_ns()): in the client under the kernel
+// module, in the daemon under the user daemon. Releasing old messages comes
+// after that and is not counted. The same binary is built twice, once against a
+// kernel-module agnocastlib and once against a user-daemon one, so the recorded
+// numbers differ only in the backend.
 
 #include "agnocast/agnocast.hpp"
 #include "agnocast/agnocast_bench_timing.hpp"
@@ -151,6 +155,8 @@ private:
     pub_->publish(std::move(message));
     const int64_t t1 = now_ns();
 
+    const int64_t notify_end = agnocast::get_last_publish_notify_end_ns();
+    const int64_t publish_end = (notify_end > 0) ? notify_end : t1;
     const int64_t ipc_ns = agnocast::get_last_publish_ipc_ns();
     const agnocast::IpcBreakdown & breakdown = agnocast::get_last_publish_ipc_breakdown();
 
@@ -159,7 +165,7 @@ private:
     if (
       warmup_done_.load(std::memory_order_relaxed) &&
       !measurement_done_.load(std::memory_order_relaxed)) {
-      samples_.push_back(Sample{seq_, t1 - t0, ipc_ns, timestamp, breakdown});
+      samples_.push_back(Sample{seq_, publish_end - t0, ipc_ns, timestamp, breakdown});
       measured_published_++;
     }
 
@@ -194,13 +200,13 @@ private:
     // kernel-module backend, which has no separate servicing entity to attribute.
     ofs << "topic_idx,seq,publish_latency_ns,publish_ipc_ns,timestamp_ns,"
         << "ipc_total_ns,ipc_req_ns,ipc_send_syscall_ns,ipc_up_ns,ipc_lock_ns,"
-        << "ipc_work_ns,ipc_down_ns,ipc_post_ns,ipc_daemon_stamped\n";
+        << "ipc_work_ns,ipc_notify_ns,ipc_down_ns,ipc_post_ns,ipc_daemon_stamped\n";
     for (const Sample & s : samples_) {
       ofs << topic_index_ << "," << s.seq << "," << s.publish_latency_ns << "," << s.publish_ipc_ns
           << "," << s.timestamp_ns << "," << s.ipc.total_ns << "," << s.ipc.req_ns << ","
           << s.ipc.send_syscall_ns << "," << s.ipc.up_ns << "," << s.ipc.lock_ns << ","
-          << s.ipc.work_ns << "," << s.ipc.down_ns << "," << s.ipc.post_ns << ","
-          << s.ipc.daemon_stamped << "\n";
+          << s.ipc.work_ns << "," << s.ipc.notify_ns << "," << s.ipc.down_ns << "," << s.ipc.post_ns
+          << "," << s.ipc.daemon_stamped << "\n";
     }
   }
 

@@ -151,6 +151,10 @@ struct BenchTimingTrailer
   int64_t recv_ns; /* recv() for this request returned */
   int64_t work_ns; /* handler passed dispatch and acquired its locks; 0 if unstamped */
   int64_t send_ns; /* immediately before the reply is written to the socket */
+  /* PUBLISH_MSG only, 0 otherwise: the daemon's subscriber-notification loop.
+   * notify_end_ns is right after the last mq_send(). */
+  int64_t notify_begin_ns;
+  int64_t notify_end_ns;
 };
 
 /* --------------------------------------------------------------------------
@@ -341,6 +345,10 @@ struct ReleaseSubRefRequest
  * The subscriber_ids_buffer_addr/size in the ioctl is a userspace pointer pair;
  * subscriber IDs are returned inline in the response instead.
  * Maximum response size ≈ 12 KB (MAX_SUBSCRIBER_NUM × 4 bytes).
+ *
+ * Unlike the kernel module, the daemon wakes the subscribers itself (mq_send on
+ * each subscriber's notification queue) before replying. subscriber_num and
+ * subscriber_ids report who was notified; the client must not notify again.
  */
 struct PublishMsgRequest
 {
@@ -685,7 +693,7 @@ struct SetRos2PublisherNumRequest
 #ifdef __cplusplus
 static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-static_assert(sizeof(struct BenchTimingTrailer) == 32, "BenchTimingTrailer must be 32 bytes");
+static_assert(sizeof(struct BenchTimingTrailer) == 48, "BenchTimingTrailer must be 48 bytes");
 static_assert(
   sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
 static_assert(
@@ -715,7 +723,7 @@ static_assert(
 #else
 _Static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 _Static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
-_Static_assert(sizeof(struct BenchTimingTrailer) == 32, "BenchTimingTrailer must be 32 bytes");
+_Static_assert(sizeof(struct BenchTimingTrailer) == 48, "BenchTimingTrailer must be 48 bytes");
 _Static_assert(
   sizeof(struct AgnocastPublisherShmInfo) == 24, "AgnocastPublisherShmInfo must be 24 bytes");
 _Static_assert(

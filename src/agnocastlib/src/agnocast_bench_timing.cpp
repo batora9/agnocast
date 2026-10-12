@@ -12,6 +12,7 @@ namespace agnocast
 
 thread_local int64_t last_publish_ipc_ns = 0;
 thread_local int64_t last_receive_ipc_ns = 0;
+thread_local int64_t last_publish_notify_end_ns = 0;
 
 thread_local IpcBreakdown last_publish_ipc_breakdown = {};
 thread_local IpcBreakdown last_receive_ipc_breakdown = {};
@@ -35,6 +36,11 @@ int64_t get_last_receive_ipc_ns()
   return last_receive_ipc_ns;
 }
 
+int64_t get_last_publish_notify_end_ns()
+{
+  return last_publish_notify_end_ns;
+}
+
 const IpcBreakdown & get_last_publish_ipc_breakdown()
 {
   return last_publish_ipc_breakdown;
@@ -53,6 +59,11 @@ int64_t get_last_publish_ipc_ns()
 }
 
 int64_t get_last_receive_ipc_ns()
+{
+  return 0;
+}
+
+int64_t get_last_publish_notify_end_ns()
 {
   return 0;
 }

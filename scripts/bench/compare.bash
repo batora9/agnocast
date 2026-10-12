@@ -28,7 +28,6 @@ while [[ $# -gt 0 ]]; do
   --kmod-data) KMOD_DATA="$2"; shift 2 ;;
   --daemon-rt-priority)
     SWEEP_ARGS+=(--daemon-rt-priority "$2")
-    DAEMON_LABEL="user daemon FIFO ${2}"
     shift 2
     ;;
   -h | --help) sed -n '3,12p' "${BASH_SOURCE[0]}"; exit 0 ;;

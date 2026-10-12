@@ -26,6 +26,7 @@ SEGMENTS = [
     ("up", "ipc_up_ns", "sendmsg -> daemon's recv returns (transport + wakeup)"),
     ("lock", "ipc_lock_ns", "daemon: dispatch, topic lookup, lock acquisition"),
     ("work", "ipc_work_ns", "daemon: handler body and response fill"),
+    ("notify", "ipc_notify_ns", "daemon: mq_send to every subscriber (publish only)"),
     ("down", "ipc_down_ns", "daemon's reply -> client's recvmsg returns"),
     ("post", "ipc_post_ns", "client: unmarshal response into caller args"),
 ]
