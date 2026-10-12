@@ -124,7 +124,7 @@ points makes p99.9 scheduler-dominated and is not comparable.
 |--------|---------|
 | `publish_ipc` | `agnocast_ipc_publish_msg` round trip (ioctl vs UDS) |
 | `receive_ipc` | `agnocast_ipc_receive_msg` round trip |
-| `publish` | `borrow_loaned_message()` until the last subscriber `mq_send` |
+| `publish` | `borrow_loaned_message()` until the last subscriber was notified |
 | `e2e` | publisher stamp to subscriber callback entry |
 
 Both backends notify the subscribers from the central component, so `publish`
@@ -134,9 +134,12 @@ ioctl returns. The user daemon notifies with `mq_send` before replying, and
 `publish` ends at the daemon's stamp after the last send (CLOCK_MONOTONIC,
 carried in the timing trailer). Numbers taken before the 2.4.1 merge used the
 old mechanism (client-side `mq_send` under the kernel module) and are not
-comparable with ones taken after it. Releasing old messages happens after that in both cases and
-is not counted. A consequence is that the daemon's `publish_ipc` round trip
-contains the notification (`notify` below) while the kernel module's does not.
+comparable with ones taken after it. Releasing old messages happens after that
+in both cases and is not counted.
+
+Both `*_ipc` round trips therefore now contain the notification: the daemon's as
+the `notify` segment below, the kernel module's inside the ioctl where it cannot
+be split out.
 
 ## IPC breakdown
 
