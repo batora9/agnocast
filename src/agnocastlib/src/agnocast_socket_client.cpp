@@ -6,6 +6,8 @@
 #include "agnocast/agnocast_utils.hpp"
 #include "protocol.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
@@ -19,6 +21,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace agnocast
 {
@@ -340,6 +344,107 @@ static void copy_name_out(char * dst, size_t dst_size, const char * src)
   dst[dst_size - 1] = '\0';
 }
 
+// Per-subscriber memory shared with the daemon (AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL).
+namespace
+{
+
+struct ClientChannel
+{
+  AgnocastSubscriberChannel * shm = nullptr;
+
+  ClientChannel() = default;
+  ~ClientChannel()
+  {
+    if (shm != nullptr) munmap(shm, sizeof(*shm));
+  }
+  ClientChannel(const ClientChannel &) = delete;
+  ClientChannel & operator=(const ClientChannel &) = delete;
+};
+
+// Held by shared_ptr so a thread still using a channel keeps it mapped after
+// the subscription that owns it has been removed.
+std::mutex channels_mtx;
+std::unordered_map<std::string, std::shared_ptr<ClientChannel>> channels;
+
+std::string channel_key(const struct name_info & topic_name, int32_t subscriber_id)
+{
+  std::string key(topic_name.ptr != nullptr ? topic_name.ptr : "", topic_name.len);
+  key.push_back('\0');
+  key.append(std::to_string(subscriber_id));
+  return key;
+}
+
+std::shared_ptr<ClientChannel> find_channel(
+  const struct name_info & topic_name, int32_t subscriber_id)
+{
+  const std::string key = channel_key(topic_name, subscriber_id);
+  std::lock_guard<std::mutex> lock(channels_mtx);
+  const auto it = channels.find(key);
+  return (it != channels.end()) ? it->second : nullptr;
+}
+
+// AGNOCAST_SUB_CHANNEL=0 keeps every subscriber on the plain request path, so
+// one build can be measured both ways.
+bool sub_channel_enabled()
+{
+  const char * v = std::getenv("AGNOCAST_SUB_CHANNEL");
+  return v == nullptr || std::strcmp(v, "0") != 0;
+}
+
+}  // namespace
+
+// A subscriber without a channel still works over plain requests, so failing
+// here is reported and otherwise ignored.
+static void attach_subscriber_channel(const struct name_info & topic_name, int32_t subscriber_id)
+{
+  if (!sub_channel_enabled()) return;
+
+  const int memfd = memfd_create("agnocast_sub_channel", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (memfd < 0) {
+    RCLCPP_WARN(logger, "memfd_create for the subscriber channel failed: %s", strerror(errno));
+    return;
+  }
+
+  constexpr size_t kChannelSize = sizeof(AgnocastSubscriberChannel);
+  auto channel = std::make_shared<ClientChannel>();
+  void * mapped = MAP_FAILED;
+  if (ftruncate(memfd, kChannelSize) == 0) {
+    mapped = mmap(nullptr, kChannelSize, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  }
+  if (
+    mapped == MAP_FAILED ||
+    fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
+    RCLCPP_WARN(logger, "preparing the subscriber channel failed: %s", strerror(errno));
+    if (mapped != MAP_FAILED) munmap(mapped, kChannelSize);
+    close(memfd);
+    return;
+  }
+  channel->shm = static_cast<AgnocastSubscriberChannel *>(mapped);
+  __atomic_store_n(&channel->shm->magic, AGNOCAST_SUB_CHANNEL_MAGIC, __ATOMIC_RELEASE);
+
+  AttachSubscriberChannelRequest req{};
+  copy_name(req.topic_name, sizeof(req.topic_name), topic_name);
+  req.subscriber_id = subscriber_id;
+  const int r =
+    daemon_call(AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL, &req, sizeof(req), nullptr, 0, memfd);
+  close(memfd);
+  if (r < 0) {
+    RCLCPP_WARN(
+      logger, "AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL failed: %s; using plain requests",
+      strerror(errno));
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(channels_mtx);
+  channels[channel_key(topic_name, subscriber_id)] = std::move(channel);
+}
+
+static void detach_subscriber_channel(const struct name_info & topic_name, int32_t subscriber_id)
+{
+  std::lock_guard<std::mutex> lock(channels_mtx);
+  channels.erase(channel_key(topic_name, subscriber_id));
+}
+
 int agnocast_ipc_get_version(struct ioctl_get_version_args * args)
 {
   GetVersionResponse resp{};
@@ -402,7 +507,10 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   int r =
     daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), args->eventfd);
   if (r == 0) {
+    // ret_id overlaps topic_name in the union, so take the name first.
+    const struct name_info topic_name = args->topic_name;
     args->ret_id = resp.subscriber_id;
+    attach_subscriber_channel(topic_name, resp.subscriber_id);
   }
   return r;
 }
@@ -522,7 +630,9 @@ int agnocast_ipc_remove_subscriber(struct ioctl_remove_subscriber_args * args)
   RemoveSubscriberRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
-  return daemon_call(AGNOCAST_CMD_REMOVE_SUBSCRIBER, &req, sizeof(req), nullptr, 0);
+  const int r = daemon_call(AGNOCAST_CMD_REMOVE_SUBSCRIBER, &req, sizeof(req), nullptr, 0);
+  detach_subscriber_channel(args->topic_name, args->subscriber_id);
+  return r;
 }
 
 int agnocast_ipc_get_subscriber_num(union ioctl_get_subscriber_num_args * args)

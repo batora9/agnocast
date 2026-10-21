@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -69,6 +70,26 @@ struct PublisherInfo
   bool is_bridge = false;
 };
 
+// The daemon's side of a subscriber's AgnocastSubscriberChannel. Owns the
+// mapping; it is unmapped when the SubscriberInfo holding it is erased, which
+// happens only under global_mutex_ held exclusively, so no handler can still be
+// reading through it.
+struct SubscriberChannel
+{
+  AgnocastSubscriberChannel * shm = nullptr;
+
+  // Serializes the daemon-side accessors of this channel that may run under a
+  // shared topic lock.
+  std::mutex mtx;
+
+  explicit SubscriberChannel(AgnocastSubscriberChannel * mapped) : shm(mapped) {}
+  ~SubscriberChannel();
+  SubscriberChannel(const SubscriberChannel &) = delete;
+  SubscriberChannel & operator=(const SubscriberChannel &) = delete;
+  SubscriberChannel(SubscriberChannel &&) = delete;
+  SubscriberChannel & operator=(SubscriberChannel &&) = delete;
+};
+
 // Equivalent of agnocast_kmod::subscriber_info.
 struct SubscriberInfo
 {
@@ -89,6 +110,9 @@ struct SubscriberInfo
   // The kernel module resolves the caller's fd to an eventfd_ctx instead; a
   // userspace daemon cannot, so the descriptor itself has to be passed.
   int notify_eventfd = -1;
+  // Set by AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL; null for a subscriber that
+  // never attached one, which then uses the plain request path throughout.
+  std::unique_ptr<SubscriberChannel> channel;
 };
 
 // Equivalent of agnocast_kmod::topic_struct.

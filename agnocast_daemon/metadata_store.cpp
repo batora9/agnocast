@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "metadata_store.hpp"
 
+#include <sys/mman.h>
+
+SubscriberChannel::~SubscriberChannel()
+{
+  if (shm != nullptr) munmap(shm, sizeof(*shm));
+}
+
 TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
 {
   auto it = topic_map_.find(key);

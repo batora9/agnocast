@@ -14,9 +14,10 @@ public:
   CommandHandlers(MetadataStore & store, MemoryAllocator & allocator);
 
   // recv_fd is the descriptor the client attached with SCM_RIGHTS, or -1. Only
-  // AGNOCAST_CMD_ADD_SUBSCRIBER sends one (the subscriber's notification
-  // eventfd); dispatch closes it for every other command so a client cannot
-  // leak descriptors into the daemon.
+  // AGNOCAST_CMD_ADD_SUBSCRIBER (the subscriber's notification eventfd) and
+  // AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL (the channel memfd) send one;
+  // dispatch closes it for every other command so a client cannot leak
+  // descriptors into the daemon.
   void dispatch(
     int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd);
 
@@ -57,6 +58,7 @@ private:
   void handle_set_ros2_subscriber_num(int fd, pid_t pid, const void * payload);
   void handle_set_ros2_publisher_num(int fd, pid_t pid, const void * payload);
   void handle_notify_bridge_shutdown(int fd, pid_t pid);
+  void handle_attach_subscriber_channel(int fd, pid_t pid, const void * payload, int channel_fd);
 
   void process_exit_cleanup(pid_t pid);
 };

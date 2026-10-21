@@ -105,6 +105,9 @@ typedef enum {
   AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM = 25,
   AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM = 26,
   AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN = 27,
+  /* Daemon-only commands. They have no ioctl counterpart, so they are numbered
+   * well clear of the range agnocast.h uses. */
+  AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL = 64,
 } CommandType;
 
 /* --------------------------------------------------------------------------
@@ -683,6 +686,37 @@ struct SetRos2PublisherNumRequest
 /* ---- AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN (27) ---- */
 /* Request: no payload */
 /* Response: no payload */
+
+/* ---- AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL (64) ---- */
+/* Shares one AgnocastSubscriberChannel between a subscriber and the daemon.
+ *
+ * The subscriber creates a memfd of exactly sizeof(AgnocastSubscriberChannel),
+ * writes the magic, seals it against shrinking and growing, and attaches it
+ * with SCM_RIGHTS. The daemon maps it and keeps the mapping until the
+ * subscriber is removed or its process exits. The seal is what lets the daemon
+ * touch client-provided memory: without it the client could truncate the file
+ * and turn the daemon's next access into SIGBUS.
+ *
+ * Everything in the channel is writable by the subscriber, so the daemon reads
+ * only the fields the subscriber owns and never trusts their values: indices
+ * are clamped and entry ids are looked up before use.
+ */
+struct AttachSubscriberChannelRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  int32_t subscriber_id; /* topic_local_id_t */
+};
+/* Response: no payload */
+
+#define AGNOCAST_SUB_CHANNEL_MAGIC 0x41474348u /* "AGCH" */
+
+/* Cross-process fields are accessed only through __atomic builtins, so the
+ * layout stays plain C and both sides agree on it. */
+struct AgnocastSubscriberChannel
+{
+  uint32_t magic; /* AGNOCAST_SUB_CHANNEL_MAGIC, written by the subscriber */
+  uint32_t _pad;
+};
 
 /* --------------------------------------------------------------------------
  * Compile-time layout assertions

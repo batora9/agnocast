@@ -7,6 +7,7 @@
 #include <mqueue.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -437,9 +438,11 @@ void CommandHandlers::send_response(
 void CommandHandlers::dispatch(
   int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd)
 {
-  // Only ADD_SUBSCRIBER has a use for an attached descriptor. Close anything
-  // that arrives on another command rather than letting it accumulate.
-  if (recv_fd >= 0 && hdr.command != AGNOCAST_CMD_ADD_SUBSCRIBER) {
+  // Only these two commands have a use for an attached descriptor. Close
+  // anything that arrives on another command rather than letting it accumulate.
+  if (
+    recv_fd >= 0 && hdr.command != AGNOCAST_CMD_ADD_SUBSCRIBER &&
+    hdr.command != AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL) {
     close(recv_fd);
     recv_fd = -1;
   }
@@ -522,6 +525,9 @@ void CommandHandlers::dispatch(
       break;
     case AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN:
       handle_notify_bridge_shutdown(client_fd, client_pid);
+      break;
+    case AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL:
+      handle_attach_subscriber_channel(client_fd, client_pid, payload, recv_fd);
       break;
     default:
       send_response(client_fd, EINVAL);
@@ -1471,6 +1477,77 @@ void CommandHandlers::handle_notify_bridge_shutdown(int fd, pid_t pid)
   std::unique_lock glock(store_.global_mutex_);
   ProcessInfo * proc = store_.find_process(pid);
   if (proc) proc->is_performance_bridge_manager = false;
+  send_response(fd, 0);
+}
+
+void CommandHandlers::handle_attach_subscriber_channel(
+  int fd, pid_t pid, const void * payload, int channel_fd)
+{
+  // Owns channel_fd on every path: the mapping, once made, does not need it.
+  struct FdCloser
+  {
+    int fd;
+    ~FdCloser()
+    {
+      if (fd >= 0) close(fd);
+    }
+  } closer{channel_fd};
+
+  if (!payload || channel_fd < 0) {
+    send_response(fd, EINVAL);
+    return;
+  }
+  const auto * req = static_cast<const AttachSubscriberChannelRequest *>(payload);
+
+  constexpr size_t kChannelSize = sizeof(AgnocastSubscriberChannel);
+  struct stat st
+  {
+  };
+  if (fstat(channel_fd, &st) < 0 || st.st_size != static_cast<off_t>(kChannelSize)) {
+    send_response(fd, EINVAL);
+    return;
+  }
+  const int seals = fcntl(channel_fd, F_GET_SEALS);
+  if (seals < 0 || (seals & F_SEAL_SHRINK) == 0) {
+    send_response(fd, EPERM);
+    return;
+  }
+
+  void * mapped = mmap(nullptr, kChannelSize, PROT_READ | PROT_WRITE, MAP_SHARED, channel_fd, 0);
+  if (mapped == MAP_FAILED) {
+    send_response(fd, errno);
+    return;
+  }
+  auto channel =
+    std::make_unique<SubscriberChannel>(static_cast<AgnocastSubscriberChannel *>(mapped));
+  if (__atomic_load_n(&channel->shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_SUB_CHANNEL_MAGIC) {
+    send_response(fd, EINVAL);
+    return;
+  }
+
+  std::shared_lock glock(store_.global_mutex_);
+  TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
+  if (!wrapper) {
+    send_response(fd, EINVAL);
+    return;
+  }
+
+  std::unique_lock tlock(wrapper->topic_rwsem);
+  SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
+  if (!sub_info) {
+    send_response(fd, ENODATA);
+    return;
+  }
+  if (sub_info->pid != pid) {
+    send_response(fd, EPERM);
+    return;
+  }
+  if (sub_info->channel) {
+    send_response(fd, EEXIST);
+    return;
+  }
+
+  sub_info->channel = std::move(channel);
   send_response(fd, 0);
 }
 
