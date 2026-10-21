@@ -87,6 +87,9 @@ struct SubscriberChannel
   uint64_t push_head = 0;
   bool ipc_pending = true;
 
+  // The daemon's own copy of release.tail, for the same reason.
+  uint64_t release_tail = 0;
+
   explicit SubscriberChannel(AgnocastSubscriberChannel * mapped) : shm(mapped) {}
   ~SubscriberChannel();
   SubscriberChannel(const SubscriberChannel &) = delete;

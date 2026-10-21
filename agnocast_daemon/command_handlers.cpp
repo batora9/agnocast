@@ -149,6 +149,42 @@ int add_subscriber_reference(EntryNode & en, int32_t id)
   return 0;
 }
 
+// Applies the releases a subscriber has queued in its channel's release ring.
+// The caller holds the topic lock (shared is enough: the reference bits are
+// atomic and the entries map is not modified); the channel mutex keeps two
+// shared holders from consuming the same slots.
+void drain_release_ring(TopicWrapper * wrapper, SubscriberInfo & sub)
+{
+  SubscriberChannel * channel = sub.channel.get();
+  if (channel == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(channel->mtx);
+  AgnocastReleaseRing & ring = channel->shm->release;
+  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_ACQUIRE);
+  uint64_t tail = channel->release_tail;
+  if (head - tail > AGNOCAST_RELEASE_RING_SLOTS) {
+    // head is the subscriber's to write; one behind tail or more than a ring
+    // ahead is not something a well-behaved subscriber produces.
+    tail = head;
+  }
+  for (; tail != head; ++tail) {
+    const int64_t entry_id =
+      __atomic_load_n(&ring.entry_ids[tail % AGNOCAST_RELEASE_RING_SLOTS], __ATOMIC_RELAXED);
+    EntryNode * en = find_message_entry(wrapper->topic, entry_id);
+    if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
+  }
+  channel->release_tail = tail;
+  __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
+}
+
+void drain_release_rings(TopicWrapper * wrapper)
+{
+  for (auto & [id, sub] : wrapper->topic.sub_info_map) {
+    (void)id;
+    drain_release_ring(wrapper, sub);
+  }
+}
+
 int insert_subscriber_info(
   TopicWrapper * wrapper, const char * node_name, pid_t subscriber_pid, uint32_t qos_depth,
   bool qos_is_transient_local, bool qos_is_reliable, bool is_take_sub,
@@ -797,6 +833,7 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
   resp.entry_id = entry_id;
   pub_info->entries_num++;
 
+  drain_release_rings(wrapper);
   int ret = release_msgs_to_meet_depth(wrapper, pub_info, &resp);
   if (ret < 0) {
     send_response(fd, -ret);
@@ -910,6 +947,10 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
     send_response(fd, EINVAL);
     return;
   }
+  // A queued release of the message about to be taken again must land first,
+  // or allow_same_message would see the stale bit, skip re-referencing, and the
+  // late release would then drop the reference the caller now holds.
+  drain_release_ring(wrapper, *sub_info);
 
   TakeMsgResponse resp{};
   resp.addr = 0;
@@ -1261,6 +1302,9 @@ void CommandHandlers::handle_remove_subscriber(int fd, pid_t pid, const void * p
   }
 
   if (sub_info->notify_eventfd >= 0) close(sub_info->notify_eventfd);
+  // The cleanup below frees entries no one references, so the other
+  // subscribers' queued releases have to be in the bits first.
+  drain_release_rings(wrapper);
   wrapper->topic.sub_info_map.erase(req->subscriber_id);
   cleanup_unreferenced_entries_from_exited_publishers(wrapper, req->subscriber_id, store_);
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
@@ -1289,6 +1333,7 @@ void CommandHandlers::handle_remove_publisher(int fd, pid_t pid, const void * pa
     return;
   }
 
+  drain_release_rings(wrapper);
   std::vector<int64_t> to_remove;
   for (auto & [entry_id, en] : wrapper->topic.entries) {
     if (en.publisher_id != req->publisher_id) continue;
@@ -1637,6 +1682,7 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
     for (auto & [key, wrapper_ptr] : store_.topic_map_) {
       TopicWrapper * wrapper = wrapper_ptr.get();
       std::unique_lock tlock(wrapper->topic_rwsem);
+      drain_release_rings(wrapper);
 
       // Publisher exit cleanup
       std::vector<int32_t> pubs_to_remove;
