@@ -82,6 +82,10 @@ struct SubscriberChannel
   // shared topic lock.
   std::mutex mtx;
 
+  // The daemon's own copy of release.tail. The shared one is only published
+  // for the subscriber, which could overwrite it.
+  uint64_t release_tail = 0;
+
   explicit SubscriberChannel(AgnocastSubscriberChannel * mapped) : shm(mapped) {}
   ~SubscriberChannel();
   SubscriberChannel(const SubscriberChannel &) = delete;

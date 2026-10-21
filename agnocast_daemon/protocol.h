@@ -710,12 +710,31 @@ struct AttachSubscriberChannelRequest
 
 #define AGNOCAST_SUB_CHANNEL_MAGIC 0x41474348u /* "AGCH" */
 
+/* Releases the subscriber has not reported yet, instead of one
+ * AGNOCAST_CMD_RELEASE_SUB_REF round trip each. The subscriber appends the
+ * entry id and advances head; the daemon consumes them under the topic lock
+ * before anything that reads the reference bits (publish, take, publisher
+ * removal, exit cleanup). Deferring a release to the next publish loses
+ * nothing: a publish is the only place memory is handed back to a publisher.
+ * When the ring is full the subscriber falls back to the request. */
+#define AGNOCAST_RELEASE_RING_SLOTS 256
+
+struct AgnocastReleaseRing
+{
+  uint64_t head; /* written by the subscriber: next slot to fill */
+  uint8_t _pad0[56];
+  uint64_t tail; /* written by the daemon: next slot to consume */
+  uint8_t _pad1[56];
+  int64_t entry_ids[AGNOCAST_RELEASE_RING_SLOTS];
+};
+
 /* Cross-process fields are accessed only through __atomic builtins, so the
  * layout stays plain C and both sides agree on it. */
 struct AgnocastSubscriberChannel
 {
   uint32_t magic; /* AGNOCAST_SUB_CHANNEL_MAGIC, written by the subscriber */
-  uint32_t _pad;
+  uint32_t _pad[15];
+  struct AgnocastReleaseRing release;
 };
 
 /* --------------------------------------------------------------------------

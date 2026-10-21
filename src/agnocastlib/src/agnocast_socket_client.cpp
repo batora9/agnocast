@@ -351,6 +351,9 @@ namespace
 struct ClientChannel
 {
   AgnocastSubscriberChannel * shm = nullptr;
+  // Several threads can drop the last reference to different messages of one
+  // subscription at once; the daemon is the ring's only consumer.
+  std::mutex release_mtx;
 
   ClientChannel() = default;
   ~ClientChannel()
@@ -389,6 +392,19 @@ bool sub_channel_enabled()
 {
   const char * v = std::getenv("AGNOCAST_SUB_CHANNEL");
   return v == nullptr || std::strcmp(v, "0") != 0;
+}
+
+// false when the ring is full; the caller then reports the release directly.
+bool queue_release(ClientChannel & channel, int64_t entry_id)
+{
+  std::lock_guard<std::mutex> lock(channel.release_mtx);
+  AgnocastReleaseRing & ring = channel.shm->release;
+  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_RELAXED);
+  const uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_ACQUIRE);
+  if (head - tail >= AGNOCAST_RELEASE_RING_SLOTS) return false;
+  __atomic_store_n(&ring.entry_ids[head % AGNOCAST_RELEASE_RING_SLOTS], entry_id, __ATOMIC_RELAXED);
+  __atomic_store_n(&ring.head, head + 1, __ATOMIC_RELEASE);
+  return true;
 }
 
 }  // namespace
@@ -610,6 +626,10 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
 
 int agnocast_ipc_release_sub_ref(struct ioctl_update_entry_args * args)
 {
+  if (const auto channel = find_channel(args->topic_name, args->pubsub_id)) {
+    if (queue_release(*channel, args->entry_id)) return 0;
+  }
+
   ReleaseSubRefRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.pubsub_id = args->pubsub_id;
