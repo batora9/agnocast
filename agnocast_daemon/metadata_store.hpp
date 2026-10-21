@@ -82,6 +82,11 @@ struct SubscriberChannel
   // shared topic lock.
   std::mutex mtx;
 
+  // The daemon's own copies of push.head and push.ipc_pending. The shared ones
+  // are only published for the subscriber, which could overwrite them.
+  uint64_t push_head = 0;
+  bool ipc_pending = true;
+
   explicit SubscriberChannel(AgnocastSubscriberChannel * mapped) : shm(mapped) {}
   ~SubscriberChannel();
   SubscriberChannel(const SubscriberChannel &) = delete;

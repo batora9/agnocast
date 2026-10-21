@@ -78,16 +78,29 @@ void finalize_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
   out.notify_ns = s.daemon_send - work_end;
 }
 
+// For a call answered from the channel without a round trip: the whole span is
+// local work, reported as req_ns, with no daemon stamps.
+void finalize_local_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
+{
+  out = IpcBreakdown{};
+  out.total_ns = exit_ns - enter_ns;
+  out.req_ns = out.total_ns;
+}
+
 }  // namespace
 
-// Both macros expand inside namespace agnocast, so unqualified lookup reaches
-// finalize_breakdown() in the unnamed namespace above.
+// The macros expand inside namespace agnocast, so unqualified lookup reaches
+// the finalizers in the unnamed namespace above.
 #define AGNOCAST_BENCH_CALL_ENTER() const int64_t agnocast_bench_enter_ns = bench_timing_now_ns()
 #define AGNOCAST_BENCH_CALL_LEAVE(slot) \
   finalize_breakdown(last_##slot##_ipc_breakdown, agnocast_bench_enter_ns, bench_timing_now_ns())
+#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot) \
+  finalize_local_breakdown(                   \
+    last_##slot##_ipc_breakdown, agnocast_bench_enter_ns, bench_timing_now_ns())
 #else
 #define AGNOCAST_BENCH_CALL_ENTER() static_cast<void>(0)
 #define AGNOCAST_BENCH_CALL_LEAVE(slot) static_cast<void>(0)
+#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot) static_cast<void>(0)
 #endif  // AGNOCAST_BENCH_TIMING
 
 // Client-side wait for the daemon reply. Always tries MSG_DONTWAIT once so a
@@ -391,6 +404,40 @@ bool sub_channel_enabled()
   return v == nullptr || std::strcmp(v, "0") != 0;
 }
 
+// Hands over what the daemon pushed at publish time (see AgnocastPushRing).
+// false when the subscriber has to send the request instead, in which case
+// args is untouched. Receives of one subscription are serialized by mmap_mtx,
+// so this is the ring's only consumer.
+bool take_pushed(ClientChannel & channel, union ioctl_receive_msg_args * args)
+{
+  AgnocastPushRing & ring = channel.shm->push;
+  // ipc_pending first: once it reads set, every push made before it is
+  // visible, so an empty ring then means the rest is behind the request.
+  const bool ipc_pending = __atomic_load_n(&ring.ipc_pending, __ATOMIC_ACQUIRE) != 0;
+  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_ACQUIRE);
+  uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_RELAXED);
+  if (head == tail && ipc_pending) return false;
+
+  int64_t entry_ids[MAX_RECEIVE_NUM];
+  uint64_t entry_addrs[MAX_RECEIVE_NUM];
+  uint16_t entry_num = 0;
+  for (; tail != head && entry_num < MAX_RECEIVE_NUM; tail++, entry_num++) {
+    const AgnocastPushSlot & slot = ring.slots[tail % AGNOCAST_PUSH_RING_SLOTS];
+    entry_ids[entry_num] = __atomic_load_n(&slot.entry_id, __ATOMIC_RELAXED);
+    entry_addrs[entry_num] = __atomic_load_n(&slot.entry_addr, __ATOMIC_RELAXED);
+  }
+  __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
+
+  args->ret_entry_num = entry_num;
+  args->ret_call_again = (tail != head) || ipc_pending;
+  args->ret_pub_shm_num = 0;
+  for (uint16_t i = 0; i < entry_num; i++) {
+    args->ret_entry_ids[i] = entry_ids[i];
+    args->ret_entry_addrs[i] = entry_addrs[i];
+  }
+  return true;
+}
+
 }  // namespace
 
 // A subscriber without a channel still works over plain requests, so failing
@@ -550,6 +597,13 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
   // field, otherwise writing ret_entry_ids[]/ret_entry_addrs[] clobbers them.
   const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
+
+  if (const auto channel = find_channel(args->topic_name, args->subscriber_id)) {
+    if (take_pushed(*channel, args)) {
+      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive);
+      return 0;
+    }
+  }
 
   ReceiveMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);

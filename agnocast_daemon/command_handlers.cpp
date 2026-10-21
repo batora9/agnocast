@@ -317,6 +317,64 @@ int receive_msg_core(
   return 0;
 }
 
+// Caller holds channel.mtx.
+void set_ipc_pending(SubscriberChannel & channel, bool pending)
+{
+  channel.ipc_pending = pending;
+  __atomic_store_n(&channel.shm->push.ipc_pending, pending ? 1U : 0U, __ATOMIC_RELEASE);
+}
+
+// Runs the subscriber's receive at publish time and leaves the result in its
+// channel's push ring (see AgnocastPushRing). The caller holds the topic lock
+// exclusively and writes the subscriber's eventfd afterwards.
+void push_receive(TopicWrapper * wrapper, SubscriberInfo & sub, MetadataStore & store)
+{
+  SubscriberChannel * channel = sub.channel.get();
+  if (channel == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(channel->mtx);
+  if (channel->ipc_pending) return;
+  if (sub.need_mmap_update) {
+    // Publisher shm infos travel only in a receive reply.
+    set_ipc_pending(*channel, true);
+    return;
+  }
+
+  AgnocastPushRing & ring = channel->shm->push;
+  const uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_ACQUIRE);
+  const uint64_t unread = channel->push_head - tail;
+  // An implausible tail (the subscriber can write it) lands here as well. The
+  // depth check keeps a stalled subscriber from pinning more pushed entries
+  // than its keep-last depth; the request path then applies keep-last itself.
+  if (
+    unread > AGNOCAST_PUSH_RING_SLOTS || unread >= sub.qos_depth ||
+    AGNOCAST_PUSH_RING_SLOTS - unread < AGNOCAST_PROTO_MAX_RECEIVE_NUM) {
+    set_ipc_pending(*channel, true);
+    return;
+  }
+
+  thread_local ReceiveMsgResponse resp;
+  if (receive_msg_core(wrapper, &sub, sub.id, &resp, store) < 0) {
+    // Nothing was delivered, so give back the references it did take.
+    for (uint16_t i = 0; i < resp.entry_num; i++) {
+      EntryNode * en = find_message_entry(wrapper->topic, resp.entry_ids[i]);
+      if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
+    }
+    set_ipc_pending(*channel, true);
+    return;
+  }
+
+  uint64_t head = channel->push_head;
+  for (uint16_t i = 0; i < resp.entry_num; i++, head++) {
+    AgnocastPushSlot & slot = ring.slots[head % AGNOCAST_PUSH_RING_SLOTS];
+    __atomic_store_n(&slot.entry_id, resp.entry_ids[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&slot.entry_addr, resp.entry_addrs[i], __ATOMIC_RELAXED);
+  }
+  channel->push_head = head;
+  __atomic_store_n(&ring.head, head, __ATOMIC_RELEASE);
+  if (resp.call_again) set_ipc_pending(*channel, true);
+}
+
 void cleanup_unreferenced_entries_from_exited_publishers(
   TopicWrapper * wrapper, int32_t subscriber_id, MetadataStore & store)
 {
@@ -747,11 +805,12 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
 
   uint32_t subscriber_num = 0;
   t_notify_fds.clear();
-  for (const auto & [id, sub] : wrapper->topic.sub_info_map) {
+  for (auto & [id, sub] : wrapper->topic.sub_info_map) {
     (void)id;
     if (sub.is_take_sub) continue;
     if (sub.ignore_local_publications && (sub.pid == pub_info->pid)) continue;
     resp.subscriber_ids[subscriber_num++] = sub.id;
+    push_receive(wrapper, sub, store_);
     // A subscriber registered before the eventfd handshake has no descriptor;
     // it polls instead of being woken, so there is nothing to signal.
     if (sub.notify_eventfd >= 0) t_notify_fds.push_back(sub.notify_eventfd);
@@ -810,18 +869,23 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
 
   if (!sub_info->need_mmap_update) {
     resp.pub_shm_num = 0;
-    send_response(fd, 0, &resp, sizeof(resp));
-    return;
+  } else {
+    ret = set_publisher_shm_info(
+      wrapper, sub_info->pid, allocator_, resp.pub_shm_infos, AGNOCAST_PROTO_MAX_PUBLISHER_NUM,
+      &resp.pub_shm_num, store_);
+    if (ret < 0) {
+      send_response(fd, -ret);
+      return;
+    }
+    sub_info->need_mmap_update = false;
   }
 
-  ret = set_publisher_shm_info(
-    wrapper, sub_info->pid, allocator_, resp.pub_shm_infos, AGNOCAST_PROTO_MAX_PUBLISHER_NUM,
-    &resp.pub_shm_num, store_);
-  if (ret < 0) {
-    send_response(fd, -ret);
-    return;
+  // Pushing resumes once this reply has caught the subscriber up. With
+  // call_again set, the rest still has to come through the request.
+  if (sub_info->channel && !resp.call_again) {
+    std::lock_guard<std::mutex> lock(sub_info->channel->mtx);
+    set_ipc_pending(*sub_info->channel, false);
   }
-  sub_info->need_mmap_update = false;
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
@@ -1548,6 +1612,10 @@ void CommandHandlers::handle_attach_subscriber_channel(
   }
 
   sub_info->channel = std::move(channel);
+  {
+    std::lock_guard<std::mutex> channel_lock(sub_info->channel->mtx);
+    set_ipc_pending(*sub_info->channel, true);
+  }
   send_response(fd, 0);
 }
 

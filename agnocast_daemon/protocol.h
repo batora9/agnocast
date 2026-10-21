@@ -710,12 +710,48 @@ struct AttachSubscriberChannelRequest
 
 #define AGNOCAST_SUB_CHANNEL_MAGIC 0x41474348u /* "AGCH" */
 
+/* Receive results the daemon computed at publish time, so a woken subscriber
+ * reads its messages here instead of sending AGNOCAST_CMD_RECEIVE_MSG.
+ *
+ * Under the topic lock of each publish, the daemon runs the subscriber's
+ * receive (taking the references and advancing latest_received_entry_id),
+ * appends the results, advances head, and then writes the eventfd. The
+ * subscriber consumes slots and advances tail.
+ *
+ * ipc_pending sends the subscriber back to the request. The daemon sets it
+ * whenever a result cannot travel in the ring (the ring or the subscriber's
+ * keep-last depth is full, a new publisher's memory has to be mapped first,
+ * more than AGNOCAST_PROTO_MAX_RECEIVE_NUM entries are due) and pushes nothing
+ * while it is set; only a completed AGNOCAST_CMD_RECEIVE_MSG clears it. Every
+ * slot is therefore older than whatever the request returns, provided the
+ * subscriber loads ipc_pending before head and empties the ring before
+ * sending the request. It starts set, so the first receive (and any
+ * transient-local history) always goes through the request. */
+#define AGNOCAST_PUSH_RING_SLOTS 64
+
+struct AgnocastPushSlot
+{
+  int64_t entry_id;
+  uint64_t entry_addr;
+};
+
+struct AgnocastPushRing
+{
+  uint64_t head;        /* written by the daemon: next slot to fill */
+  uint32_t ipc_pending; /* written by the daemon */
+  uint8_t _pad0[52];
+  uint64_t tail; /* written by the subscriber: next slot to consume */
+  uint8_t _pad1[56];
+  struct AgnocastPushSlot slots[AGNOCAST_PUSH_RING_SLOTS];
+};
+
 /* Cross-process fields are accessed only through __atomic builtins, so the
  * layout stays plain C and both sides agree on it. */
 struct AgnocastSubscriberChannel
 {
   uint32_t magic; /* AGNOCAST_SUB_CHANNEL_MAGIC, written by the subscriber */
-  uint32_t _pad;
+  uint32_t _pad[15];
+  struct AgnocastPushRing push;
 };
 
 /* --------------------------------------------------------------------------
