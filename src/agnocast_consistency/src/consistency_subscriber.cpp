@@ -41,7 +41,8 @@ class ConsistencySubscriber : public agnocast::Node
   {
     std::array<agnocast::publisher_shm_info, MAX_PUBLISHER_NUM> pub_shm_infos{};
     union agnocast::ioctl_receive_msg_args receive_args = {};
-    receive_args.topic_name = {sub_->get_topic_name().c_str(), sub_->get_topic_name().size()};
+    const std::string topic_name = sub_->get_topic_name();
+    receive_args.topic_name = {topic_name.c_str(), topic_name.size()};
     receive_args.subscriber_id = sub_->get_id();
     receive_args.pub_shm_info_addr = reinterpret_cast<uint64_t>(pub_shm_infos.data());
     receive_args.pub_shm_info_size = MAX_PUBLISHER_NUM;
