@@ -68,13 +68,14 @@ int MemoryAllocator::reference_memory(MempoolEntry * entry, pid_t pid)
 void MemoryAllocator::free_memory(pid_t pid)
 {
   std::lock_guard lock(mutex_);
+  // A process is on its own slot and on every slot it mapped from a publisher;
+  // stopping at the first would leave the others occupied forever.
   for (auto & e : entries_) {
     auto & pids = e.mapped_pids;
     auto it = std::find(pids.begin(), pids.end(), pid);
     if (it != pids.end()) {
       pids.erase(it);
       e.mapped_num--;
-      return;
     }
   }
 }

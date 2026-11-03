@@ -44,7 +44,7 @@ public:
   // Equivalent of agnocast_kmod::reference_memory().
   int reference_memory(MempoolEntry * entry, pid_t pid);
 
-  // Release the slot mapping for pid.
+  // Drops pid from every slot it owns or references.
   // Equivalent of agnocast_kmod::free_memory().
   void free_memory(pid_t pid);
 
