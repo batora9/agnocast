@@ -44,6 +44,10 @@ struct Snapshot
   uint32_t subscriber_num = 0;
 };
 
+// Endpoints whose node name contains this are left out of a snapshot (the
+// daemon crash harness's churn node comes and goes).
+std::string g_exclude_node_substr;
+
 std::string json_escape(const std::string & s)
 {
   std::string out;
@@ -78,6 +82,11 @@ std::vector<Endpoint> query_endpoints(const std::string & topic, bool publishers
   std::vector<Endpoint> out;
   for (uint32_t i = 0; i < args.ret_topic_info_ret_num; i++) {
     if (buf[i].is_bridge) {
+      continue;
+    }
+    if (
+      !g_exclude_node_substr.empty() &&
+      std::string(buf[i].node_name).find(g_exclude_node_substr) != std::string::npos) {
       continue;
     }
     Endpoint e;
@@ -157,7 +166,19 @@ void write_endpoints(std::ostream & os, const char * key, const std::vector<Endp
   os << "  ]";
 }
 
-void write_snapshot(std::ostream & os, const Snapshot & snap)
+struct Extras
+{
+  bool has_check = false;
+  bool check_ok = false;
+  uint32_t shm_violations = 0;
+  uint32_t registry_violations = 0;
+  uint64_t rollback_count = 0;
+  uint64_t rollback_record_num = 0;
+  uint32_t entry_num = 0;
+  std::string check_message;
+};
+
+void write_snapshot(std::ostream & os, const Snapshot & snap, const Extras & extras)
 {
   os << "{\n";
   os << "  \"topics\": [";
@@ -173,8 +194,17 @@ void write_snapshot(std::ostream & os, const Snapshot & snap)
   write_endpoints(os, "subscribers", snap.subscribers);
   os << ",\n";
   os << "  \"publisher_num\": " << snap.publisher_num << ",\n";
-  os << "  \"subscriber_num\": " << snap.subscriber_num << "\n";
-  os << "}\n";
+  os << "  \"subscriber_num\": " << snap.subscriber_num;
+  if (extras.has_check) {
+    os << ",\n  \"check\": {\"ok\": " << (extras.check_ok ? "true" : "false")
+       << ", \"shm_violations\": " << extras.shm_violations
+       << ", \"registry_violations\": " << extras.registry_violations
+       << ", \"rollback_count\": " << extras.rollback_count
+       << ", \"rollback_record_num\": " << extras.rollback_record_num
+       << ", \"entry_num\": " << extras.entry_num << ", \"message\": \""
+       << json_escape(extras.check_message) << "\"}";
+  }
+  os << "\n}\n";
 }
 
 }  // namespace
@@ -197,6 +227,46 @@ int main(int argc, char ** argv)
   const int wait_publishers = node->declare_parameter<int>("wait_publishers", 0);
   const int wait_subscribers = node->declare_parameter<int>("wait_subscribers", 0);
   const int wait_timeout_sec = node->declare_parameter<int>("wait_timeout_sec", 15);
+  g_exclude_node_substr = node->declare_parameter<std::string>("exclude_node_substr", "");
+  const bool check_invariants = node->declare_parameter<bool>("check_invariants", false);
+  const std::string recovery_output = node->declare_parameter<std::string>("recovery_output", "");
+  const bool wait_recovery_done = node->declare_parameter<bool>("wait_recovery_done", false);
+
+#ifdef AGNOCAST_USE_DAEMON
+  if (wait_recovery_done || !recovery_output.empty()) {
+    agnocast::DaemonRecoveryStatus st{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_timeout_sec);
+    bool ok = false;
+    while (agnocast::ok()) {
+      ok = agnocast::agnocast_ipc_get_recovery_status(&st) == 0;
+      if (!wait_recovery_done || (ok && !st.in_recovery)) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        ok = false;
+        break;
+      }
+      std::this_thread::sleep_for(5ms);
+    }
+    if (!recovery_output.empty()) {
+      std::ofstream ofs(recovery_output);
+      ofs << "{\"ok\": " << (ok ? "true" : "false")
+          << ", \"recovered\": " << (st.recovered ? "true" : "false")
+          << ", \"in_recovery\": " << (st.in_recovery ? "true" : "false")
+          << ", \"expected_num\": " << st.expected_num << ", \"restored_num\": " << st.restored_num
+          << ", \"dead_num\": " << st.dead_num << ", \"timed_out_num\": " << st.timed_out_num
+          << ", \"adopted_topic_num\": " << st.adopted_topic_num
+          << ", \"orphan_publisher_num\": " << st.orphan_publisher_num
+          << ", \"orphan_subscriber_num\": " << st.orphan_subscriber_num << ", \"recovery_ms\": "
+          << (st.end_ns > 0 ? static_cast<double>(st.end_ns - st.start_ns) / 1e6 : -1.0) << "}\n";
+    }
+    if (wait_recovery_done && !ok) {
+      std::fprintf(stderr, "consistency_observer: recovery did not finish\n");
+      return 1;
+    }
+  }
+#else
+  (void)recovery_output;
+  (void)wait_recovery_done;
+#endif
 
   Snapshot snap;
   if (wait_publishers > 0 || wait_subscribers > 0 || !wait_absent_subscriber.empty()) {
@@ -231,11 +301,32 @@ int main(int argc, char ** argv)
     snap = query_snapshot(topic);
   }
 
+  Extras extras;
+#ifdef AGNOCAST_USE_DAEMON
+  if (check_invariants) {
+    agnocast::DaemonTopicCheck check{};
+    extras.has_check = true;
+    if (agnocast::agnocast_ipc_debug_check_topic(topic, &check) == 0) {
+      extras.check_ok = true;
+      extras.shm_violations = check.shm_violations;
+      extras.registry_violations = check.registry_violations;
+      extras.rollback_count = check.rollback_count;
+      extras.rollback_record_num = check.rollback_record_num;
+      extras.entry_num = check.entry_num;
+      extras.check_message = check.message;
+    } else {
+      extras.check_message = std::string("check failed: ") + std::strerror(errno);
+    }
+  }
+#else
+  (void)check_invariants;
+#endif
+
   if (output.empty()) {
-    write_snapshot(std::cout, snap);
+    write_snapshot(std::cout, snap, extras);
   } else {
     std::ofstream ofs(output);
-    write_snapshot(ofs, snap);
+    write_snapshot(ofs, snap, extras);
   }
 
   node.reset();

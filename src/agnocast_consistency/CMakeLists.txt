@@ -13,7 +13,7 @@ find_package(ament_cmake REQUIRED)
 find_package(agnocastlib REQUIRED)
 find_package(agnocast_sample_interfaces REQUIRED)
 
-foreach(exe IN ITEMS consistency_publisher consistency_subscriber consistency_observer)
+foreach(exe IN ITEMS consistency_publisher consistency_subscriber consistency_observer consistency_churn)
   add_executable(${exe} src/${exe}.cpp)
   ament_target_dependencies(${exe} agnocastlib agnocast_sample_interfaces)
   target_include_directories(${exe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

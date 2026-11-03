@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +38,25 @@ class ConsistencySubscriber : public agnocast::Node
   std::string sync_dir_;
   int qos_depth_;
   int index_{0};
+  // Messages delivered to the callback; written to status_file_ so the daemon
+  // crash harness can tell whether delivery went on while the daemon was down.
+  std::string status_file_;
+  int64_t received_{0};
+  int64_t written_received_{-1};
+
+  void write_status()
+  {
+    if (status_file_.empty() || received_ == written_received_) {
+      return;
+    }
+    const std::string tmp = status_file_ + ".tmp";
+    {
+      std::ofstream ofs(tmp);
+      ofs << received_ << '\n';
+    }
+    std::filesystem::rename(tmp, status_file_);
+    written_received_ = received_;
+  }
 
   void receive_and_release_once()
   {
@@ -82,6 +103,7 @@ class ConsistencySubscriber : public agnocast::Node
     if (executor_ == nullptr || !consistency_sync_exists(sync_dir_, "SNAP")) {
       return;
     }
+    write_status();
     write_sync_marker(sync_dir_, "sub_" + std::to_string(index_) + ".paused");
     executor_->cancel();
   }
@@ -101,6 +123,7 @@ public:
     qos_depth_ = this->declare_parameter<int>("qos_depth", 10);
     sync_dir_ = this->declare_parameter<std::string>("sync_dir", "");
     index_ = this->declare_parameter<int>("subscriber_index", 0);
+    status_file_ = this->declare_parameter<std::string>("status_file", "");
 
     const rclcpp::QoS qos(rclcpp::KeepLast(static_cast<size_t>(qos_depth_)));
 
@@ -114,12 +137,17 @@ public:
           if (last_) {
             (void)last_->id;
           }
+          received_++;
+          if ((received_ & 15) == 0) {
+            write_status();
+          }
           maybe_pause_executor();
         });
       touch_timer_ = this->create_wall_timer(20ms, [this]() {
         if (last_) {
           (void)last_->id;
         }
+        write_status();
         maybe_pause_executor();
       });
     }
