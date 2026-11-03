@@ -132,6 +132,9 @@ if [[ "${REQUIRED_QUEUES}" -gt "${CURRENT_QUEUES_MAX}" ]]; then
   if [[ -n "${SUDO}" ]]; then
     echo "Raising fs.mqueue.queues_max: ${CURRENT_QUEUES_MAX} -> ${REQUIRED_QUEUES}"
     ${SUDO} sysctl -w fs.mqueue.queues_max="${REQUIRED_QUEUES}" >/dev/null
+  elif [[ "${BACKEND}" == "daemon" ]]; then
+    echo "WARNING: fs.mqueue.queues_max is ${CURRENT_QUEUES_MAX}; formula wants ${REQUIRED_QUEUES}."
+    echo "         The daemon backend notifies over eventfd and opens no queues; continuing."
   else
     die "fs.mqueue.queues_max is ${CURRENT_QUEUES_MAX}, this configuration needs ${REQUIRED_QUEUES}.
        Raise it first: sudo bash scripts/prep_repro_env.sh"
