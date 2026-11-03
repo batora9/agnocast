@@ -11,6 +11,8 @@ AGNOCAST_ROOT="${AGNOCAST_ROOT:-${BENCH_ROOT}}"
 
 # Must match AGNOCAST_DAEMON_SOCKET_PATH in agnocast_daemon/protocol.h.
 AGNOCAST_DAEMON_SOCKET_PATH="${AGNOCAST_DAEMON_SOCKET_PATH:-/tmp/agnocast_daemon.sock}"
+# Must match AGNOCAST_DAEMON_STATE_PATH in agnocast_daemon/protocol.h.
+AGNOCAST_DAEMON_STATE_PATH="${AGNOCAST_DAEMON_STATE_PATH:-/tmp/agnocast_daemon.state}"
 AGNOCAST_DAEMON_BIN="${AGNOCAST_DAEMON_BIN:-${AGNOCAST_ROOT}/agnocast_daemon/build/agnocast_daemon}"
 
 # PID of a daemon started by this shell (empty when we did not start one).
@@ -134,6 +136,9 @@ restart_daemon() {
     sleep 0.1
   done
   ${DAEMON_STOP_PREFIX} rm -f "${AGNOCAST_DAEMON_SOCKET_PATH}" 2>/dev/null || true
+  # A fresh start: the new daemon must not wait for the clients of an earlier
+  # one to restore (see AGNOCAST_DAEMON_STATE_PATH in protocol.h).
+  ${DAEMON_STOP_PREFIX} rm -f "${AGNOCAST_DAEMON_STATE_PATH}" 2>/dev/null || true
   start_daemon
 }
 
