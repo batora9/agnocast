@@ -135,6 +135,9 @@ void * map_area(
     return nullptr;
   }
 
+#ifdef AGNOCAST_USE_DAEMON
+  daemon_note_mapped_region(pid, shm_addr, shm_size);
+#endif
   return ret;
 }
 

@@ -38,6 +38,8 @@ public:
   // Thread-safe; may be called from a signal handler.
   void request_shutdown() noexcept;
 
+  CommandHandlers & handlers() noexcept { return handlers_; }
+
 private:
   // Accept one client from server_fd_ and spawn a handler thread.
   void accept_client();

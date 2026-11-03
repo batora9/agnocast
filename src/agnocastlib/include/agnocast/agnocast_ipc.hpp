@@ -5,6 +5,11 @@
 
 #ifndef AGNOCAST_USE_DAEMON
 #include <sys/ioctl.h>
+#else
+#include <sys/types.h>
+
+#include <cstdint>
+#include <string>
 #endif
 
 namespace agnocast
@@ -145,6 +150,43 @@ int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args
 int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args);
 int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args);
 int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args);
+
+// Records that this process mapped pid's memory pool (its own included), so a
+// receive knows which publishers it can read and a restarted daemon can be told.
+void daemon_note_mapped_region(pid_t pid, uint64_t addr, uint64_t size);
+
+// How often this process reconnected to a restarted daemon and restored its
+// registrations.
+uint64_t daemon_reconnect_count();
+
+// Evaluation of the rollback after a daemon crash.
+struct DaemonTopicCheck
+{
+  uint32_t shm_violations;
+  uint32_t registry_violations;
+  uint64_t rollback_count;
+  uint64_t rollback_record_num;
+  uint32_t entry_num;
+  uint32_t sub_num;
+  char message[256];
+};
+int agnocast_ipc_debug_check_topic(const std::string & topic_name, DaemonTopicCheck * out);
+
+struct DaemonRecoveryStatus
+{
+  bool recovered;
+  bool in_recovery;
+  uint32_t expected_num;
+  uint32_t restored_num;
+  uint32_t dead_num;
+  uint32_t timed_out_num;
+  uint32_t adopted_topic_num;
+  uint32_t orphan_publisher_num;
+  uint32_t orphan_subscriber_num;
+  int64_t start_ns;
+  int64_t end_ns;
+};
+int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out);
 
 #endif  // AGNOCAST_USE_DAEMON
 

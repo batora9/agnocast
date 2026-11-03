@@ -96,7 +96,7 @@ struct TopicStruct
 {
   std::unordered_map<int32_t, PublisherInfo> pub_info_map;
   std::unordered_map<int32_t, SubscriberInfo> sub_info_map;
-  int32_t current_pubsub_id = 0;
+  // Ids come from the segment's next_pubsub_id, which survives a daemon restart.
   uint32_t ros2_subscriber_num = 0;
   uint32_t ros2_publisher_num = 0;
 };
@@ -164,6 +164,11 @@ public:
   // Caller must hold global_mutex_ (unique_lock) before calling. nullptr when
   // a new topic's segment could not be created.
   TopicWrapper * find_or_create_topic(const TopicKey & key);
+
+  // Daemon restart: takes over a segment a client still has, given as shm_fd
+  // (always consumed). The same segment again is fine; a different one for a
+  // topic that already has one is -EEXIST. Caller holds global_mutex_ (unique).
+  int adopt_topic(const TopicKey & key, int shm_fd, TopicWrapper ** out);
 
   // Caller must hold global_mutex_ (at least shared_lock) before calling.
   TopicWrapper * find_topic(const TopicKey & key) const;

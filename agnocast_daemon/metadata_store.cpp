@@ -3,7 +3,10 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include <cerrno>
 
 TopicWrapper::~TopicWrapper()
 {
@@ -54,6 +57,66 @@ TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
   auto * ptr = wrapper.get();
   topic_map_.emplace(key, std::move(wrapper));
   return ptr;
+}
+
+int MetadataStore::adopt_topic(const TopicKey & key, int shm_fd, TopicWrapper ** out)
+{
+  struct FdCloser
+  {
+    int fd;
+    ~FdCloser()
+    {
+      if (fd >= 0) close(fd);
+    }
+  } closer{shm_fd};
+  *out = nullptr;
+  if (shm_fd < 0) return -EINVAL;
+
+  struct stat st
+  {
+  };
+  if (fstat(shm_fd, &st) < 0) return -errno;
+  // Only a sealed segment of the right size: the daemon must not be the one
+  // that takes SIGBUS when a client shrinks it.
+  const int seals = fcntl(shm_fd, F_GET_SEALS);
+  if (
+    st.st_size != static_cast<off_t>(sizeof(AgnocastTopicShm)) || seals < 0 ||
+    (seals & (F_SEAL_SHRINK | F_SEAL_GROW)) != (F_SEAL_SHRINK | F_SEAL_GROW)) {
+    return -EINVAL;
+  }
+
+  if (auto it = topic_map_.find(key); it != topic_map_.end()) {
+    struct stat cur
+    {
+    };
+    if (fstat(it->second->shm_fd, &cur) < 0) return -errno;
+    if (cur.st_ino != st.st_ino || cur.st_dev != st.st_dev) return -EEXIST;
+    *out = it->second.get();
+    return 0;
+  }
+
+  void * mapped =
+    mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+  if (mapped == MAP_FAILED) return -errno;
+  auto * shm = static_cast<AgnocastTopicShm *>(mapped);
+  if (__atomic_load_n(&shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_TOPIC_SHM_MAGIC) {
+    munmap(mapped, sizeof(AgnocastTopicShm));
+    return -EINVAL;
+  }
+
+  auto wrapper = std::make_unique<TopicWrapper>();
+  wrapper->key = key.name;
+  wrapper->domain_id = key.domain_id;
+  wrapper->shm_fd = shm_fd;
+  wrapper->shm = shm;
+  closer.fd = -1;
+  // Locking also rolls back whatever the previous daemon was doing to the
+  // segment if it died holding the mutex.
+  topic_shm_lock(shm);
+  topic_shm_unlock(shm);
+  *out = wrapper.get();
+  topic_map_.emplace(key, std::move(wrapper));
+  return 0;
 }
 
 TopicWrapper * MetadataStore::find_topic(const TopicKey & key) const

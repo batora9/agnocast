@@ -13,6 +13,7 @@ add_library(agnocast_daemon_core STATIC
   metadata_store.cpp
   memory_allocator.cpp
   command_handlers.cpp
+  fault_injection.cpp
 )
 target_compile_definitions(agnocast_daemon_core PUBLIC AGNOCAST_VERSION="${AGNOCAST_VERSION_RAW}")
 target_include_directories(agnocast_daemon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -32,6 +33,13 @@ target_link_libraries(agnocast_daemon PRIVATE agnocast_daemon_core pthread)
 option(AGNOCAST_BENCH_TIMING "Append daemon-side timing stamps to responses" OFF)
 if(AGNOCAST_BENCH_TIMING)
   target_compile_definitions(agnocast_daemon_core PUBLIC AGNOCAST_BENCH_TIMING)
+endif()
+
+# Crash points used by scripts/consistency/run_daemon_crash.bash. They do
+# nothing unless AGNOCAST_DAEMON_FAULT_POINT is set in the daemon's environment.
+option(AGNOCAST_FAULT_INJECTION "Compile the daemon's crash points" ON)
+if(AGNOCAST_FAULT_INJECTION)
+  target_compile_definitions(agnocast_daemon_core PUBLIC AGNOCAST_FAULT_INJECTION)
 endif()
 
 option(AGNOCAST_BUILD_TESTS "Build agnocast_daemon unit tests" OFF)

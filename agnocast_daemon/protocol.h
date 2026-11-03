@@ -108,6 +108,17 @@ typedef enum {
   /* Daemon-only commands. They have no ioctl counterpart, so they are numbered
    * well clear of the range agnocast.h uses. */
   AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS = 65,
+  AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS = 66,
+  /* Re-registration after a daemon restart (see "Daemon restart" below). */
+  AGNOCAST_CMD_RESTORE_PROCESS = 67,
+  AGNOCAST_CMD_RESTORE_MAPPINGS = 68,
+  AGNOCAST_CMD_RESTORE_TOPIC = 69,
+  AGNOCAST_CMD_RESTORE_PUBLISHER = 70,
+  AGNOCAST_CMD_RESTORE_SUBSCRIBER = 71,
+  AGNOCAST_CMD_RESTORE_DONE = 72,
+  /* Evaluation only. */
+  AGNOCAST_CMD_DEBUG_CHECK_TOPIC = 73,
+  AGNOCAST_CMD_GET_RECOVERY_STATUS = 74,
 } CommandType;
 
 /* --------------------------------------------------------------------------
@@ -715,6 +726,138 @@ struct GetSubscriberEventfdsResponse
   uint32_t total;
   uint32_t num;
   int32_t subscriber_ids[AGNOCAST_SUBSCRIBER_EVENTFD_BATCH];
+};
+
+/* ---- AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS (66) ---- */
+/* Where the memory of every live publisher on the topic (other than the
+ * caller's own) is. Unlike RECEIVE_MSG it changes no message state, and it
+ * lists every publisher each time rather than only the ones the daemon thinks
+ * are new: the client skips what it has mapped already, so a reply lost to a
+ * daemon crash is simply asked for again. */
+struct GetPublisherShmInfosRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  int32_t subscriber_id; /* topic_local_id_t */
+};
+
+struct GetPublisherShmInfosResponse
+{
+  uint32_t pub_shm_num;
+  uint32_t _pad;
+  struct AgnocastPublisherShmInfo pub_shm_infos[AGNOCAST_PROTO_MAX_PUBLISHER_NUM];
+};
+
+/* --------------------------------------------------------------------------
+ * Daemon restart
+ *
+ * The metadata the daemon keeps on its heap is lost when it dies; the message
+ * state is not, because it lives in the topic segments that the clients keep
+ * mapped. Every client therefore remembers what it registered, and when its
+ * connection breaks it reconnects to the restarted daemon and replays:
+ *
+ *   RESTORE_PROCESS      its memory pool (same address as before)
+ *   RESTORE_MAPPINGS     the other processes' pools it has mapped
+ *   RESTORE_TOPIC        each topic segment, as an SCM_RIGHTS descriptor
+ *   RESTORE_PUBLISHER    each publisher, with the id it was given
+ *   RESTORE_SUBSCRIBER   each subscriber, with its id and eventfd
+ *   (ADD_BRIDGE, SET_ROS2_*_NUM as before)
+ *   RESTORE_DONE
+ *
+ * The restarted daemon reads the pids of its predecessor's clients from
+ * AGNOCAST_DAEMON_STATE_PATH and holds back new registrations until each of
+ * them has restored or died. Then every id in a segment that no client claimed
+ * is removed: these are registrations whose reply never reached the client, or
+ * of processes that died while the daemon was down. An interrupted change to a
+ * segment itself is rolled back by its undo log (topic_shm.hpp).
+ * -------------------------------------------------------------------------- */
+#define AGNOCAST_DAEMON_STATE_PATH "/tmp/agnocast_daemon.state"
+
+/* ---- AGNOCAST_CMD_RESTORE_PROCESS (67) ---- */
+struct RestoreProcessRequest
+{
+  uint64_t shm_addr;
+  uint32_t domain_id;
+  bool is_performance_bridge_manager;
+  uint8_t _pad[3];
+};
+/* Response: no payload. EEXIST if the process is already registered. */
+
+/* ---- AGNOCAST_CMD_RESTORE_MAPPINGS (68) ---- */
+#define AGNOCAST_RESTORE_MAPPING_BATCH 32
+
+struct RestoreMappingsRequest
+{
+  uint32_t num;
+  uint32_t _pad;
+  uint64_t shm_addrs[AGNOCAST_RESTORE_MAPPING_BATCH];
+};
+/* Response: no payload */
+
+/* ---- AGNOCAST_CMD_RESTORE_TOPIC (69) ---- */
+/* The topic segment travels as one SCM_RIGHTS descriptor. EEXIST when the
+ * daemon already has a different segment for the topic. */
+struct RestoreTopicRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+};
+/* Response: no payload */
+
+/* ---- AGNOCAST_CMD_RESTORE_PUBLISHER (70) ---- */
+struct RestorePublisherRequest
+{
+  struct AddPublisherRequest reg;
+  int32_t publisher_id; /* topic_local_id_t */
+};
+/* Response: no payload */
+
+/* ---- AGNOCAST_CMD_RESTORE_SUBSCRIBER (71) ---- */
+/* The subscriber's eventfd travels as one SCM_RIGHTS descriptor. */
+struct RestoreSubscriberRequest
+{
+  struct AddSubscriberRequest reg;
+  int32_t subscriber_id; /* topic_local_id_t */
+};
+/* Response: no payload */
+
+/* ---- AGNOCAST_CMD_RESTORE_DONE (72) ---- */
+/* Request: no payload. Response: no payload */
+
+/* ---- AGNOCAST_CMD_DEBUG_CHECK_TOPIC (73) ---- */
+/* Checks the topic segment's invariants and that it agrees with the daemon's
+ * registrations. */
+struct DebugCheckTopicRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+};
+
+struct DebugCheckTopicResponse
+{
+  uint32_t shm_violations;
+  uint32_t registry_violations;
+  uint64_t rollback_count;
+  uint64_t rollback_record_num;
+  uint32_t entry_num;
+  uint32_t sub_num;
+  char message[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+};
+
+/* ---- AGNOCAST_CMD_GET_RECOVERY_STATUS (74) ---- */
+/* Request: no payload. Times are CLOCK_MONOTONIC nanoseconds; end_ns is 0
+ * while the recovery is running. */
+struct GetRecoveryStatusResponse
+{
+  bool recovered;   /* this daemon took over a predecessor's clients */
+  bool in_recovery; /* still waiting for some of them */
+  uint8_t _pad[2];
+  uint32_t expected_num;
+  uint32_t restored_num;
+  uint32_t dead_num;
+  uint32_t timed_out_num;
+  uint32_t adopted_topic_num;
+  uint32_t orphan_publisher_num;
+  uint32_t orphan_subscriber_num;
+  int64_t start_ns;
+  int64_t end_ns;
 };
 
 /* --------------------------------------------------------------------------

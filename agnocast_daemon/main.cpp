@@ -4,10 +4,18 @@
 #include "protocol.h"
 #include "socket_server.hpp"
 
+#include <signal.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 // Global pointer used by the signal handler to request a graceful shutdown.
 // Written once (before run()) and read from signal context — safe in practice
@@ -19,6 +27,39 @@ static void signal_handler(int /*signo*/) noexcept
   if (g_server) {
     g_server->request_shutdown();
   }
+}
+
+static std::string state_path()
+{
+  const char * v = std::getenv("AGNOCAST_DAEMON_STATE_PATH");
+  return (v != nullptr && v[0] != '\0') ? v : AGNOCAST_DAEMON_STATE_PATH;
+}
+
+static int64_t recovery_timeout_ms()
+{
+  const char * v = std::getenv("AGNOCAST_DAEMON_RECOVERY_TIMEOUT_MS");
+  if (v == nullptr || v[0] == '\0') return 5000;
+  const long long n = std::strtoll(v, nullptr, 10);
+  return n > 0 ? n : 5000;
+}
+
+// The clients a previous daemon left behind that are still running. They will
+// reconnect and restore what they registered.
+static std::vector<pid_t> previous_clients(const std::string & path)
+{
+  std::vector<pid_t> pids;
+  std::ifstream ifs(path);
+  if (!ifs) return pids;
+  std::string line;
+  while (std::getline(ifs, line)) {
+    if (line.empty() || line.rfind("agnocast_daemon", 0) == 0) continue;
+    const long pid = std::strtol(line.c_str(), nullptr, 10);
+    if (pid <= 0 || pid == getpid()) continue;
+    if (kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM) {
+      pids.push_back(static_cast<pid_t>(pid));
+    }
+  }
+  return pids;
 }
 
 int main()
@@ -42,6 +83,13 @@ int main()
     SocketServer server(store, allocator);
 
     g_server = &server;
+
+    const std::string path = state_path();
+    const std::vector<pid_t> clients = previous_clients(path);
+    server.handlers().set_state_path(path);
+    if (!clients.empty()) {
+      server.handlers().start_recovery(clients, recovery_timeout_ms());
+    }
 
     fprintf(stderr, "agnocast_daemon: started (socket: %s)\n", AGNOCAST_DAEMON_SOCKET_PATH);
 

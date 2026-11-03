@@ -50,7 +50,7 @@ static constexpr int kMaxEpollEvents = 64;
 static constexpr int kEpollTimeoutMs = 1000;
 
 // Maximum size of a single request message (RequestHeader + largest payload).
-// AddSubscriberRequest (524 bytes) is the largest payload; 600 adds margin.
+// RestoreSubscriberRequest (528 bytes) is the largest payload; 600 adds margin.
 static constexpr size_t kMaxRequestSize = sizeof(RequestHeader) + 600;
 
 // ============================================================
@@ -185,8 +185,8 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
 {
   std::vector<uint8_t> buf(kMaxRequestSize);
 
-  // Ancillary space for the single descriptor ADD_SUBSCRIBER or
-  // ATTACH_SUBSCRIBER_CHANNEL attaches.
+  // Ancillary space for the single descriptor ADD_SUBSCRIBER,
+  // RESTORE_SUBSCRIBER or RESTORE_TOPIC attaches.
   union {
     cmsghdr align;
     char bytes[CMSG_SPACE(sizeof(int))];

@@ -44,6 +44,17 @@ public:
   // Equivalent of agnocast_kmod::reference_memory().
   int reference_memory(MempoolEntry * entry, pid_t pid);
 
+  // The slot that starts at addr, or nullptr.
+  MempoolEntry * find_memory(uint64_t addr);
+
+  // Daemon restart: registers pid on the slot at addr, which the process was
+  // given by the previous daemon and still has mapped. Returns nullptr when addr
+  // is not the start of a slot.
+  MempoolEntry * claim_memory(pid_t pid, uint64_t addr);
+
+  // Daemon restart: reference_memory() for a slot known only by its address.
+  int reference_memory_at(uint64_t addr, pid_t pid);
+
   // Drops pid from every slot it owns or references.
   // Equivalent of agnocast_kmod::free_memory().
   void free_memory(pid_t pid);
@@ -52,6 +63,8 @@ public:
   int mempool_num() const noexcept { return static_cast<int>(entries_.size()); }
 
 private:
+  MempoolEntry * find_memory_locked(uint64_t addr);
+
   std::mutex mutex_;
   std::vector<MempoolEntry> entries_;
   uint64_t mempool_size_bytes_ = 0;

@@ -115,6 +115,14 @@ public:
 
   void disconnect(pid_t pid) { handlers_.on_client_disconnect(pid); }
 
+  CommandHandlers & handlers() { return handlers_; }
+
+  int topic_shm_fd(const char * topic) const
+  {
+    auto it = store_.topic_map_.find(topic_key(topic));
+    return (it != store_.topic_map_.end()) ? it->second->shm_fd : -1;
+  }
+
   static void set_topic(char (&dst)[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE], const char * src)
   {
     std::strncpy(dst, src, sizeof(dst) - 1);

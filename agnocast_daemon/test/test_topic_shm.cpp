@@ -42,7 +42,7 @@ int local_receive(AgnocastTopicShm * shm, int32_t sub_id, int64_t * ids, uint16_
   uint64_t addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   bool call_again = false;
   TopicShmLock lock(shm);
-  return topic_shm_receive(shm, sub_id, false, ids, addrs, num, &call_again);
+  return topic_shm_receive(shm, sub_id, TopicShmAlwaysMapped{}, ids, addrs, num, &call_again);
 }
 
 int local_release(AgnocastTopicShm * shm, int32_t sub_id, int64_t entry_id)
@@ -132,7 +132,7 @@ TEST(TopicShm, TransientLocalTakeSeesEarlierLocalPublish)
   EXPECT_EQ(resp.pub_shm_num, 1U);
 }
 
-TEST(TopicShm, LocalReceiveDefersToDaemonUntilPublisherMapped)
+TEST(TopicShm, LocalReceiveWaitsForThePublisherMemory)
 {
   DaemonHarness h;
   uint64_t pub_addr = 0;
@@ -141,26 +141,51 @@ TEST(TopicShm, LocalReceiveDefersToDaemonUntilPublisherMapped)
   int32_t sub_id = -1;
   ASSERT_EQ(h.add_subscriber(kTopic, kNode, kSubPid, 10, &sub_id), 0);
   AgnocastTopicShm * shm = h.topic_shm(kTopic);
+  {
+    TopicShmLock lock(shm);
+    EXPECT_TRUE(topic_shm_consume_mmap_update(shm, sub_id));
+    EXPECT_FALSE(topic_shm_consume_mmap_update(shm, sub_id));
+  }
 
-  int64_t ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
-  uint16_t num = 0;
-  EXPECT_EQ(local_receive(shm, sub_id, ids, &num), -EAGAIN);
-
-  ReceiveMsgResponse resp{};
-  ASSERT_EQ(h.receive(kTopic, sub_id, &resp), 0);
-  EXPECT_EQ(local_receive(shm, sub_id, ids, &num), 0);
-
-  // A new publisher sends the subscriber back to the daemon.
+  // A new publisher asks the subscriber to look up its memory.
   int32_t pub_id = -1;
   ASSERT_EQ(h.add_publisher(kTopic, kNode, kPubPid, 10, &pub_id), 0);
+  {
+    TopicShmLock lock(shm);
+    EXPECT_TRUE(topic_shm_consume_mmap_update(shm, sub_id));
+  }
+  GetPublisherShmInfosRequest req{};
+  DaemonHarness::set_topic(req.topic_name, kTopic);
+  req.subscriber_id = sub_id;
+  GetPublisherShmInfosResponse infos{};
+  ASSERT_EQ(
+    h.call(AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS, kSubPid, &req, sizeof(req), &infos, sizeof(infos)),
+    0);
+  ASSERT_EQ(infos.pub_shm_num, 1U);
+  EXPECT_EQ(infos.pub_shm_infos[0].pid, kPubPid);
+  EXPECT_EQ(infos.pub_shm_infos[0].shm_addr, pub_addr);
+  // Asked again (a lost reply), the daemon lists it again.
+  ASSERT_EQ(
+    h.call(AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS, kSubPid, &req, sizeof(req), &infos, sizeof(infos)),
+    0);
+  EXPECT_EQ(infos.pub_shm_num, 1U);
+
   int64_t entry_id = -1;
   ASSERT_EQ(local_publish(shm, pub_id, pub_addr, &entry_id), 0);
-  EXPECT_EQ(local_receive(shm, sub_id, ids, &num), -EAGAIN);
-  ASSERT_EQ(h.receive(kTopic, sub_id, &resp), 0);
-  ASSERT_EQ(resp.entry_num, 1);
-  EXPECT_EQ(resp.pub_shm_num, 1U);
 
-  ASSERT_EQ(local_publish(shm, pub_id, pub_addr + 64, &entry_id), 0);
+  // Not mapped yet: the entry is left where it is.
+  int64_t ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
+  uint64_t addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
+  uint16_t num = 0;
+  bool call_again = false;
+  {
+    TopicShmLock lock(shm);
+    ASSERT_EQ(
+      topic_shm_receive(
+        shm, sub_id, [](int32_t) { return false; }, ids, addrs, &num, &call_again),
+      0);
+  }
+  EXPECT_EQ(num, 0);
   ASSERT_EQ(local_receive(shm, sub_id, ids, &num), 0);
   ASSERT_EQ(num, 1);
   EXPECT_EQ(ids[0], entry_id);

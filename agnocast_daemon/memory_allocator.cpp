@@ -65,6 +65,40 @@ int MemoryAllocator::reference_memory(MempoolEntry * entry, pid_t pid)
   return 0;
 }
 
+MemoryAllocator::MempoolEntry * MemoryAllocator::find_memory_locked(uint64_t addr)
+{
+  if (entries_.empty() || addr < entries_.front().addr) return nullptr;
+  const uint64_t index = (addr - entries_.front().addr) / mempool_size_bytes_;
+  if (index >= entries_.size() || entries_[index].addr != addr) return nullptr;
+  return &entries_[index];
+}
+
+MemoryAllocator::MempoolEntry * MemoryAllocator::find_memory(uint64_t addr)
+{
+  std::lock_guard lock(mutex_);
+  return find_memory_locked(addr);
+}
+
+MemoryAllocator::MempoolEntry * MemoryAllocator::claim_memory(pid_t pid, uint64_t addr)
+{
+  std::lock_guard lock(mutex_);
+  MempoolEntry * e = find_memory_locked(addr);
+  if (e == nullptr) return nullptr;
+  if (std::find(e->mapped_pids.begin(), e->mapped_pids.end(), pid) == e->mapped_pids.end()) {
+    // The owner goes first, as assign_memory() leaves it.
+    e->mapped_pids.insert(e->mapped_pids.begin(), pid);
+    e->mapped_num++;
+  }
+  return e;
+}
+
+int MemoryAllocator::reference_memory_at(uint64_t addr, pid_t pid)
+{
+  MempoolEntry * e = find_memory(addr);
+  if (e == nullptr) return -EINVAL;
+  return reference_memory(e, pid);
+}
+
 void MemoryAllocator::free_memory(pid_t pid)
 {
   std::lock_guard lock(mutex_);

@@ -8,6 +8,7 @@
 #include "topic_shm.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -18,6 +19,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,7 +28,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace agnocast
 {
@@ -230,8 +236,14 @@ int recv_response(msghdr * recv_msg)
 {
   const RecvSpinConfig & cfg = recv_spin_config();
 
+  // A zero-length read is the daemon closing the connection: every reply
+  // carries at least its header.
   ssize_t n = recvmsg_dontwait(agnocast_fd, recv_msg);
-  if (n >= 0) {
+  if (n == 0) {
+    errno = ECONNRESET;
+    return -1;
+  }
+  if (n > 0) {
     if (cfg.mode == RecvSpinMode::Adaptive) {
       adaptive_on_hit(t_spin_budget_ns);
     }
@@ -254,7 +266,11 @@ int recv_response(msghdr * recv_msg)
     while (monotonic_now_ns() - start < budget) {
       cpu_relax();
       n = recvmsg_dontwait(agnocast_fd, recv_msg);
-      if (n >= 0) {
+      if (n == 0) {
+        errno = ECONNRESET;
+        return -1;
+      }
+      if (n > 0) {
         if (cfg.mode == RecvSpinMode::Adaptive) {
           adaptive_on_hit(t_spin_budget_ns);
         }
@@ -269,6 +285,10 @@ int recv_response(msghdr * recv_msg)
   const int64_t block_begin = monotonic_now_ns();
   n = recvmsg(agnocast_fd, recv_msg, MSG_CMSG_CLOEXEC);
   if (n < 0) {
+    return -1;
+  }
+  if (n == 0) {
+    errno = ECONNRESET;
     return -1;
   }
   if (cfg.mode == RecvSpinMode::Adaptive) {
@@ -295,13 +315,26 @@ int recv_response(msghdr * recv_msg)
 // Descriptors the daemon attaches to the reply are stored in recv_fds (up to
 // recv_fd_cap, the rest closed) and counted in *recv_fd_num; the caller owns
 // them, even when the call itself reports an error.
-static int daemon_call(
-  uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
-  uint32_t resp_size, int send_fd = -1, int * recv_fds = nullptr, uint32_t recv_fd_cap = 0,
-  uint32_t * recv_fd_num = nullptr)
+//
+// Caller holds socket_mtx. *transport_failed tells a broken connection (the
+// daemon is gone) apart from an error the daemon replied with.
+namespace
 {
+
+bool is_transport_error(int err)
+{
+  return err == EPIPE || err == ECONNRESET || err == ENOTCONN || err == ECONNREFUSED;
+}
+
+}  // namespace
+
+static int daemon_call_locked(
+  uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
+  uint32_t resp_size, int send_fd, int * recv_fds, uint32_t recv_fd_cap, uint32_t * recv_fd_num,
+  bool * transport_failed)
+{
+  *transport_failed = false;
   if (recv_fd_num != nullptr) *recv_fd_num = 0;
-  std::lock_guard<std::mutex> lock(socket_mtx);
 
   // --- send request ---
   RequestHeader req_hdr{cmd, req_size};
@@ -330,6 +363,7 @@ static int daemon_call(
   g_stamps.send_begin = bench_timing_now_ns();
 #endif
   if (sendmsg(agnocast_fd, &send_msg, MSG_NOSIGNAL) < 0) {
+    *transport_failed = is_transport_error(errno);
     return -1;
   }
 #ifdef AGNOCAST_BENCH_TIMING
@@ -362,6 +396,7 @@ static int daemon_call(
     recv_msg.msg_controllen = sizeof(recv_cmsg_buf.bytes);
   }
   if (recv_response(&recv_msg) < 0) {
+    *transport_failed = is_transport_error(errno);
     return -1;
   }
   if (recv_fds != nullptr) {
@@ -397,6 +432,215 @@ static int daemon_call(
   return 0;
 }
 
+// ============================================================
+// Surviving a daemon crash
+// ============================================================
+//
+// The message data plane runs on the topic segments, which this process keeps
+// mapped, so publish, receive and release go on while the daemon is down. What
+// needs the daemon (registration, queries, looking up a new publisher's
+// memory) waits for it to come back: when the connection breaks, one thread
+// reconnects, replays what this process registered (restore_locked), and
+// repeats the call that failed. A call the daemon committed but could not
+// answer is not applied twice: the restarted daemon removes what no client
+// reclaimed, so the repeated call starts from a state without it.
+//
+//   AGNOCAST_DAEMON_RECONNECT=0               fail as before instead
+//   AGNOCAST_DAEMON_RECONNECT_TIMEOUT_MS=<n>  how long a call waits (default 60000)
+
+namespace
+{
+
+struct CallOptions
+{
+  // Wait for the daemon to come back and repeat the call when the connection
+  // breaks. Off for callers that can do without an answer for now.
+  bool wait_for_daemon = true;
+  // Runs under socket_mtx right after a successful reply, so that a restore
+  // cannot slip in between the daemon committing a registration and this
+  // process recording it.
+  void (*on_success)(void *) = nullptr;
+  void * ctx = nullptr;
+};
+
+std::atomic<uint64_t> g_conn_generation{0};
+std::atomic<uint64_t> g_reconnect_count{0};
+std::mutex g_recover_mtx;
+std::condition_variable g_recover_cv;
+bool g_recovering = false;
+
+bool reconnect_enabled()
+{
+  static const bool enabled = [] {
+    const char * v = std::getenv("AGNOCAST_DAEMON_RECONNECT");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
+int64_t reconnect_timeout_ms()
+{
+  static const int64_t ms = [] {
+    const char * v = std::getenv("AGNOCAST_DAEMON_RECONNECT_TIMEOUT_MS");
+    if (v == nullptr || v[0] == '\0') return int64_t{60000};
+    const long long n = std::strtoll(v, nullptr, 10);
+    return n > 0 ? static_cast<int64_t>(n) : int64_t{60000};
+  }();
+  return ms;
+}
+
+int open_daemon_socket()
+{
+  const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+  if (fd < 0) return -1;
+  const int buf = AGNOCAST_DAEMON_SOCKET_BUF_SIZE;
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, AGNOCAST_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+  if (connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+bool restore_locked();
+
+// Connects to the daemon until deadline_ns (< 0: forever) and replays this
+// process's registrations over the new connection.
+bool reconnect_and_restore(int64_t deadline_ns)
+{
+  const int64_t begin = monotonic_now_ns();
+  RCLCPP_WARN(logger, "lost the connection to agnocast_daemon; reconnecting");
+  while (true) {
+    const int fd = open_daemon_socket();
+    if (fd >= 0) {
+      std::lock_guard<std::mutex> lock(socket_mtx);
+      if (agnocast_fd < 0) {
+        close(fd);
+        return false;
+      }
+      // Keep the descriptor number: others hold agnocast_fd by value.
+      if (fd != agnocast_fd && dup3(fd, agnocast_fd, O_CLOEXEC) < 0) {
+        close(fd);
+        return false;
+      }
+      if (fd != agnocast_fd) close(fd);
+      if (restore_locked()) {
+        g_reconnect_count.fetch_add(1);
+        RCLCPP_INFO(
+          logger, "reconnected to agnocast_daemon and restored registrations in %.3f ms",
+          static_cast<double>(monotonic_now_ns() - begin) / 1e6);
+        return true;
+      }
+    }
+    if (deadline_ns >= 0 && monotonic_now_ns() >= deadline_ns) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
+// Called by a thread whose call broke on connection generation failed_gen.
+// True once a newer connection is in place. With wait false it only reports
+// whether one already is.
+bool recover_connection(uint64_t failed_gen, bool wait, int64_t timeout_ms)
+{
+  std::unique_lock<std::mutex> lk(g_recover_mtx);
+  if (g_conn_generation.load() != failed_gen) return true;
+  if (!wait) return false;
+  const int64_t deadline = timeout_ms < 0 ? -1 : monotonic_now_ns() + timeout_ms * 1000000LL;
+  if (g_recovering) {
+    auto done = [&] { return g_conn_generation.load() != failed_gen || !g_recovering; };
+    if (timeout_ms < 0) {
+      g_recover_cv.wait(lk, done);
+    } else {
+      g_recover_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), done);
+    }
+    return g_conn_generation.load() != failed_gen;
+  }
+  g_recovering = true;
+  lk.unlock();
+  const bool ok = reconnect_and_restore(deadline);
+  lk.lock();
+  g_recovering = false;
+  if (ok) g_conn_generation.fetch_add(1);
+  g_recover_cv.notify_all();
+  return ok;
+}
+
+// Notices the daemon going away even while nothing here needs it, so the
+// restarted daemon gets this process's registrations back promptly.
+void watcher_main()
+{
+  while (true) {
+    const uint64_t gen = g_conn_generation.load();
+    const int fd = agnocast_fd;
+    if (fd < 0) return;
+    pollfd p{fd, POLLRDHUP, 0};
+    const int r = poll(&p, 1, -1);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return;
+    }
+    if (p.revents & POLLNVAL) return;  // closed: the process is shutting down
+    if ((p.revents & (POLLHUP | POLLRDHUP | POLLERR)) && g_conn_generation.load() == gen) {
+      recover_connection(gen, true, -1);
+    }
+  }
+}
+
+// Started with the first publisher or subscriber, when the heap is usable.
+void ensure_watcher()
+{
+  static std::atomic<pid_t> started_in{0};
+  if (!reconnect_enabled()) return;
+  const pid_t self = getpid();
+  pid_t expected = started_in.load();
+  if (expected == self) return;
+  if (!started_in.compare_exchange_strong(expected, self)) return;
+  std::thread(watcher_main).detach();
+}
+
+}  // namespace
+
+// Returns 0 on success, sets errno on failure. See daemon_call_locked.
+static int daemon_call(
+  uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
+  uint32_t resp_size, int send_fd = -1, int * recv_fds = nullptr, uint32_t recv_fd_cap = 0,
+  uint32_t * recv_fd_num = nullptr, const CallOptions * opts = nullptr)
+{
+  static const CallOptions kDefault{};
+  const CallOptions & o = (opts != nullptr) ? *opts : kDefault;
+  while (true) {
+    const uint64_t gen = g_conn_generation.load();
+    bool transport_failed = false;
+    int r = 0;
+    int saved_errno = 0;
+    {
+      std::lock_guard<std::mutex> lock(socket_mtx);
+      r = daemon_call_locked(
+        cmd, req_payload, req_size, resp_payload, resp_size, send_fd, recv_fds, recv_fd_cap,
+        recv_fd_num, &transport_failed);
+      saved_errno = errno;
+      if (r == 0 && o.on_success != nullptr) o.on_success(o.ctx);
+    }
+    if (r == 0 || !transport_failed || !reconnect_enabled()) {
+      errno = saved_errno;
+      return r;
+    }
+    if (!recover_connection(gen, o.wait_for_daemon, reconnect_timeout_ms())) {
+      errno = saved_errno;
+      return -1;
+    }
+  }
+}
+
+uint64_t daemon_reconnect_count()
+{
+  return g_reconnect_count.load();
+}
+
 // Helper to copy a name_info string into a fixed-size char array (null-terminated).
 static void copy_name(char * dst, size_t dst_size, const struct name_info & src)
 {
@@ -421,6 +665,8 @@ namespace
 struct TopicSegment
 {
   AgnocastTopicShm * shm = nullptr;
+  // Kept open so the segment can be handed to a restarted daemon.
+  int fd = -1;
   std::string topic_name;
 
   // A publisher's copies of the subscribers' eventfds, valid for
@@ -437,6 +683,7 @@ struct TopicSegment
       close(efd);
     }
     if (shm != nullptr) munmap(shm, sizeof(*shm));
+    if (fd >= 0) close(fd);
   }
   TopicSegment(const TopicSegment &) = delete;
   TopicSegment & operator=(const TopicSegment &) = delete;
@@ -445,6 +692,8 @@ struct TopicSegment
 // Keyed by (topic, publisher or subscriber id). Held by shared_ptr so a thread
 // still using a segment keeps it mapped after the handle is removed; the
 // by-inode map lets every handle on one topic share one mapping.
+//
+// Lock ordering: socket_mtx → segments_mtx → registry_mtx.
 std::mutex segments_mtx;
 std::unordered_map<std::string, std::shared_ptr<TopicSegment>> segments;
 std::unordered_map<ino_t, std::weak_ptr<TopicSegment>> segments_by_inode;
@@ -466,7 +715,8 @@ std::shared_ptr<TopicSegment> find_segment(const struct name_info & topic_name, 
 }
 
 // AGNOCAST_TOPIC_SHM=0 keeps every call on the daemon request path, so one
-// build can be measured both ways.
+// build can be measured both ways. Such a client cannot be restored after a
+// daemon crash: restoring hands the segments back.
 bool topic_shm_enabled()
 {
   static const bool enabled = [] {
@@ -484,7 +734,10 @@ void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id
   struct FdCloser
   {
     int fd;
-    ~FdCloser() { close(fd); }
+    ~FdCloser()
+    {
+      if (fd >= 0) close(fd);
+    }
   } closer{shm_fd};
   if (!topic_shm_enabled()) return;
 
@@ -515,6 +768,8 @@ void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id
       RCLCPP_WARN(logger, "topic segment is not initialized; using plain requests");
       return;
     }
+    segment->fd = shm_fd;
+    closer.fd = -1;
     for (auto it = segments_by_inode.begin(); it != segments_by_inode.end();) {
       it = it->second.expired() ? segments_by_inode.erase(it) : std::next(it);
     }
@@ -529,12 +784,263 @@ void detach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id
   segments.erase(segment_key(topic_name, pubsub_id));
 }
 
-// Caller holds segment.notify_mtx.
+// ------------------------------------------------------------
+// Memory pools this process has mapped
+// ------------------------------------------------------------
+
+// Append-only: a pool is never unmapped. Readers scan [0, g_region_num) without
+// a lock; the writer publishes a slot by bumping the count.
+struct MappedRegion
+{
+  pid_t pid;
+  uint64_t addr;
+  uint64_t size;
+};
+constexpr uint32_t kMaxMappedRegions = 4096 + 1;
+MappedRegion g_regions[kMaxMappedRegions];
+std::atomic<uint32_t> g_region_num{0};
+std::mutex g_region_write_mtx;
+
+bool region_mapped(pid_t pid)
+{
+  const uint32_t n = g_region_num.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; i++) {
+    if (g_regions[i].pid == pid) return true;
+  }
+  return false;
+}
+
+// Which publishers a receive may hand out: those whose memory is mapped, plus
+// those whose memory the caller maps right after this call returns.
+struct ReadablePublishers
+{
+  const publisher_shm_info * fresh = nullptr;
+  uint32_t fresh_num = 0;
+
+  bool operator()(int32_t pid) const
+  {
+    for (uint32_t i = 0; i < fresh_num; i++) {
+      if (fresh[i].pid == pid) return true;
+    }
+    return region_mapped(pid);
+  }
+};
+
+// ------------------------------------------------------------
+// What this process registered, for a restarted daemon
+// ------------------------------------------------------------
+
+struct PublisherRecord
+{
+  std::string topic_name;
+  int32_t id;
+  AddPublisherRequest req;
+};
+
+struct SubscriberRecord
+{
+  std::string topic_name;
+  int32_t id;
+  AddSubscriberRequest req;
+  int eventfd;
+};
+
+struct BridgeRecord
+{
+  bool has_r2a = false;
+  bool has_a2r = false;
+};
+
+struct ClientRegistry
+{
+  pid_t owner = 0;
+  std::vector<PublisherRecord> publishers;
+  std::vector<SubscriberRecord> subscribers;
+  std::unordered_map<std::string, BridgeRecord> bridges;
+  std::unordered_map<std::string, uint32_t> ros2_subscriber_num;
+  std::unordered_map<std::string, uint32_t> ros2_publisher_num;
+};
+
+// The process registration is recorded during initialization, before the heap
+// may be used, so it lives in plain storage.
+struct ProcessRecord
+{
+  pid_t owner = 0;
+  uint32_t domain_id = 0;
+  bool is_performance_bridge_manager = false;
+  uint64_t shm_addr = 0;
+};
+ProcessRecord g_process_record;
+
+std::mutex registry_mtx;
+// Never freed: a forked child starts a registry of its own and must not free
+// the parent's through its own allocator.
+ClientRegistry * g_registry = nullptr;
+
+ClientRegistry & registry_locked()
+{
+  if (g_registry == nullptr || g_registry->owner != getpid()) {
+    g_registry = new ClientRegistry();
+    g_registry->owner = getpid();
+  }
+  return *g_registry;
+}
+
+std::string to_string(const struct name_info & name)
+{
+  return std::string(name.ptr != nullptr ? name.ptr : "", name.len);
+}
+
+void forget_publisher(const std::string & topic_name, int32_t id)
+{
+  std::lock_guard<std::mutex> lock(registry_mtx);
+  auto & v = registry_locked().publishers;
+  v.erase(
+    std::remove_if(
+      v.begin(), v.end(),
+      [&](const PublisherRecord & r) { return r.id == id && r.topic_name == topic_name; }),
+    v.end());
+}
+
+void forget_subscriber(const std::string & topic_name, int32_t id)
+{
+  std::lock_guard<std::mutex> lock(registry_mtx);
+  auto & v = registry_locked().subscribers;
+  v.erase(
+    std::remove_if(
+      v.begin(), v.end(),
+      [&](const SubscriberRecord & r) { return r.id == id && r.topic_name == topic_name; }),
+    v.end());
+}
+
+// Replays this process's registrations to a freshly connected daemon. Caller
+// holds socket_mtx. False only when the connection broke again.
+bool restore_locked()
+{
+  auto call =
+    [](uint32_t cmd, const void * req, uint32_t req_size, int send_fd, const char * what) -> int {
+    bool transport_failed = false;
+    const int r = daemon_call_locked(
+      cmd, req, req_size, nullptr, 0, send_fd, nullptr, 0, nullptr, &transport_failed);
+    if (r < 0 && transport_failed) return -2;
+    if (r < 0 && errno != EEXIST) {
+      RCLCPP_WARN(logger, "restoring %s after a daemon restart failed: %s", what, strerror(errno));
+    }
+    return r;
+  };
+
+  if (g_process_record.owner == getpid()) {
+    RestoreProcessRequest req{};
+    req.shm_addr = g_process_record.shm_addr;
+    req.domain_id = g_process_record.domain_id;
+    req.is_performance_bridge_manager = g_process_record.is_performance_bridge_manager;
+    if (call(AGNOCAST_CMD_RESTORE_PROCESS, &req, sizeof(req), -1, "the process") == -2) {
+      return false;
+    }
+
+    RestoreMappingsRequest map_req{};
+    const uint32_t n = g_region_num.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; i++) {
+      if (g_regions[i].addr == g_process_record.shm_addr) continue;
+      map_req.shm_addrs[map_req.num++] = g_regions[i].addr;
+      if (map_req.num == AGNOCAST_RESTORE_MAPPING_BATCH || i + 1 == n) {
+        if (call(AGNOCAST_CMD_RESTORE_MAPPINGS, &map_req, sizeof(map_req), -1, "mappings") == -2) {
+          return false;
+        }
+        map_req.num = 0;
+      }
+    }
+  }
+
+  std::vector<std::pair<std::string, std::shared_ptr<TopicSegment>>> topics;
+  {
+    std::lock_guard<std::mutex> lock(segments_mtx);
+    for (const auto & [key, segment] : segments) {
+      (void)key;
+      if (!segment || segment->fd < 0) continue;
+      const bool listed = std::any_of(
+        topics.begin(), topics.end(), [&](const auto & t) { return t.second == segment; });
+      if (!listed) topics.emplace_back(segment->topic_name, segment);
+    }
+  }
+  for (const auto & [name, segment] : topics) {
+    RestoreTopicRequest req{};
+    std::strncpy(req.topic_name, name.c_str(), sizeof(req.topic_name) - 1);
+    if (call(AGNOCAST_CMD_RESTORE_TOPIC, &req, sizeof(req), segment->fd, "a topic") == -2) {
+      return false;
+    }
+  }
+
+  ClientRegistry snapshot;
+  {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    snapshot = registry_locked();
+  }
+  for (const auto & rec : snapshot.publishers) {
+    RestorePublisherRequest req{};
+    req.reg = rec.req;
+    req.publisher_id = rec.id;
+    if (call(AGNOCAST_CMD_RESTORE_PUBLISHER, &req, sizeof(req), -1, "a publisher") == -2) {
+      return false;
+    }
+  }
+  for (const auto & rec : snapshot.subscribers) {
+    RestoreSubscriberRequest req{};
+    req.reg = rec.req;
+    req.subscriber_id = rec.id;
+    const int r =
+      call(AGNOCAST_CMD_RESTORE_SUBSCRIBER, &req, sizeof(req), rec.eventfd, "a subscriber");
+    if (r == -2) return false;
+  }
+  for (const auto & [name, br] : snapshot.bridges) {
+    for (const bool is_r2a : {true, false}) {
+      if (is_r2a ? !br.has_r2a : !br.has_a2r) continue;
+      AddBridgeRequest req{};
+      std::strncpy(req.topic_name, name.c_str(), sizeof(req.topic_name) - 1);
+      req.is_r2a = is_r2a;
+      bool transport_failed = false;
+      AddBridgeResponse resp{};
+      if (
+        daemon_call_locked(
+          AGNOCAST_CMD_ADD_BRIDGE, &req, sizeof(req), &resp, sizeof(resp), -1, nullptr, 0, nullptr,
+          &transport_failed) < 0 &&
+        transport_failed) {
+        return false;
+      }
+    }
+  }
+  for (const auto & [name, num] : snapshot.ros2_subscriber_num) {
+    SetRos2SubscriberNumRequest req{};
+    std::strncpy(req.topic_name, name.c_str(), sizeof(req.topic_name) - 1);
+    req.ros2_subscriber_num = num;
+    if (call(AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM, &req, sizeof(req), -1, "a ROS 2 count") == -2) {
+      return false;
+    }
+  }
+  for (const auto & [name, num] : snapshot.ros2_publisher_num) {
+    SetRos2PublisherNumRequest req{};
+    std::strncpy(req.topic_name, name.c_str(), sizeof(req.topic_name) - 1);
+    req.ros2_publisher_num = num;
+    if (call(AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM, &req, sizeof(req), -1, "a ROS 2 count") == -2) {
+      return false;
+    }
+  }
+  return call(AGNOCAST_CMD_RESTORE_DONE, nullptr, 0, -1, "the registrations") != -2;
+}
+
+// ------------------------------------------------------------
+// Data plane
+// ------------------------------------------------------------
+
+// Caller holds segment.notify_mtx. Does not wait for a daemon that is down:
+// the cached eventfds keep working meanwhile.
 int refresh_notify_fds(TopicSegment & segment)
 {
   std::unordered_map<int32_t, int> fds;
   uint64_t generation = UINT64_MAX;
   uint32_t offset = 0;
+  CallOptions opts;
+  opts.wait_for_daemon = false;
   while (true) {
     GetSubscriberEventfdsRequest req{};
     std::strncpy(req.topic_name, segment.topic_name.c_str(), sizeof(req.topic_name) - 1);
@@ -544,7 +1050,7 @@ int refresh_notify_fds(TopicSegment & segment)
     uint32_t got_num = 0;
     const int r = daemon_call(
       AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS, &req, sizeof(req), &resp, sizeof(resp), -1, got,
-      AGNOCAST_SUBSCRIBER_EVENTFD_BATCH, &got_num);
+      AGNOCAST_SUBSCRIBER_EVENTFD_BATCH, &got_num, &opts);
     if (r < 0 || got_num != resp.num) {
       for (uint32_t i = 0; i < got_num; i++) close(got[i]);
       for (const auto & [id, efd] : fds) {
@@ -565,9 +1071,22 @@ int refresh_notify_fds(TopicSegment & segment)
     if (resp.num == 0 || offset >= resp.total) break;
   }
 
+  // While a restarted daemon is still collecting the subscribers, it lists only
+  // those already restored. Keep waking the others with the eventfds from
+  // before: ids are never reused, so an id still subscribed in the segment is
+  // still the same subscriber.
+  {
+    TopicShmLock lock(segment.shm);
+    for (auto & [id, efd] : segment.notify_fds) {
+      if (efd < 0 || fds.count(id) > 0 || !topic_shm_valid_id(id)) continue;
+      if (segment.shm->ids[id].kind != TOPIC_SHM_ID_SUBSCRIBER) continue;
+      fds.emplace(id, efd);
+      efd = -1;
+    }
+  }
   for (const auto & [id, efd] : segment.notify_fds) {
     (void)id;
-    close(efd);
+    if (efd >= 0) close(efd);
   }
   segment.notify_fds = std::move(fds);
   segment.notify_generation = generation;
@@ -580,10 +1099,14 @@ void notify_subscribers_local(
 {
   std::lock_guard<std::mutex> lock(segment.notify_mtx);
   if (segment.notify_generation != generation && refresh_notify_fds(segment) < 0) {
-    RCLCPP_ERROR(
-      logger, "fetching subscriber eventfds for '%s' failed: %s", segment.topic_name.c_str(),
-      strerror(errno));
-    return;
+    // The daemon is down or restarting: wake whom we can with the cached
+    // eventfds and try again on the next publish.
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      RCLCPP_WARN(
+        logger, "fetching subscriber eventfds for '%s' failed (%s); using cached ones",
+        segment.topic_name.c_str(), strerror(errno));
+    }
   }
   const uint64_t one = 1;
   for (uint32_t i = 0; i < subscriber_num; i++) {
@@ -633,25 +1156,69 @@ int publish_local(
   return 0;
 }
 
-// 1 when the subscriber has to ask the daemon instead (a publisher's memory is
-// still to be mapped), in which case args is untouched.
-int receive_local(
-  TopicSegment & segment, union ioctl_receive_msg_args * args,
-  [[maybe_unused]] LocalStamps & stamps)
+// When a publisher appeared since the subscriber last looked, asks the daemon
+// where the publishers' memory is and writes the pools this process has not
+// mapped yet to out (the caller maps them after the call). Returns how many.
+// Without the daemon it returns 0 and leaves the flag set: the publishers'
+// entries then wait in the segment until their memory can be mapped.
+uint32_t fetch_new_publisher_memory(
+  TopicSegment & segment, int32_t subscriber_id, publisher_shm_info * out, uint32_t out_size)
 {
+  bool needed = false;
+  {
+    TopicShmLock lock(segment.shm);
+    needed = topic_shm_consume_mmap_update(segment.shm, subscriber_id);
+  }
+  if (!needed) return 0;
+
+  GetPublisherShmInfosRequest req{};
+  std::strncpy(req.topic_name, segment.topic_name.c_str(), sizeof(req.topic_name) - 1);
+  req.subscriber_id = subscriber_id;
+  auto resp = std::make_unique<GetPublisherShmInfosResponse>();
+  CallOptions opts;
+  opts.wait_for_daemon = false;
+  if (
+    daemon_call(
+      AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS, &req, sizeof(req), resp.get(), sizeof(*resp), -1,
+      nullptr, 0, nullptr, &opts) < 0) {
+    TopicShmLock lock(segment.shm);
+    topic_shm_request_mmap_update(segment.shm, subscriber_id);
+    return 0;
+  }
+
+  uint32_t num = 0;
+  const uint32_t total = std::min<uint32_t>(resp->pub_shm_num, AGNOCAST_PROTO_MAX_PUBLISHER_NUM);
+  for (uint32_t i = 0; i < total && num < out_size; i++) {
+    const auto & info = resp->pub_shm_infos[i];
+    if (region_mapped(info.pid)) continue;
+    out[num].pid = info.pid;
+    out[num].shm_addr = info.shm_addr;
+    out[num].shm_size = info.shm_size;
+    num++;
+  }
+  return num;
+}
+
+int receive_local(
+  TopicSegment & segment, union ioctl_receive_msg_args * args, publisher_shm_info * shm_buf,
+  uint32_t shm_buf_size, [[maybe_unused]] LocalStamps & stamps)
+{
+  const uint32_t pub_shm_num =
+    fetch_new_publisher_memory(segment, args->subscriber_id, shm_buf, shm_buf_size);
+
   int64_t entry_ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint64_t entry_addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint16_t entry_num = 0;
   bool call_again = false;
+  const ReadablePublishers readable{shm_buf, pub_shm_num};
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
   topic_shm_lock(segment.shm);
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
   const int ret = topic_shm_receive(
-    segment.shm, args->subscriber_id, false, entry_ids, entry_addrs, &entry_num, &call_again);
+    segment.shm, args->subscriber_id, readable, entry_ids, entry_addrs, &entry_num, &call_again);
   topic_shm_unlock(segment.shm);
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
-  if (ret == -EAGAIN) return 1;
   if (ret < 0) {
     errno = -ret;
     return -1;
@@ -659,7 +1226,7 @@ int receive_local(
 
   args->ret_entry_num = entry_num;
   args->ret_call_again = call_again;
-  args->ret_pub_shm_num = 0;
+  args->ret_pub_shm_num = pub_shm_num;
   for (uint16_t i = 0; i < entry_num; i++) {
     args->ret_entry_ids[i] = entry_ids[i];
     args->ret_entry_addrs[i] = entry_addrs[i];
@@ -667,46 +1234,49 @@ int receive_local(
   return 0;
 }
 
-// 1 when the subscriber has to ask the daemon instead (a publisher's memory is
-// still to be mapped), in which case args is untouched.
 int take_local(
-  TopicSegment & segment, union ioctl_take_msg_args * args, [[maybe_unused]] LocalStamps & stamps)
+  TopicSegment & segment, union ioctl_take_msg_args * args, publisher_shm_info * shm_buf,
+  uint32_t shm_buf_size)
 {
   if (!topic_shm_valid_id(args->subscriber_id)) {
     errno = EINVAL;
     return -1;
   }
-  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
-  topic_shm_lock(segment.shm);
-  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
-  TopicShmId & sub = segment.shm->ids[args->subscriber_id];
-  if (sub.kind != TOPIC_SHM_ID_SUBSCRIBER) {
-    topic_shm_unlock(segment.shm);
-    errno = EINVAL;
-    return -1;
-  }
-  if (sub.need_mmap_update) {
-    topic_shm_unlock(segment.shm);
-    return 1;
-  }
+  const uint32_t pub_shm_num =
+    fetch_new_publisher_memory(segment, args->subscriber_id, shm_buf, shm_buf_size);
+
   uint64_t addr = 0;
   int64_t entry_id = -1;
-  const int ret =
-    topic_shm_take(segment.shm, args->subscriber_id, args->allow_same_message, &addr, &entry_id);
-  topic_shm_unlock(segment.shm);
-  AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
-  AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
+  const ReadablePublishers readable{shm_buf, pub_shm_num};
+  int ret = 0;
+  {
+    TopicShmLock lock(segment.shm);
+    ret = topic_shm_take(
+      segment.shm, args->subscriber_id, args->allow_same_message, readable, &addr, &entry_id);
+  }
   if (ret < 0) {
     errno = -ret;
     return -1;
   }
   args->ret_addr = addr;
   args->ret_entry_id = entry_id;
-  args->ret_pub_shm_num = 0;
+  args->ret_pub_shm_num = pub_shm_num;
   return 0;
 }
 
 }  // namespace
+
+void daemon_note_mapped_region(pid_t pid, uint64_t addr, uint64_t size)
+{
+  std::lock_guard<std::mutex> lock(g_region_write_mtx);
+  const uint32_t n = g_region_num.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < n; i++) {
+    if (g_regions[i].pid == pid && g_regions[i].addr == addr) return;
+  }
+  if (n == kMaxMappedRegions) return;
+  g_regions[n] = MappedRegion{pid, addr, size};
+  g_region_num.store(n + 1, std::memory_order_release);
+}
 
 int agnocast_ipc_get_version(struct ioctl_get_version_args * args)
 {
@@ -726,7 +1296,26 @@ int agnocast_ipc_add_process(union ioctl_add_process_args * args)
   req.is_performance_bridge_manager = (args->role == PROCESS_ROLE_BRIDGE_MANAGER);
   req.domain_id = args->domain_id;
   AddProcessResponse resp{};
-  int r = daemon_call(AGNOCAST_CMD_ADD_PROCESS, &req, sizeof(req), &resp, sizeof(resp));
+  struct Ctx
+  {
+    const AddProcessRequest * req;
+    const AddProcessResponse * resp;
+  } ctx{&req, &resp};
+  CallOptions opts;
+  opts.ctx = &ctx;
+  // No heap here: this runs before the allocator is set up.
+  opts.on_success = [](void * p) {
+    const auto * c = static_cast<Ctx *>(p);
+    // A bridge manager that lost the race is told to exit, not given a pool.
+    if (c->resp->shm_addr == 0) return;
+    g_process_record.owner = getpid();
+    g_process_record.domain_id = c->req->domain_id;
+    g_process_record.is_performance_bridge_manager = c->req->is_performance_bridge_manager;
+    g_process_record.shm_addr = c->resp->shm_addr;
+  };
+  int r = daemon_call(
+    AGNOCAST_CMD_ADD_PROCESS, &req, sizeof(req), &resp, sizeof(resp), -1, nullptr, 0, nullptr,
+    &opts);
   if (r == 0) {
     args->ret_addr = resp.shm_addr;
     args->ret_shm_size = resp.shm_size;
@@ -748,14 +1337,33 @@ int agnocast_ipc_add_publisher(union ioctl_add_publisher_args * args)
   AddPublisherResponse resp{};
   int shm_fd = -1;
   uint32_t shm_fd_num = 0;
+  ensure_watcher();
+  // ret_id overlaps topic_name in the union, so take the name first.
+  const struct name_info topic_name = args->topic_name;
+  struct Ctx
+  {
+    const struct name_info * topic_name;
+    const AddPublisherRequest * req;
+    const AddPublisherResponse * resp;
+    int * shm_fd;
+    uint32_t * shm_fd_num;
+  } ctx{&topic_name, &req, &resp, &shm_fd, &shm_fd_num};
+  CallOptions opts;
+  opts.ctx = &ctx;
+  opts.on_success = [](void * p) {
+    const auto * c = static_cast<Ctx *>(p);
+    attach_topic_segment(
+      *c->topic_name, c->resp->publisher_id, *c->shm_fd_num > 0 ? *c->shm_fd : -1);
+    *c->shm_fd_num = 0;
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry_locked().publishers.push_back(
+      PublisherRecord{to_string(*c->topic_name), c->resp->publisher_id, *c->req});
+  };
   int r = daemon_call(
-    AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp), -1, &shm_fd, 1,
-    &shm_fd_num);
+    AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp), -1, &shm_fd, 1, &shm_fd_num,
+    &opts);
   if (r == 0) {
-    // ret_id overlaps topic_name in the union, so take the name first.
-    const struct name_info topic_name = args->topic_name;
     args->ret_id = resp.publisher_id;
-    attach_topic_segment(topic_name, resp.publisher_id, shm_fd_num > 0 ? shm_fd : -1);
   } else if (shm_fd_num > 0) {
     close(shm_fd);
   }
@@ -778,14 +1386,35 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   // it, the way the kernel module signals the eventfd_ctx.
   int shm_fd = -1;
   uint32_t shm_fd_num = 0;
+  ensure_watcher();
+  // ret_id overlaps topic_name in the union, so take the name first.
+  const struct name_info topic_name = args->topic_name;
+  const int eventfd = args->eventfd;
+  struct Ctx
+  {
+    const struct name_info * topic_name;
+    const AddSubscriberRequest * req;
+    const AddSubscriberResponse * resp;
+    int eventfd;
+    int * shm_fd;
+    uint32_t * shm_fd_num;
+  } ctx{&topic_name, &req, &resp, eventfd, &shm_fd, &shm_fd_num};
+  CallOptions opts;
+  opts.ctx = &ctx;
+  opts.on_success = [](void * p) {
+    const auto * c = static_cast<Ctx *>(p);
+    attach_topic_segment(
+      *c->topic_name, c->resp->subscriber_id, *c->shm_fd_num > 0 ? *c->shm_fd : -1);
+    *c->shm_fd_num = 0;
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry_locked().subscribers.push_back(
+      SubscriberRecord{to_string(*c->topic_name), c->resp->subscriber_id, *c->req, c->eventfd});
+  };
   int r = daemon_call(
-    AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), args->eventfd, &shm_fd, 1,
-    &shm_fd_num);
+    AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), eventfd, &shm_fd, 1,
+    &shm_fd_num, &opts);
   if (r == 0) {
-    // ret_id overlaps topic_name in the union, so take the name first.
-    const struct name_info topic_name = args->topic_name;
     args->ret_id = resp.subscriber_id;
-    attach_topic_segment(topic_name, resp.subscriber_id, shm_fd_num > 0 ? shm_fd : -1);
   } else if (shm_fd_num > 0) {
     close(shm_fd);
   }
@@ -840,11 +1469,11 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
 
   if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
     LocalStamps stamps;
-    const int r = receive_local(*segment, args, stamps);
-    if (r <= 0) {
-      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive, stamps);
-      return r;
-    }
+    const int r = receive_local(
+      *segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr), pub_shm_info_size,
+      stamps);
+    AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive, stamps);
+    return r;
   }
 
   ReceiveMsgRequest req{};
@@ -860,15 +1489,18 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
       args->ret_entry_ids[i] = resp.entry_ids[i];
       args->ret_entry_addrs[i] = resp.entry_addrs[i];
     }
-    // Copy pub_shm_infos into the caller-provided buffer (snapshotted above).
+    // Copy pub_shm_infos into the caller-provided buffer (snapshotted above),
+    // minus pools already mapped: a restarted daemon may list them again.
     auto * shm_buf = reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr);
-    uint32_t copy_count =
-      (resp.pub_shm_num < pub_shm_info_size) ? resp.pub_shm_num : pub_shm_info_size;
-    for (uint32_t i = 0; i < copy_count; i++) {
-      shm_buf[i].pid = resp.pub_shm_infos[i].pid;
-      shm_buf[i].shm_addr = resp.pub_shm_infos[i].shm_addr;
-      shm_buf[i].shm_size = resp.pub_shm_infos[i].shm_size;
+    uint32_t copy_count = 0;
+    for (uint32_t i = 0; i < resp.pub_shm_num && copy_count < pub_shm_info_size; i++) {
+      if (region_mapped(resp.pub_shm_infos[i].pid)) continue;
+      shm_buf[copy_count].pid = resp.pub_shm_infos[i].pid;
+      shm_buf[copy_count].shm_addr = resp.pub_shm_infos[i].shm_addr;
+      shm_buf[copy_count].shm_size = resp.pub_shm_infos[i].shm_size;
+      copy_count++;
     }
+    args->ret_pub_shm_num = copy_count;
   }
 
   AGNOCAST_BENCH_CALL_LEAVE(receive);
@@ -883,11 +1515,8 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
 
   if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
-    LocalStamps stamps;
-    const int r = take_local(*segment, args, stamps);
-    if (r <= 0) {
-      return r;
-    }
+    return take_local(
+      *segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr), pub_shm_info_size);
   }
 
   TakeMsgRequest req{};
@@ -899,15 +1528,16 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
   if (r == 0) {
     args->ret_addr = resp.addr;
     args->ret_entry_id = resp.entry_id;
-    args->ret_pub_shm_num = resp.pub_shm_num;
     auto * shm_buf = reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr);
-    uint32_t copy_count =
-      (resp.pub_shm_num < pub_shm_info_size) ? resp.pub_shm_num : pub_shm_info_size;
-    for (uint32_t i = 0; i < copy_count; i++) {
-      shm_buf[i].pid = resp.pub_shm_infos[i].pid;
-      shm_buf[i].shm_addr = resp.pub_shm_infos[i].shm_addr;
-      shm_buf[i].shm_size = resp.pub_shm_infos[i].shm_size;
+    uint32_t copy_count = 0;
+    for (uint32_t i = 0; i < resp.pub_shm_num && copy_count < pub_shm_info_size; i++) {
+      if (region_mapped(resp.pub_shm_infos[i].pid)) continue;
+      shm_buf[copy_count].pid = resp.pub_shm_infos[i].pid;
+      shm_buf[copy_count].shm_addr = resp.pub_shm_infos[i].shm_addr;
+      shm_buf[copy_count].shm_size = resp.pub_shm_infos[i].shm_size;
+      copy_count++;
     }
+    args->ret_pub_shm_num = copy_count;
   }
   return r;
 }
@@ -939,7 +1569,13 @@ int agnocast_ipc_remove_publisher(struct ioctl_remove_publisher_args * args)
   RemovePublisherRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.publisher_id = args->publisher_id;
-  const int r = daemon_call(AGNOCAST_CMD_REMOVE_PUBLISHER, &req, sizeof(req), nullptr, 0);
+  // Forgotten first, so a restore running meanwhile does not bring it back.
+  forget_publisher(to_string(args->topic_name), args->publisher_id);
+  const uint64_t gen = g_conn_generation.load();
+  int r = daemon_call(AGNOCAST_CMD_REMOVE_PUBLISHER, &req, sizeof(req), nullptr, 0);
+  if (r < 0 && (errno == ENODATA || errno == EINVAL) && g_conn_generation.load() != gen) {
+    r = 0;  // the restarted daemon already dropped it as unclaimed
+  }
   detach_topic_segment(args->topic_name, args->publisher_id);
   return r;
 }
@@ -949,7 +1585,12 @@ int agnocast_ipc_remove_subscriber(struct ioctl_remove_subscriber_args * args)
   RemoveSubscriberRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
-  const int r = daemon_call(AGNOCAST_CMD_REMOVE_SUBSCRIBER, &req, sizeof(req), nullptr, 0);
+  forget_subscriber(to_string(args->topic_name), args->subscriber_id);
+  const uint64_t gen = g_conn_generation.load();
+  int r = daemon_call(AGNOCAST_CMD_REMOVE_SUBSCRIBER, &req, sizeof(req), nullptr, 0);
+  if (r < 0 && (errno == ENODATA || errno == EINVAL) && g_conn_generation.load() != gen) {
+    r = 0;  // the restarted daemon already dropped it as unclaimed
+  }
   detach_topic_segment(args->topic_name, args->subscriber_id);
   return r;
 }
@@ -1036,6 +1677,10 @@ int agnocast_ipc_add_bridge(struct ioctl_add_bridge_args * args)
     args->ret_pid = resp.pid;
     args->ret_has_r2a = resp.has_r2a;
     args->ret_has_a2r = resp.has_a2r;
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    BridgeRecord & br = registry_locked().bridges[req.topic_name];
+    br.has_r2a = resp.has_r2a;
+    br.has_a2r = resp.has_a2r;
   }
   return r;
 }
@@ -1045,6 +1690,14 @@ int agnocast_ipc_remove_bridge(struct ioctl_remove_bridge_args * args)
   RemoveBridgeRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.is_r2a = args->is_r2a;
+  {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    auto & bridges = registry_locked().bridges;
+    if (auto it = bridges.find(req.topic_name); it != bridges.end()) {
+      (args->is_r2a ? it->second.has_r2a : it->second.has_a2r) = false;
+      if (!it->second.has_r2a && !it->second.has_a2r) bridges.erase(it);
+    }
+  }
   return daemon_call(AGNOCAST_CMD_REMOVE_BRIDGE, &req, sizeof(req), nullptr, 0);
 }
 
@@ -1070,7 +1723,12 @@ int agnocast_ipc_set_ros2_subscriber_num(struct ioctl_set_ros2_subscriber_num_ar
   SetRos2SubscriberNumRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.ros2_subscriber_num = args->ros2_subscriber_num;
-  return daemon_call(AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM, &req, sizeof(req), nullptr, 0);
+  const int r = daemon_call(AGNOCAST_CMD_SET_ROS2_SUBSCRIBER_NUM, &req, sizeof(req), nullptr, 0);
+  if (r == 0) {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry_locked().ros2_subscriber_num[req.topic_name] = req.ros2_subscriber_num;
+  }
+  return r;
 }
 
 int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args * args)
@@ -1078,7 +1736,12 @@ int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args
   SetRos2PublisherNumRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.ros2_publisher_num = args->ros2_publisher_num;
-  return daemon_call(AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM, &req, sizeof(req), nullptr, 0);
+  const int r = daemon_call(AGNOCAST_CMD_SET_ROS2_PUBLISHER_NUM, &req, sizeof(req), nullptr, 0);
+  if (r == 0) {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry_locked().ros2_publisher_num[req.topic_name] = req.ros2_publisher_num;
+  }
+  return r;
 }
 
 int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args)
@@ -1158,6 +1821,45 @@ int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args)
     AGNOCAST_CMD_GET_TOPIC_PUBLISHER_INFO, &req, sizeof(req), resp.get(), sizeof(*resp));
   if (r == 0) {
     copy_topic_info_entries(args, resp->entry_num, resp->entries);
+  }
+  return r;
+}
+
+int agnocast_ipc_debug_check_topic(const std::string & topic_name, DaemonTopicCheck * out)
+{
+  DebugCheckTopicRequest req{};
+  std::strncpy(req.topic_name, topic_name.c_str(), sizeof(req.topic_name) - 1);
+  DebugCheckTopicResponse resp{};
+  const int r = daemon_call(AGNOCAST_CMD_DEBUG_CHECK_TOPIC, &req, sizeof(req), &resp, sizeof(resp));
+  if (r == 0) {
+    out->shm_violations = resp.shm_violations;
+    out->registry_violations = resp.registry_violations;
+    out->rollback_count = resp.rollback_count;
+    out->rollback_record_num = resp.rollback_record_num;
+    out->entry_num = resp.entry_num;
+    out->sub_num = resp.sub_num;
+    std::memcpy(out->message, resp.message, sizeof(out->message));
+    out->message[sizeof(out->message) - 1] = '\0';
+  }
+  return r;
+}
+
+int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out)
+{
+  GetRecoveryStatusResponse resp{};
+  const int r = daemon_call(AGNOCAST_CMD_GET_RECOVERY_STATUS, nullptr, 0, &resp, sizeof(resp));
+  if (r == 0) {
+    out->recovered = resp.recovered;
+    out->in_recovery = resp.in_recovery;
+    out->expected_num = resp.expected_num;
+    out->restored_num = resp.restored_num;
+    out->dead_num = resp.dead_num;
+    out->timed_out_num = resp.timed_out_num;
+    out->adopted_topic_num = resp.adopted_topic_num;
+    out->orphan_publisher_num = resp.orphan_publisher_num;
+    out->orphan_subscriber_num = resp.orphan_subscriber_num;
+    out->start_ns = resp.start_ns;
+    out->end_ns = resp.end_ns;
   }
   return r;
 }
