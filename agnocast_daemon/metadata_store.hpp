@@ -2,7 +2,7 @@
 #pragma once
 
 #include "memory_allocator.hpp"
-#include "message_entry.hpp"
+#include "topic_shm.hpp"
 
 #include <sys/types.h>
 
@@ -66,36 +66,7 @@ struct PublisherInfo
   std::string node_name;
   uint32_t qos_depth = 0;
   bool qos_is_transient_local = false;
-  uint32_t entries_num = 0;
   bool is_bridge = false;
-};
-
-// The daemon's side of a subscriber's AgnocastSubscriberChannel. Owns the
-// mapping; it is unmapped when the SubscriberInfo holding it is erased, which
-// happens only under global_mutex_ held exclusively, so no handler can still be
-// reading through it.
-struct SubscriberChannel
-{
-  AgnocastSubscriberChannel * shm = nullptr;
-
-  // Serializes the daemon-side accessors of this channel that may run under a
-  // shared topic lock.
-  std::mutex mtx;
-
-  // The daemon's own copies of push.head and push.ipc_pending. The shared ones
-  // are only published for the subscriber, which could overwrite them.
-  uint64_t push_head = 0;
-  bool ipc_pending = true;
-
-  // The daemon's own copy of release.tail, for the same reason.
-  uint64_t release_tail = 0;
-
-  explicit SubscriberChannel(AgnocastSubscriberChannel * mapped) : shm(mapped) {}
-  ~SubscriberChannel();
-  SubscriberChannel(const SubscriberChannel &) = delete;
-  SubscriberChannel & operator=(const SubscriberChannel &) = delete;
-  SubscriberChannel(SubscriberChannel &&) = delete;
-  SubscriberChannel & operator=(SubscriberChannel &&) = delete;
 };
 
 // Equivalent of agnocast_kmod::subscriber_info.
@@ -107,31 +78,25 @@ struct SubscriberInfo
   uint32_t qos_depth = 0;
   bool qos_is_transient_local = false;
   bool qos_is_reliable = false;
-  int64_t latest_received_entry_id = -1;
   std::string node_name;
   bool is_take_sub = false;
   bool ignore_local_publications = false;
-  bool need_mmap_update = false;
   bool is_bridge = false;
   // The subscriber's notification eventfd, received over SCM_RIGHTS at
   // registration and owned by the daemon from then on (-1 when none was sent).
   // The kernel module resolves the caller's fd to an eventfd_ctx instead; a
   // userspace daemon cannot, so the descriptor itself has to be passed.
   int notify_eventfd = -1;
-  // Set by AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL; null for a subscriber that
-  // never attached one, which then uses the plain request path throughout.
-  std::unique_ptr<SubscriberChannel> channel;
 };
 
-// Equivalent of agnocast_kmod::topic_struct.
-// The red-black tree (struct rb_root) is replaced by std::map<int64_t, EntryNode>.
+// Equivalent of agnocast_kmod::topic_struct, minus what the data plane needs:
+// the entries (the kernel module's red-black tree), the reference bits, and the
+// per-publisher and per-subscriber counters live in the topic's shared segment.
 struct TopicStruct
 {
-  std::map<int64_t, EntryNode> entries;  // keyed by entry_id
   std::unordered_map<int32_t, PublisherInfo> pub_info_map;
   std::unordered_map<int32_t, SubscriberInfo> sub_info_map;
   int32_t current_pubsub_id = 0;
-  int64_t current_entry_id = 0;
   uint32_t ros2_subscriber_num = 0;
   uint32_t ros2_publisher_num = 0;
 };
@@ -144,14 +109,21 @@ struct TopicWrapper
   std::string key;
   uint32_t domain_id = 0;
 
-  // Lock ordering: global_mutex_ (MetadataStore) → topic_rwsem → mutex_ (MemoryAllocator).
-  // shared_lock  for queries, receive/take, and release_ref (entry ref bits are atomic).
-  // unique_lock  for publish and other operations that change the entries map.
+  // Lock ordering: global_mutex_ (MetadataStore) → topic_rwsem → shm->mutex →
+  // mutex_ (MemoryAllocator).
+  // shared_lock  for queries and for anything that touches only the segment.
+  // unique_lock  for changes to pub_info_map / sub_info_map.
   mutable std::shared_mutex topic_rwsem;
 
   TopicStruct topic;
 
+  // The topic's shared segment (topic_shm.hpp), sealed against resizing so a
+  // client holding the descriptor cannot turn the daemon's accesses into SIGBUS.
+  int shm_fd = -1;
+  AgnocastTopicShm * shm = nullptr;
+
   TopicWrapper() = default;
+  ~TopicWrapper();
   TopicWrapper(const TopicWrapper &) = delete;
   TopicWrapper & operator=(const TopicWrapper &) = delete;
   TopicWrapper(TopicWrapper &&) = delete;
@@ -189,7 +161,8 @@ public:
   std::unordered_map<pid_t, ProcessInfo> proc_info_map_;
   std::unordered_map<std::string, BridgeInfo> bridge_map_;
 
-  // Caller must hold global_mutex_ (unique_lock) before calling.
+  // Caller must hold global_mutex_ (unique_lock) before calling. nullptr when
+  // a new topic's segment could not be created.
   TopicWrapper * find_or_create_topic(const TopicKey & key);
 
   // Caller must hold global_mutex_ (at least shared_lock) before calling.

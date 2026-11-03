@@ -1,12 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "metadata_store.hpp"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
-SubscriberChannel::~SubscriberChannel()
+TopicWrapper::~TopicWrapper()
 {
   if (shm != nullptr) munmap(shm, sizeof(*shm));
+  if (shm_fd >= 0) close(shm_fd);
 }
+
+namespace
+{
+
+bool create_topic_shm(TopicWrapper & wrapper)
+{
+  const int fd = memfd_create("agnocast_topic", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (fd < 0) return false;
+  void * mapped = MAP_FAILED;
+  if (
+    ftruncate(fd, sizeof(AgnocastTopicShm)) == 0 &&
+    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) == 0) {
+    mapped = mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  }
+  if (mapped == MAP_FAILED) {
+    close(fd);
+    return false;
+  }
+  auto * shm = static_cast<AgnocastTopicShm *>(mapped);
+  if (topic_shm_init(shm) < 0) {
+    munmap(mapped, sizeof(AgnocastTopicShm));
+    close(fd);
+    return false;
+  }
+  wrapper.shm_fd = fd;
+  wrapper.shm = shm;
+  return true;
+}
+
+}  // namespace
 
 TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
 {
@@ -15,6 +48,7 @@ TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
     return it->second.get();
   }
   auto wrapper = std::make_unique<TopicWrapper>();
+  if (!create_topic_shm(*wrapper)) return nullptr;
   wrapper->key = key.name;
   wrapper->domain_id = key.domain_id;
   auto * ptr = wrapper.get();

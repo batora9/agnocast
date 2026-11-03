@@ -5,10 +5,12 @@
 #include "agnocast/agnocast_ipc.hpp"
 #include "agnocast/agnocast_utils.hpp"
 #include "protocol.h"
+#include "topic_shm.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,13 +81,20 @@ void finalize_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
   out.notify_ns = s.daemon_send - work_end;
 }
 
-// For a call answered from the channel without a round trip: the whole span is
-// local work, reported as req_ns, with no daemon stamps.
-void finalize_local_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit_ns)
+// For a call served from the topic segment without a round trip. There are no
+// daemon stamps; lock_ns/work_ns/notify_ns are the segment mutex wait, the
+// critical section, and the eventfd writes.
+void finalize_local_breakdown(
+  IpcBreakdown & out, int64_t enter_ns, int64_t lock_begin_ns, int64_t lock_end_ns,
+  int64_t work_end_ns, int64_t notify_end_ns, int64_t exit_ns)
 {
   out = IpcBreakdown{};
   out.total_ns = exit_ns - enter_ns;
-  out.req_ns = out.total_ns;
+  out.req_ns = lock_begin_ns - enter_ns;
+  out.lock_ns = lock_end_ns - lock_begin_ns;
+  out.work_ns = work_end_ns - lock_end_ns;
+  out.notify_ns = notify_end_ns - work_end_ns;
+  out.post_ns = exit_ns - notify_end_ns;
 }
 
 }  // namespace
@@ -94,14 +104,31 @@ void finalize_local_breakdown(IpcBreakdown & out, int64_t enter_ns, int64_t exit
 #define AGNOCAST_BENCH_CALL_ENTER() const int64_t agnocast_bench_enter_ns = bench_timing_now_ns()
 #define AGNOCAST_BENCH_CALL_LEAVE(slot) \
   finalize_breakdown(last_##slot##_ipc_breakdown, agnocast_bench_enter_ns, bench_timing_now_ns())
-#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot) \
-  finalize_local_breakdown(                   \
-    last_##slot##_ipc_breakdown, agnocast_bench_enter_ns, bench_timing_now_ns())
+#define AGNOCAST_BENCH_LOCAL_STAMP(var) var = bench_timing_now_ns()
+#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot, stamps)                                             \
+  finalize_local_breakdown(                                                                       \
+    last_##slot##_ipc_breakdown, agnocast_bench_enter_ns, (stamps).lock_begin, (stamps).lock_end, \
+    (stamps).work_end, (stamps).notify_end, bench_timing_now_ns())
 #else
 #define AGNOCAST_BENCH_CALL_ENTER() static_cast<void>(0)
 #define AGNOCAST_BENCH_CALL_LEAVE(slot) static_cast<void>(0)
-#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot) static_cast<void>(0)
+#define AGNOCAST_BENCH_LOCAL_STAMP(var) static_cast<void>(0)
+#define AGNOCAST_BENCH_CALL_LEAVE_LOCAL(slot, stamps) static_cast<void>(0)
 #endif  // AGNOCAST_BENCH_TIMING
+
+namespace
+{
+
+// Stamps of a call served from the topic segment (bench builds only).
+struct LocalStamps
+{
+  int64_t lock_begin = 0;
+  int64_t lock_end = 0;
+  int64_t work_end = 0;
+  int64_t notify_end = 0;
+};
+
+}  // namespace
 
 // Client-side wait for the daemon reply. Always tries MSG_DONTWAIT once so a
 // datagram already in the socket buffer does not require a blocking recvmsg
@@ -190,7 +217,7 @@ thread_local int64_t t_spin_budget_ns = 0;
 ssize_t recvmsg_dontwait(int fd, msghdr * msg)
 {
   while (true) {
-    const ssize_t n = recvmsg(fd, msg, MSG_DONTWAIT);
+    const ssize_t n = recvmsg(fd, msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
     if (n < 0 && errno == EINTR) {
       continue;
     }
@@ -240,7 +267,7 @@ int recv_response(msghdr * recv_msg)
   }
 
   const int64_t block_begin = monotonic_now_ns();
-  n = recvmsg(agnocast_fd, recv_msg, 0);
+  n = recvmsg(agnocast_fd, recv_msg, MSG_CMSG_CLOEXEC);
   if (n < 0) {
     return -1;
   }
@@ -264,10 +291,16 @@ int recv_response(msghdr * recv_msg)
 // module reads a subscriber's notification eventfd out of the caller's own fd
 // table, which a userspace daemon cannot do, so the descriptor itself has to
 // travel with the registration. Ownership moves to the daemon on success.
+//
+// Descriptors the daemon attaches to the reply are stored in recv_fds (up to
+// recv_fd_cap, the rest closed) and counted in *recv_fd_num; the caller owns
+// them, even when the call itself reports an error.
 static int daemon_call(
   uint32_t cmd, const void * req_payload, uint32_t req_size, void * resp_payload,
-  uint32_t resp_size, int send_fd = -1)
+  uint32_t resp_size, int send_fd = -1, int * recv_fds = nullptr, uint32_t recv_fd_cap = 0,
+  uint32_t * recv_fd_num = nullptr)
 {
+  if (recv_fd_num != nullptr) *recv_fd_num = 0;
   std::lock_guard<std::mutex> lock(socket_mtx);
 
   // --- send request ---
@@ -320,8 +353,31 @@ static int daemon_call(
   msghdr recv_msg{};
   recv_msg.msg_iov = riov;
   recv_msg.msg_iovlen = static_cast<size_t>(n_riov);
+  union {
+    cmsghdr align;
+    char bytes[CMSG_SPACE(sizeof(int) * AGNOCAST_SUBSCRIBER_EVENTFD_BATCH)];
+  } recv_cmsg_buf{};
+  if (recv_fds != nullptr) {
+    recv_msg.msg_control = recv_cmsg_buf.bytes;
+    recv_msg.msg_controllen = sizeof(recv_cmsg_buf.bytes);
+  }
   if (recv_response(&recv_msg) < 0) {
     return -1;
+  }
+  if (recv_fds != nullptr) {
+    for (cmsghdr * c = CMSG_FIRSTHDR(&recv_msg); c != nullptr; c = CMSG_NXTHDR(&recv_msg, c)) {
+      if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+      const size_t fd_num = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+      for (size_t i = 0; i < fd_num; i++) {
+        int got = -1;
+        memcpy(&got, CMSG_DATA(c) + i * sizeof(int), sizeof(got));
+        if (*recv_fd_num < recv_fd_cap) {
+          recv_fds[(*recv_fd_num)++] = got;
+        } else {
+          close(got);
+        }
+      }
+    }
   }
 #ifdef AGNOCAST_BENCH_TIMING
   g_stamps.recv_end = bench_timing_now_ns();
@@ -357,156 +413,300 @@ static void copy_name_out(char * dst, size_t dst_size, const char * src)
   dst[dst_size - 1] = '\0';
 }
 
-// Per-subscriber memory shared with the daemon (AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL).
+// The topic's shared segment (topic_shm.hpp), handed over with each publisher
+// and subscriber registration.
 namespace
 {
 
-struct ClientChannel
+struct TopicSegment
 {
-  AgnocastSubscriberChannel * shm = nullptr;
-  // Several threads can drop the last reference to different messages of one
-  // subscription at once; the daemon is the ring's only consumer.
-  std::mutex release_mtx;
+  AgnocastTopicShm * shm = nullptr;
+  std::string topic_name;
 
-  ClientChannel() = default;
-  ~ClientChannel()
+  // A publisher's copies of the subscribers' eventfds, valid for
+  // notify_generation of shm->sub_generation.
+  std::mutex notify_mtx;
+  uint64_t notify_generation = UINT64_MAX;
+  std::unordered_map<int32_t, int> notify_fds;
+
+  TopicSegment() = default;
+  ~TopicSegment()
   {
+    for (const auto & [id, efd] : notify_fds) {
+      (void)id;
+      close(efd);
+    }
     if (shm != nullptr) munmap(shm, sizeof(*shm));
   }
-  ClientChannel(const ClientChannel &) = delete;
-  ClientChannel & operator=(const ClientChannel &) = delete;
+  TopicSegment(const TopicSegment &) = delete;
+  TopicSegment & operator=(const TopicSegment &) = delete;
 };
 
-// Held by shared_ptr so a thread still using a channel keeps it mapped after
-// the subscription that owns it has been removed.
-std::mutex channels_mtx;
-std::unordered_map<std::string, std::shared_ptr<ClientChannel>> channels;
+// Keyed by (topic, publisher or subscriber id). Held by shared_ptr so a thread
+// still using a segment keeps it mapped after the handle is removed; the
+// by-inode map lets every handle on one topic share one mapping.
+std::mutex segments_mtx;
+std::unordered_map<std::string, std::shared_ptr<TopicSegment>> segments;
+std::unordered_map<ino_t, std::weak_ptr<TopicSegment>> segments_by_inode;
 
-std::string channel_key(const struct name_info & topic_name, int32_t subscriber_id)
+std::string segment_key(const struct name_info & topic_name, int32_t pubsub_id)
 {
   std::string key(topic_name.ptr != nullptr ? topic_name.ptr : "", topic_name.len);
   key.push_back('\0');
-  key.append(std::to_string(subscriber_id));
+  key.append(std::to_string(pubsub_id));
   return key;
 }
 
-std::shared_ptr<ClientChannel> find_channel(
-  const struct name_info & topic_name, int32_t subscriber_id)
+std::shared_ptr<TopicSegment> find_segment(const struct name_info & topic_name, int32_t pubsub_id)
 {
-  const std::string key = channel_key(topic_name, subscriber_id);
-  std::lock_guard<std::mutex> lock(channels_mtx);
-  const auto it = channels.find(key);
-  return (it != channels.end()) ? it->second : nullptr;
+  const std::string key = segment_key(topic_name, pubsub_id);
+  std::lock_guard<std::mutex> lock(segments_mtx);
+  const auto it = segments.find(key);
+  return (it != segments.end()) ? it->second : nullptr;
 }
 
-// AGNOCAST_SUB_CHANNEL=0 keeps every subscriber on the plain request path, so
-// one build can be measured both ways.
-bool sub_channel_enabled()
+// AGNOCAST_TOPIC_SHM=0 keeps every call on the daemon request path, so one
+// build can be measured both ways.
+bool topic_shm_enabled()
 {
-  const char * v = std::getenv("AGNOCAST_SUB_CHANNEL");
-  return v == nullptr || std::strcmp(v, "0") != 0;
+  static const bool enabled = [] {
+    const char * v = std::getenv("AGNOCAST_TOPIC_SHM");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
 }
 
-// Hands over what the daemon pushed at publish time (see AgnocastPushRing).
-// false when the subscriber has to send the request instead, in which case
-// args is untouched. Receives of one subscription are serialized by mmap_mtx,
-// so this is the ring's only consumer.
-bool take_pushed(ClientChannel & channel, union ioctl_receive_msg_args * args)
+// Takes ownership of shm_fd. A handle without a segment still works over plain
+// requests, so failing here is reported and otherwise ignored.
+void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id, int shm_fd)
 {
-  AgnocastPushRing & ring = channel.shm->push;
-  // ipc_pending first: once it reads set, every push made before it is
-  // visible, so an empty ring then means the rest is behind the request.
-  const bool ipc_pending = __atomic_load_n(&ring.ipc_pending, __ATOMIC_ACQUIRE) != 0;
-  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_ACQUIRE);
-  uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_RELAXED);
-  if (head == tail && ipc_pending) return false;
+  if (shm_fd < 0) return;
+  struct FdCloser
+  {
+    int fd;
+    ~FdCloser() { close(fd); }
+  } closer{shm_fd};
+  if (!topic_shm_enabled()) return;
 
-  int64_t entry_ids[MAX_RECEIVE_NUM];
-  uint64_t entry_addrs[MAX_RECEIVE_NUM];
-  uint16_t entry_num = 0;
-  for (; tail != head && entry_num < MAX_RECEIVE_NUM; tail++, entry_num++) {
-    const AgnocastPushSlot & slot = ring.slots[tail % AGNOCAST_PUSH_RING_SLOTS];
-    entry_ids[entry_num] = __atomic_load_n(&slot.entry_id, __ATOMIC_RELAXED);
-    entry_addrs[entry_num] = __atomic_load_n(&slot.entry_addr, __ATOMIC_RELAXED);
+  struct stat st
+  {
+  };
+  if (fstat(shm_fd, &st) < 0 || st.st_size != static_cast<off_t>(sizeof(AgnocastTopicShm))) {
+    RCLCPP_WARN(logger, "unexpected topic segment from the daemon; using plain requests");
+    return;
   }
-  __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
+
+  std::lock_guard<std::mutex> lock(segments_mtx);
+  std::shared_ptr<TopicSegment> segment;
+  if (const auto it = segments_by_inode.find(st.st_ino); it != segments_by_inode.end()) {
+    segment = it->second.lock();
+  }
+  if (!segment) {
+    void * mapped =
+      mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (mapped == MAP_FAILED) {
+      RCLCPP_WARN(logger, "mapping the topic segment failed: %s", strerror(errno));
+      return;
+    }
+    segment = std::make_shared<TopicSegment>();
+    segment->shm = static_cast<AgnocastTopicShm *>(mapped);
+    segment->topic_name.assign(topic_name.ptr != nullptr ? topic_name.ptr : "", topic_name.len);
+    if (__atomic_load_n(&segment->shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_TOPIC_SHM_MAGIC) {
+      RCLCPP_WARN(logger, "topic segment is not initialized; using plain requests");
+      return;
+    }
+    for (auto it = segments_by_inode.begin(); it != segments_by_inode.end();) {
+      it = it->second.expired() ? segments_by_inode.erase(it) : std::next(it);
+    }
+    segments_by_inode[st.st_ino] = segment;
+  }
+  segments[segment_key(topic_name, pubsub_id)] = std::move(segment);
+}
+
+void detach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id)
+{
+  std::lock_guard<std::mutex> lock(segments_mtx);
+  segments.erase(segment_key(topic_name, pubsub_id));
+}
+
+// Caller holds segment.notify_mtx.
+int refresh_notify_fds(TopicSegment & segment)
+{
+  std::unordered_map<int32_t, int> fds;
+  uint64_t generation = UINT64_MAX;
+  uint32_t offset = 0;
+  while (true) {
+    GetSubscriberEventfdsRequest req{};
+    std::strncpy(req.topic_name, segment.topic_name.c_str(), sizeof(req.topic_name) - 1);
+    req.offset = offset;
+    GetSubscriberEventfdsResponse resp{};
+    int got[AGNOCAST_SUBSCRIBER_EVENTFD_BATCH];
+    uint32_t got_num = 0;
+    const int r = daemon_call(
+      AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS, &req, sizeof(req), &resp, sizeof(resp), -1, got,
+      AGNOCAST_SUBSCRIBER_EVENTFD_BATCH, &got_num);
+    if (r < 0 || got_num != resp.num) {
+      for (uint32_t i = 0; i < got_num; i++) close(got[i]);
+      for (const auto & [id, efd] : fds) {
+        (void)id;
+        close(efd);
+      }
+      if (r == 0) errno = EPROTO;
+      return -1;
+    }
+    // The first batch's generation is the conservative one: a change between
+    // batches is caught by the next publish.
+    if (offset == 0) generation = resp.sub_generation;
+    for (uint32_t i = 0; i < resp.num; i++) {
+      const auto [it, inserted] = fds.emplace(resp.subscriber_ids[i], got[i]);
+      if (!inserted) close(got[i]);
+    }
+    offset += resp.num;
+    if (resp.num == 0 || offset >= resp.total) break;
+  }
+
+  for (const auto & [id, efd] : segment.notify_fds) {
+    (void)id;
+    close(efd);
+  }
+  segment.notify_fds = std::move(fds);
+  segment.notify_generation = generation;
+  return 0;
+}
+
+void notify_subscribers_local(
+  TopicSegment & segment, const int32_t * subscriber_ids, uint32_t subscriber_num,
+  uint64_t generation)
+{
+  std::lock_guard<std::mutex> lock(segment.notify_mtx);
+  if (segment.notify_generation != generation && refresh_notify_fds(segment) < 0) {
+    RCLCPP_ERROR(
+      logger, "fetching subscriber eventfds for '%s' failed: %s", segment.topic_name.c_str(),
+      strerror(errno));
+    return;
+  }
+  const uint64_t one = 1;
+  for (uint32_t i = 0; i < subscriber_num; i++) {
+    const auto it = segment.notify_fds.find(subscriber_ids[i]);
+    if (it == segment.notify_fds.end()) continue;
+    // EAGAIN means the counter is saturated: the subscriber is already awake.
+    if (write(it->second, &one, sizeof(one)) == -1 && errno != EAGAIN) {
+      RCLCPP_ERROR(logger, "eventfd write failed: %s", strerror(errno));
+    }
+  }
+}
+
+thread_local int32_t t_subscriber_ids[kTopicShmIdNum];
+
+int publish_local(
+  TopicSegment & segment, union ioctl_publish_msg_args * args,
+  [[maybe_unused]] LocalStamps & stamps)
+{
+  int64_t entry_id = -1;
+  uint64_t released_addrs[AGNOCAST_PROTO_MAX_RELEASE_NUM];
+  uint32_t released_num = 0;
+  uint32_t subscriber_num = 0;
+  uint64_t generation = 0;
+  int ret = 0;
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
+  topic_shm_lock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
+  ret = topic_shm_publish(
+    segment.shm, args->publisher_id, args->msg_virtual_address, &entry_id, released_addrs,
+    &released_num, t_subscriber_ids, &subscriber_num);
+  generation = segment.shm->sub_generation;
+  topic_shm_unlock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
+  if (ret < 0) {
+    errno = -ret;
+    return -1;
+  }
+
+  notify_subscribers_local(segment, t_subscriber_ids, subscriber_num, generation);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
+
+  args->ret_entry_id = entry_id;
+  args->ret_released_num = released_num;
+  for (uint32_t i = 0; i < released_num; i++) {
+    args->ret_released_addrs[i] = released_addrs[i];
+  }
+  return 0;
+}
+
+// 1 when the subscriber has to ask the daemon instead (a publisher's memory is
+// still to be mapped), in which case args is untouched.
+int receive_local(
+  TopicSegment & segment, union ioctl_receive_msg_args * args,
+  [[maybe_unused]] LocalStamps & stamps)
+{
+  int64_t entry_ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
+  uint64_t entry_addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
+  uint16_t entry_num = 0;
+  bool call_again = false;
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
+  topic_shm_lock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
+  const int ret = topic_shm_receive(
+    segment.shm, args->subscriber_id, false, entry_ids, entry_addrs, &entry_num, &call_again);
+  topic_shm_unlock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
+  if (ret == -EAGAIN) return 1;
+  if (ret < 0) {
+    errno = -ret;
+    return -1;
+  }
 
   args->ret_entry_num = entry_num;
-  args->ret_call_again = (tail != head) || ipc_pending;
+  args->ret_call_again = call_again;
   args->ret_pub_shm_num = 0;
   for (uint16_t i = 0; i < entry_num; i++) {
     args->ret_entry_ids[i] = entry_ids[i];
     args->ret_entry_addrs[i] = entry_addrs[i];
   }
-  return true;
+  return 0;
 }
 
-// false when the ring is full; the caller then reports the release directly.
-bool queue_release(ClientChannel & channel, int64_t entry_id)
+// 1 when the subscriber has to ask the daemon instead (a publisher's memory is
+// still to be mapped), in which case args is untouched.
+int take_local(
+  TopicSegment & segment, union ioctl_take_msg_args * args, [[maybe_unused]] LocalStamps & stamps)
 {
-  std::lock_guard<std::mutex> lock(channel.release_mtx);
-  AgnocastReleaseRing & ring = channel.shm->release;
-  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_RELAXED);
-  const uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_ACQUIRE);
-  if (head - tail >= AGNOCAST_RELEASE_RING_SLOTS) return false;
-  __atomic_store_n(&ring.entry_ids[head % AGNOCAST_RELEASE_RING_SLOTS], entry_id, __ATOMIC_RELAXED);
-  __atomic_store_n(&ring.head, head + 1, __ATOMIC_RELEASE);
-  return true;
+  if (!topic_shm_valid_id(args->subscriber_id)) {
+    errno = EINVAL;
+    return -1;
+  }
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
+  topic_shm_lock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
+  TopicShmId & sub = segment.shm->ids[args->subscriber_id];
+  if (sub.kind != TOPIC_SHM_ID_SUBSCRIBER) {
+    topic_shm_unlock(segment.shm);
+    errno = EINVAL;
+    return -1;
+  }
+  if (sub.need_mmap_update) {
+    topic_shm_unlock(segment.shm);
+    return 1;
+  }
+  uint64_t addr = 0;
+  int64_t entry_id = -1;
+  const int ret =
+    topic_shm_take(segment.shm, args->subscriber_id, args->allow_same_message, &addr, &entry_id);
+  topic_shm_unlock(segment.shm);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
+  AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
+  if (ret < 0) {
+    errno = -ret;
+    return -1;
+  }
+  args->ret_addr = addr;
+  args->ret_entry_id = entry_id;
+  args->ret_pub_shm_num = 0;
+  return 0;
 }
 
 }  // namespace
-
-// A subscriber without a channel still works over plain requests, so failing
-// here is reported and otherwise ignored.
-static void attach_subscriber_channel(const struct name_info & topic_name, int32_t subscriber_id)
-{
-  if (!sub_channel_enabled()) return;
-
-  const int memfd = memfd_create("agnocast_sub_channel", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-  if (memfd < 0) {
-    RCLCPP_WARN(logger, "memfd_create for the subscriber channel failed: %s", strerror(errno));
-    return;
-  }
-
-  constexpr size_t kChannelSize = sizeof(AgnocastSubscriberChannel);
-  auto channel = std::make_shared<ClientChannel>();
-  void * mapped = MAP_FAILED;
-  if (ftruncate(memfd, kChannelSize) == 0) {
-    mapped = mmap(nullptr, kChannelSize, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-  }
-  if (
-    mapped == MAP_FAILED ||
-    fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
-    RCLCPP_WARN(logger, "preparing the subscriber channel failed: %s", strerror(errno));
-    if (mapped != MAP_FAILED) munmap(mapped, kChannelSize);
-    close(memfd);
-    return;
-  }
-  channel->shm = static_cast<AgnocastSubscriberChannel *>(mapped);
-  __atomic_store_n(&channel->shm->magic, AGNOCAST_SUB_CHANNEL_MAGIC, __ATOMIC_RELEASE);
-
-  AttachSubscriberChannelRequest req{};
-  copy_name(req.topic_name, sizeof(req.topic_name), topic_name);
-  req.subscriber_id = subscriber_id;
-  const int r =
-    daemon_call(AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL, &req, sizeof(req), nullptr, 0, memfd);
-  close(memfd);
-  if (r < 0) {
-    RCLCPP_WARN(
-      logger, "AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL failed: %s; using plain requests",
-      strerror(errno));
-    return;
-  }
-
-  std::lock_guard<std::mutex> lock(channels_mtx);
-  channels[channel_key(topic_name, subscriber_id)] = std::move(channel);
-}
-
-static void detach_subscriber_channel(const struct name_info & topic_name, int32_t subscriber_id)
-{
-  std::lock_guard<std::mutex> lock(channels_mtx);
-  channels.erase(channel_key(topic_name, subscriber_id));
-}
 
 int agnocast_ipc_get_version(struct ioctl_get_version_args * args)
 {
@@ -546,9 +746,18 @@ int agnocast_ipc_add_publisher(union ioctl_add_publisher_args * args)
   req.qos_is_transient_local = args->qos_is_transient_local;
   req.is_bridge = args->is_bridge;
   AddPublisherResponse resp{};
-  int r = daemon_call(AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp));
+  int shm_fd = -1;
+  uint32_t shm_fd_num = 0;
+  int r = daemon_call(
+    AGNOCAST_CMD_ADD_PUBLISHER, &req, sizeof(req), &resp, sizeof(resp), -1, &shm_fd, 1,
+    &shm_fd_num);
   if (r == 0) {
+    // ret_id overlaps topic_name in the union, so take the name first.
+    const struct name_info topic_name = args->topic_name;
     args->ret_id = resp.publisher_id;
+    attach_topic_segment(topic_name, resp.publisher_id, shm_fd_num > 0 ? shm_fd : -1);
+  } else if (shm_fd_num > 0) {
+    close(shm_fd);
   }
   return r;
 }
@@ -565,15 +774,20 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
   req.ignore_local_publications = args->ignore_local_publications;
   req.is_bridge = args->is_bridge;
   AddSubscriberResponse resp{};
-  // args->eventfd is the subscriber's notification eventfd; the daemon writes
-  // to it on publish, the way the kernel module signals the eventfd_ctx.
-  int r =
-    daemon_call(AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), args->eventfd);
+  // args->eventfd is the subscriber's notification eventfd; publishers write to
+  // it, the way the kernel module signals the eventfd_ctx.
+  int shm_fd = -1;
+  uint32_t shm_fd_num = 0;
+  int r = daemon_call(
+    AGNOCAST_CMD_ADD_SUBSCRIBER, &req, sizeof(req), &resp, sizeof(resp), args->eventfd, &shm_fd, 1,
+    &shm_fd_num);
   if (r == 0) {
     // ret_id overlaps topic_name in the union, so take the name first.
     const struct name_info topic_name = args->topic_name;
     args->ret_id = resp.subscriber_id;
-    attach_subscriber_channel(topic_name, resp.subscriber_id);
+    attach_topic_segment(topic_name, resp.subscriber_id, shm_fd_num > 0 ? shm_fd : -1);
+  } else if (shm_fd_num > 0) {
+    close(shm_fd);
   }
   return r;
 }
@@ -581,6 +795,16 @@ int agnocast_ipc_add_subscriber(union ioctl_add_subscriber_args * args)
 int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
 {
   AGNOCAST_BENCH_CALL_ENTER();
+
+  if (const auto segment = find_segment(args->topic_name, args->publisher_id)) {
+    LocalStamps stamps;
+    const int r = publish_local(*segment, args, stamps);
+#ifdef AGNOCAST_BENCH_TIMING
+    last_publish_notify_end_ns = stamps.notify_end;
+#endif
+    AGNOCAST_BENCH_CALL_LEAVE_LOCAL(publish, stamps);
+    return r;
+  }
 
   PublishMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
@@ -614,10 +838,12 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
   const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
 
-  if (const auto channel = find_channel(args->topic_name, args->subscriber_id)) {
-    if (take_pushed(*channel, args)) {
-      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive);
-      return 0;
+  if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
+    LocalStamps stamps;
+    const int r = receive_local(*segment, args, stamps);
+    if (r <= 0) {
+      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive, stamps);
+      return r;
     }
   }
 
@@ -656,6 +882,14 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
   const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
 
+  if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
+    LocalStamps stamps;
+    const int r = take_local(*segment, args, stamps);
+    if (r <= 0) {
+      return r;
+    }
+  }
+
   TakeMsgRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
@@ -680,8 +914,17 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
 
 int agnocast_ipc_release_sub_ref(struct ioctl_update_entry_args * args)
 {
-  if (const auto channel = find_channel(args->topic_name, args->pubsub_id)) {
-    if (queue_release(*channel, args->entry_id)) return 0;
+  if (const auto segment = find_segment(args->topic_name, args->pubsub_id)) {
+    int ret = 0;
+    {
+      TopicShmLock lock(segment->shm);
+      ret = topic_shm_release_ref(segment->shm, args->pubsub_id, args->entry_id);
+    }
+    if (ret < 0) {
+      errno = -ret;
+      return -1;
+    }
+    return 0;
   }
 
   ReleaseSubRefRequest req{};
@@ -696,7 +939,9 @@ int agnocast_ipc_remove_publisher(struct ioctl_remove_publisher_args * args)
   RemovePublisherRequest req{};
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.publisher_id = args->publisher_id;
-  return daemon_call(AGNOCAST_CMD_REMOVE_PUBLISHER, &req, sizeof(req), nullptr, 0);
+  const int r = daemon_call(AGNOCAST_CMD_REMOVE_PUBLISHER, &req, sizeof(req), nullptr, 0);
+  detach_topic_segment(args->topic_name, args->publisher_id);
+  return r;
 }
 
 int agnocast_ipc_remove_subscriber(struct ioctl_remove_subscriber_args * args)
@@ -705,7 +950,7 @@ int agnocast_ipc_remove_subscriber(struct ioctl_remove_subscriber_args * args)
   copy_name(req.topic_name, sizeof(req.topic_name), args->topic_name);
   req.subscriber_id = args->subscriber_id;
   const int r = daemon_call(AGNOCAST_CMD_REMOVE_SUBSCRIBER, &req, sizeof(req), nullptr, 0);
-  detach_subscriber_channel(args->topic_name, args->subscriber_id);
+  detach_topic_segment(args->topic_name, args->subscriber_id);
   return r;
 }
 

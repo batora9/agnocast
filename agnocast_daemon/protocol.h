@@ -107,7 +107,7 @@ typedef enum {
   AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN = 27,
   /* Daemon-only commands. They have no ioctl counterpart, so they are numbered
    * well clear of the range agnocast.h uses. */
-  AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL = 64,
+  AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS = 65,
 } CommandType;
 
 /* --------------------------------------------------------------------------
@@ -687,90 +687,34 @@ struct SetRos2PublisherNumRequest
 /* Request: no payload */
 /* Response: no payload */
 
-/* ---- AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL (64) ---- */
-/* Shares one AgnocastSubscriberChannel between a subscriber and the daemon.
- *
- * The subscriber creates a memfd of exactly sizeof(AgnocastSubscriberChannel),
- * writes the magic, seals it against shrinking and growing, and attaches it
- * with SCM_RIGHTS. The daemon maps it and keeps the mapping until the
- * subscriber is removed or its process exits. The seal is what lets the daemon
- * touch client-provided memory: without it the client could truncate the file
- * and turn the daemon's next access into SIGBUS.
- *
- * Everything in the channel is writable by the subscriber, so the daemon reads
- * only the fields the subscriber owns and never trusts their values: indices
- * are clamped and entry ids are looked up before use.
- */
-struct AttachSubscriberChannelRequest
+/* ---- Topic segment (daemon-only) ----
+ * A successful AGNOCAST_CMD_ADD_PUBLISHER or AGNOCAST_CMD_ADD_SUBSCRIBER reply
+ * carries the topic's shared segment (see topic_shm.hpp) as one SCM_RIGHTS
+ * descriptor. A client that maps it publishes, receives and releases without
+ * a round trip; one that does not keeps using the requests below, which the
+ * daemon serves from the same segment. */
+
+/* ---- AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS (65) ---- */
+/* Lets a publisher write the subscribers' eventfds itself. The reply lists the
+ * subscribers that registered one, from index offset on, and attaches their
+ * eventfds as SCM_RIGHTS descriptors in the same order; total says how many
+ * there are in all, so the caller repeats with a larger offset until it has
+ * them. sub_generation is the segment's value at the time, which the
+ * publisher compares against the segment to know when to ask again. */
+#define AGNOCAST_SUBSCRIBER_EVENTFD_BATCH 128
+
+struct GetSubscriberEventfdsRequest
 {
   char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
-  int32_t subscriber_id; /* topic_local_id_t */
-};
-/* Response: no payload */
-
-#define AGNOCAST_SUB_CHANNEL_MAGIC 0x41474348u /* "AGCH" */
-
-/* Receive results the daemon computed at publish time, so a woken subscriber
- * reads its messages here instead of sending AGNOCAST_CMD_RECEIVE_MSG.
- *
- * Under the topic lock of each publish, the daemon runs the subscriber's
- * receive (taking the references and advancing latest_received_entry_id),
- * appends the results, advances head, and then writes the eventfd. The
- * subscriber consumes slots and advances tail.
- *
- * ipc_pending sends the subscriber back to the request. The daemon sets it
- * whenever a result cannot travel in the ring (the ring or the subscriber's
- * keep-last depth is full, a new publisher's memory has to be mapped first,
- * more than AGNOCAST_PROTO_MAX_RECEIVE_NUM entries are due) and pushes nothing
- * while it is set; only a completed AGNOCAST_CMD_RECEIVE_MSG clears it. Every
- * slot is therefore older than whatever the request returns, provided the
- * subscriber loads ipc_pending before head and empties the ring before
- * sending the request. It starts set, so the first receive (and any
- * transient-local history) always goes through the request. */
-#define AGNOCAST_PUSH_RING_SLOTS 64
-
-struct AgnocastPushSlot
-{
-  int64_t entry_id;
-  uint64_t entry_addr;
+  uint32_t offset;
 };
 
-struct AgnocastPushRing
+struct GetSubscriberEventfdsResponse
 {
-  uint64_t head;        /* written by the daemon: next slot to fill */
-  uint32_t ipc_pending; /* written by the daemon */
-  uint8_t _pad0[52];
-  uint64_t tail; /* written by the subscriber: next slot to consume */
-  uint8_t _pad1[56];
-  struct AgnocastPushSlot slots[AGNOCAST_PUSH_RING_SLOTS];
-};
-
-/* Releases the subscriber has not reported yet, instead of one
- * AGNOCAST_CMD_RELEASE_SUB_REF round trip each. The subscriber appends the
- * entry id and advances head; the daemon consumes them under the topic lock
- * before anything that reads the reference bits (publish, take, publisher
- * removal, exit cleanup). Deferring a release to the next publish loses
- * nothing: a publish is the only place memory is handed back to a publisher.
- * When the ring is full the subscriber falls back to the request. */
-#define AGNOCAST_RELEASE_RING_SLOTS 256
-
-struct AgnocastReleaseRing
-{
-  uint64_t head; /* written by the subscriber: next slot to fill */
-  uint8_t _pad0[56];
-  uint64_t tail; /* written by the daemon: next slot to consume */
-  uint8_t _pad1[56];
-  int64_t entry_ids[AGNOCAST_RELEASE_RING_SLOTS];
-};
-
-/* Cross-process fields are accessed only through __atomic builtins, so the
- * layout stays plain C and both sides agree on it. */
-struct AgnocastSubscriberChannel
-{
-  uint32_t magic; /* AGNOCAST_SUB_CHANNEL_MAGIC, written by the subscriber */
-  uint32_t _pad[15];
-  struct AgnocastPushRing push;
-  struct AgnocastReleaseRing release;
+  uint64_t sub_generation;
+  uint32_t total;
+  uint32_t num;
+  int32_t subscriber_ids[AGNOCAST_SUBSCRIBER_EVENTFD_BATCH];
 };
 
 /* --------------------------------------------------------------------------

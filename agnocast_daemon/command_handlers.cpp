@@ -127,64 +127,6 @@ void unlink_posix_resources_for_exit(
   }
 }
 
-EntryNode * find_message_entry(TopicStruct & topic, int64_t entry_id)
-{
-  auto it = topic.entries.find(entry_id);
-  return (it != topic.entries.end()) ? &it->second : nullptr;
-}
-
-bool is_referenced(const EntryNode & en)
-{
-  return en.referencing_subscribers.any();
-}
-
-int add_subscriber_reference(EntryNode & en, int32_t id)
-{
-  if (id < 0 || id >= static_cast<int32_t>(AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID)) {
-    return -EINVAL;
-  }
-  if (en.referencing_subscribers.test_and_set(static_cast<size_t>(id))) {
-    return -EALREADY;
-  }
-  return 0;
-}
-
-// Applies the releases a subscriber has queued in its channel's release ring.
-// The caller holds the topic lock (shared is enough: the reference bits are
-// atomic and the entries map is not modified); the channel mutex keeps two
-// shared holders from consuming the same slots.
-void drain_release_ring(TopicWrapper * wrapper, SubscriberInfo & sub)
-{
-  SubscriberChannel * channel = sub.channel.get();
-  if (channel == nullptr) return;
-
-  std::lock_guard<std::mutex> lock(channel->mtx);
-  AgnocastReleaseRing & ring = channel->shm->release;
-  const uint64_t head = __atomic_load_n(&ring.head, __ATOMIC_ACQUIRE);
-  uint64_t tail = channel->release_tail;
-  if (head - tail > AGNOCAST_RELEASE_RING_SLOTS) {
-    // head is the subscriber's to write; one behind tail or more than a ring
-    // ahead is not something a well-behaved subscriber produces.
-    tail = head;
-  }
-  for (; tail != head; ++tail) {
-    const int64_t entry_id =
-      __atomic_load_n(&ring.entry_ids[tail % AGNOCAST_RELEASE_RING_SLOTS], __ATOMIC_RELAXED);
-    EntryNode * en = find_message_entry(wrapper->topic, entry_id);
-    if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
-  }
-  channel->release_tail = tail;
-  __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
-}
-
-void drain_release_rings(TopicWrapper * wrapper)
-{
-  for (auto & [id, sub] : wrapper->topic.sub_info_map) {
-    (void)id;
-    drain_release_ring(wrapper, sub);
-  }
-}
-
 int insert_subscriber_info(
   TopicWrapper * wrapper, const char * node_name, pid_t subscriber_pid, uint32_t qos_depth,
   bool qos_is_transient_local, bool qos_is_reliable, bool is_take_sub,
@@ -205,16 +147,19 @@ int insert_subscriber_info(
   info.qos_depth = qos_depth;
   info.qos_is_transient_local = qos_is_transient_local;
   info.qos_is_reliable = qos_is_reliable;
-  info.latest_received_entry_id =
-    qos_is_transient_local ? -1 : static_cast<int64_t>(wrapper->topic.current_entry_id++);
   info.node_name = node_name;
   info.is_take_sub = is_take_sub;
   info.ignore_local_publications = ignore_local_publications;
-  info.need_mmap_update = true;
   info.is_bridge = is_bridge;
 
   auto [it, inserted] = wrapper->topic.sub_info_map.emplace(new_id, std::move(info));
   if (!inserted) return -ENOMEM;
+  {
+    TopicShmLock lock(wrapper->shm);
+    topic_shm_add_subscriber(
+      wrapper->shm, new_id, subscriber_pid, qos_depth, qos_is_transient_local, is_take_sub,
+      ignore_local_publications);
+  }
   *out = &it->second;
   return 0;
 }
@@ -238,11 +183,14 @@ int insert_publisher_info(
   info.node_name = node_name;
   info.qos_depth = qos_depth;
   info.qos_is_transient_local = qos_is_transient_local;
-  info.entries_num = 0;
   info.is_bridge = is_bridge;
 
   auto [it, inserted] = wrapper->topic.pub_info_map.emplace(new_id, std::move(info));
   if (!inserted) return -ENOMEM;
+  {
+    TopicShmLock lock(wrapper->shm);
+    topic_shm_add_publisher(wrapper->shm, new_id, publisher_pid, qos_depth, qos_is_transient_local);
+  }
   *out = &it->second;
   return 0;
 }
@@ -277,165 +225,46 @@ int set_publisher_shm_info(
   return 0;
 }
 
-int release_msgs_to_meet_depth(
-  TopicWrapper * wrapper, PublisherInfo * pub_info, PublishMsgResponse * resp)
-{
-  resp->released_num = 0;
-  if (pub_info->entries_num <= pub_info->qos_depth) return 0;
-
-  uint32_t num_search_entries = pub_info->entries_num - pub_info->qos_depth;
-  auto it = wrapper->topic.entries.begin();
-
-  while (num_search_entries > 0 && resp->released_num < AGNOCAST_PROTO_MAX_RELEASE_NUM) {
-    if (it == wrapper->topic.entries.end()) return -ENODATA;
-
-    EntryNode & en = it->second;
-    const int64_t entry_id = en.entry_id;
-    ++it;
-
-    if (en.publisher_id != pub_info->id) continue;
-    num_search_entries--;
-
-    if (is_referenced(en)) continue;
-
-    resp->released_addrs[resp->released_num++] = en.msg_virtual_address;
-    wrapper->topic.entries.erase(entry_id);
-    pub_info->entries_num--;
-  }
-  return 0;
-}
-
-int receive_msg_core(
-  TopicWrapper * wrapper, SubscriberInfo * sub_info, int32_t subscriber_id,
-  ReceiveMsgResponse * resp, MetadataStore & store)
-{
-  resp->entry_num = 0;
-  resp->call_again = false;
-
-  if (wrapper->topic.entries.empty()) return 0;
-
-  const int64_t newest_entry_id = wrapper->topic.entries.rbegin()->first;
-  const int64_t latest_received_entry_id = sub_info->latest_received_entry_id;
-  const int64_t qos_start = newest_entry_id - static_cast<int64_t>(sub_info->qos_depth) + 1;
-  const int64_t start_entry_id =
-    (qos_start > latest_received_entry_id) ? qos_start : (latest_received_entry_id + 1);
-
-  auto it = wrapper->topic.entries.lower_bound(start_entry_id);
-  for (; it != wrapper->topic.entries.end(); ++it) {
-    EntryNode & en = it->second;
-
-    if (resp->entry_num == AGNOCAST_PROTO_MAX_RECEIVE_NUM) {
-      resp->call_again = true;
-      break;
-    }
-
-    PublisherInfo * pub_info = find_publisher_info(wrapper, en.publisher_id);
-    if (!pub_info) return -ENODATA;
-
-    ProcessInfo * proc_info = store.find_process(pub_info->pid);
-    if (!proc_info || proc_info->exited) continue;
-
-    if (sub_info->ignore_local_publications && (sub_info->pid == pub_info->pid)) {
-      continue;
-    }
-
-    const int ret = add_subscriber_reference(en, subscriber_id);
-    if (ret < 0) return ret;
-
-    resp->entry_ids[resp->entry_num] = en.entry_id;
-    resp->entry_addrs[resp->entry_num] = en.msg_virtual_address;
-    resp->entry_num++;
-  }
-
-  if (resp->entry_num > 0) {
-    sub_info->latest_received_entry_id = resp->entry_ids[resp->entry_num - 1];
-  }
-  return 0;
-}
-
-// Caller holds channel.mtx.
-void set_ipc_pending(SubscriberChannel & channel, bool pending)
-{
-  channel.ipc_pending = pending;
-  __atomic_store_n(&channel.shm->push.ipc_pending, pending ? 1U : 0U, __ATOMIC_RELEASE);
-}
-
-// Runs the subscriber's receive at publish time and leaves the result in its
-// channel's push ring (see AgnocastPushRing). The caller holds the topic lock
-// exclusively and writes the subscriber's eventfd afterwards.
-void push_receive(TopicWrapper * wrapper, SubscriberInfo & sub, MetadataStore & store)
-{
-  SubscriberChannel * channel = sub.channel.get();
-  if (channel == nullptr) return;
-
-  std::lock_guard<std::mutex> lock(channel->mtx);
-  if (channel->ipc_pending) return;
-  if (sub.need_mmap_update) {
-    // Publisher shm infos travel only in a receive reply.
-    set_ipc_pending(*channel, true);
-    return;
-  }
-
-  AgnocastPushRing & ring = channel->shm->push;
-  const uint64_t tail = __atomic_load_n(&ring.tail, __ATOMIC_ACQUIRE);
-  const uint64_t unread = channel->push_head - tail;
-  // An implausible tail (the subscriber can write it) lands here as well. The
-  // depth check keeps a stalled subscriber from pinning more pushed entries
-  // than its keep-last depth; the request path then applies keep-last itself.
-  if (
-    unread > AGNOCAST_PUSH_RING_SLOTS || unread >= sub.qos_depth ||
-    AGNOCAST_PUSH_RING_SLOTS - unread < AGNOCAST_PROTO_MAX_RECEIVE_NUM) {
-    set_ipc_pending(*channel, true);
-    return;
-  }
-
-  thread_local ReceiveMsgResponse resp;
-  if (receive_msg_core(wrapper, &sub, sub.id, &resp, store) < 0) {
-    // Nothing was delivered, so give back the references it did take.
-    for (uint16_t i = 0; i < resp.entry_num; i++) {
-      EntryNode * en = find_message_entry(wrapper->topic, resp.entry_ids[i]);
-      if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
-    }
-    set_ipc_pending(*channel, true);
-    return;
-  }
-
-  uint64_t head = channel->push_head;
-  for (uint16_t i = 0; i < resp.entry_num; i++, head++) {
-    AgnocastPushSlot & slot = ring.slots[head % AGNOCAST_PUSH_RING_SLOTS];
-    __atomic_store_n(&slot.entry_id, resp.entry_ids[i], __ATOMIC_RELAXED);
-    __atomic_store_n(&slot.entry_addr, resp.entry_addrs[i], __ATOMIC_RELAXED);
-  }
-  channel->push_head = head;
-  __atomic_store_n(&ring.head, head, __ATOMIC_RELEASE);
-  if (resp.call_again) set_ipc_pending(*channel, true);
-}
-
+// Caller holds the topic lock exclusively.
 void cleanup_unreferenced_entries_from_exited_publishers(
-  TopicWrapper * wrapper, int32_t subscriber_id, MetadataStore & store)
+  TopicWrapper * wrapper, int32_t subscriber_id)
 {
-  std::vector<int64_t> to_remove;
-  for (auto & [entry_id, en] : wrapper->topic.entries) {
-    (void)entry_id;
-    en.referencing_subscribers.test_and_clear(static_cast<size_t>(subscriber_id));
+  thread_local std::vector<int32_t> emptied(kTopicShmIdNum);
+  uint32_t emptied_num = 0;
+  {
+    TopicShmLock lock(wrapper->shm);
+    emptied_num = topic_shm_cleanup_after_subscriber(wrapper->shm, subscriber_id, emptied.data());
+  }
+  for (uint32_t i = 0; i < emptied_num; i++) {
+    wrapper->topic.pub_info_map.erase(emptied[i]);
+  }
+}
 
-    if (is_referenced(en)) continue;
+// Caller holds the topic lock exclusively.
+void remove_subscriber_info(TopicWrapper * wrapper, int32_t subscriber_id)
+{
+  {
+    TopicShmLock lock(wrapper->shm);
+    topic_shm_clear_id(wrapper->shm, subscriber_id);
+  }
+  wrapper->topic.sub_info_map.erase(subscriber_id);
+  cleanup_unreferenced_entries_from_exited_publishers(wrapper, subscriber_id);
+}
 
-    PublisherInfo * pub_info = find_publisher_info(wrapper, en.publisher_id);
-    if (!pub_info) continue;
-
-    ProcessInfo * proc_info = store.find_process(pub_info->pid);
-    if (proc_info && !proc_info->exited) continue;
-
-    to_remove.push_back(en.entry_id);
-    pub_info->entries_num--;
-    if (pub_info->entries_num == 0) {
-      wrapper->topic.pub_info_map.erase(pub_info->id);
+// Drops the publisher's unreferenced entries, and the publisher itself once it
+// has none. Caller holds the topic lock exclusively.
+void remove_publisher_entries(TopicWrapper * wrapper, int32_t publisher_id, bool exited)
+{
+  bool emptied = false;
+  {
+    TopicShmLock lock(wrapper->shm);
+    if (exited) wrapper->shm->ids[publisher_id].exited = 1;
+    if (topic_shm_remove_unreferenced_of(wrapper->shm, publisher_id) == 0) {
+      topic_shm_clear_id(wrapper->shm, publisher_id);
+      emptied = true;
     }
   }
-  for (int64_t eid : to_remove) {
-    wrapper->topic.entries.erase(eid);
-  }
+  if (emptied) wrapper->topic.pub_info_map.erase(publisher_id);
 }
 
 void try_remove_empty_topic(MetadataStore & store, const TopicKey & key)
@@ -444,7 +273,6 @@ void try_remove_empty_topic(MetadataStore & store, const TopicKey & key)
   if (it == store.topic_map_.end()) return;
   TopicWrapper * wrapper = it->second.get();
   if (!wrapper->topic.pub_info_map.empty() || !wrapper->topic.sub_info_map.empty()) return;
-  wrapper->topic.entries.clear();
   store.topic_map_.erase(it);
 }
 
@@ -505,7 +333,8 @@ void CommandHandlers::send_response(int fd, int32_t error_code)
 }
 
 void CommandHandlers::send_response(
-  int fd, int32_t error_code, const void * payload, uint32_t payload_size)
+  int fd, int32_t error_code, const void * payload, uint32_t payload_size, const int * send_fds,
+  uint32_t send_fd_num)
 {
   ResponseHeader hdr{error_code, payload_size};
   iovec iov[3];
@@ -522,6 +351,20 @@ void CommandHandlers::send_response(
   msghdr msg{};
   msg.msg_iov = iov;
   msg.msg_iovlen = static_cast<size_t>(n_iov);
+  union {
+    cmsghdr align;
+    char bytes[CMSG_SPACE(sizeof(int) * AGNOCAST_SUBSCRIBER_EVENTFD_BATCH)];
+  } cmsg_buf{};
+  if (send_fds != nullptr && send_fd_num > 0) {
+    send_fd_num = std::min<uint32_t>(send_fd_num, AGNOCAST_SUBSCRIBER_EVENTFD_BATCH);
+    msg.msg_control = cmsg_buf.bytes;
+    msg.msg_controllen = CMSG_SPACE(sizeof(int) * send_fd_num);
+    cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * send_fd_num);
+    std::memcpy(CMSG_DATA(cmsg), send_fds, sizeof(int) * send_fd_num);
+  }
   if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) {
     std::fprintf(
       stderr, "agnocast_daemon: send_response failed: %s (payload_size=%u)\n", std::strerror(errno),
@@ -532,11 +375,9 @@ void CommandHandlers::send_response(
 void CommandHandlers::dispatch(
   int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd)
 {
-  // Only these two commands have a use for an attached descriptor. Close
-  // anything that arrives on another command rather than letting it accumulate.
-  if (
-    recv_fd >= 0 && hdr.command != AGNOCAST_CMD_ADD_SUBSCRIBER &&
-    hdr.command != AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL) {
+  // Only ADD_SUBSCRIBER has a use for an attached descriptor. Close anything
+  // that arrives on another command rather than letting it accumulate.
+  if (recv_fd >= 0 && hdr.command != AGNOCAST_CMD_ADD_SUBSCRIBER) {
     close(recv_fd);
     recv_fd = -1;
   }
@@ -620,8 +461,8 @@ void CommandHandlers::dispatch(
     case AGNOCAST_CMD_NOTIFY_BRIDGE_SHUTDOWN:
       handle_notify_bridge_shutdown(client_fd, client_pid);
       break;
-    case AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL:
-      handle_attach_subscriber_channel(client_fd, client_pid, payload, recv_fd);
+    case AGNOCAST_CMD_GET_SUBSCRIBER_EVENTFDS:
+      handle_get_subscriber_eventfds(client_fd, client_pid, payload);
       break;
     default:
       send_response(client_fd, EINVAL);
@@ -692,6 +533,11 @@ void CommandHandlers::handle_add_subscriber(
 
   std::unique_lock glock(store_.global_mutex_);
   TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
+  if (!wrapper) {
+    if (notify_eventfd >= 0) close(notify_eventfd);
+    send_response(fd, ENOMEM);
+    return;
+  }
 
   SubscriberInfo * sub_info = nullptr;
   const int ret = insert_subscriber_info(
@@ -711,7 +557,7 @@ void CommandHandlers::handle_add_subscriber(
   resp.subscriber_id = sub_info->id;
   strncpy(
     resp.mq_topic_name, notify_mq_topic_name(wrapper), AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
-  send_response(fd, 0, &resp, sizeof(resp));
+  send_response(fd, 0, &resp, sizeof(resp), &wrapper->shm_fd, 1);
 }
 
 void CommandHandlers::handle_add_publisher(int fd, pid_t pid, const void * payload)
@@ -724,6 +570,10 @@ void CommandHandlers::handle_add_publisher(int fd, pid_t pid, const void * paylo
 
   std::unique_lock glock(store_.global_mutex_);
   TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
+  if (!wrapper) {
+    send_response(fd, ENOMEM);
+    return;
+  }
 
   PublisherInfo * pub_info = nullptr;
   const int ret = insert_publisher_info(
@@ -734,16 +584,11 @@ void CommandHandlers::handle_add_publisher(int fd, pid_t pid, const void * paylo
     return;
   }
 
-  for (auto & [id, sub] : wrapper->topic.sub_info_map) {
-    (void)id;
-    sub.need_mmap_update = true;
-  }
-
   AddPublisherResponse resp{};
   resp.publisher_id = pub_info->id;
   strncpy(
     resp.mq_topic_name, notify_mq_topic_name(wrapper), AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE - 1);
-  send_response(fd, 0, &resp, sizeof(resp));
+  send_response(fd, 0, &resp, sizeof(resp), &wrapper->shm_fd, 1);
 }
 
 void CommandHandlers::handle_release_sub_ref(int fd, pid_t pid, const void * payload)
@@ -762,25 +607,12 @@ void CommandHandlers::handle_release_sub_ref(int fd, pid_t pid, const void * pay
   }
 
   std::shared_lock tlock(wrapper->topic_rwsem);
-  EntryNode * en = find_message_entry(wrapper->topic, req->entry_id);
-  if (!en) {
-    send_response(fd, EINVAL);
-    return;
+  int ret = 0;
+  {
+    TopicShmLock lock(wrapper->shm);
+    ret = topic_shm_release_ref(wrapper->shm, req->pubsub_id, req->entry_id);
   }
-
-  if (
-    req->pubsub_id < 0 ||
-    req->pubsub_id >= static_cast<int32_t>(AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID)) {
-    send_response(fd, EINVAL);
-    return;
-  }
-
-  if (!en->referencing_subscribers.test_and_clear(static_cast<size_t>(req->pubsub_id))) {
-    send_response(fd, EINVAL);
-    return;
-  }
-
-  send_response(fd, 0);
+  send_response(fd, -ret);
 }
 
 void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload)
@@ -798,7 +630,7 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
     return;
   }
 
-  std::unique_lock tlock(wrapper->topic_rwsem);
+  std::shared_lock tlock(wrapper->topic_rwsem);
   AGNOCAST_DAEMON_BENCH_STAMP_WORK();
 
   PublisherInfo * pub_info = find_publisher_info(wrapper, req->publisher_id);
@@ -821,49 +653,28 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
   }
 
   PublishMsgResponse resp{};
-  const int64_t entry_id = wrapper->topic.current_entry_id++;
-  auto [it, inserted] = wrapper->topic.entries.try_emplace(entry_id);
-  if (!inserted) {
-    send_response(fd, EEXIST);
-    return;
+  int ret = 0;
+  {
+    TopicShmLock lock(wrapper->shm);
+    ret = topic_shm_publish(
+      wrapper->shm, req->publisher_id, req->msg_virtual_address, &resp.entry_id,
+      resp.released_addrs, &resp.released_num, resp.subscriber_ids, &resp.subscriber_num);
   }
-  it->second.entry_id = entry_id;
-  it->second.publisher_id = pub_info->id;
-  it->second.msg_virtual_address = req->msg_virtual_address;
-  resp.entry_id = entry_id;
-  pub_info->entries_num++;
-
-  drain_release_rings(wrapper);
-  int ret = release_msgs_to_meet_depth(wrapper, pub_info, &resp);
   if (ret < 0) {
     send_response(fd, -ret);
     return;
   }
 
-  uint32_t subscriber_num = 0;
   t_notify_fds.clear();
-  for (auto & [id, sub] : wrapper->topic.sub_info_map) {
-    (void)id;
-    if (sub.is_take_sub) continue;
-    if (sub.ignore_local_publications && (sub.pid == pub_info->pid)) continue;
-    resp.subscriber_ids[subscriber_num++] = sub.id;
-    push_receive(wrapper, sub, store_);
-    // A subscriber registered before the eventfd handshake has no descriptor;
-    // it polls instead of being woken, so there is nothing to signal.
-    if (sub.notify_eventfd >= 0) t_notify_fds.push_back(sub.notify_eventfd);
+  for (uint32_t i = 0; i < resp.subscriber_num; i++) {
+    const SubscriberInfo * sub = find_subscriber_info(wrapper, resp.subscriber_ids[i]);
+    // A subscriber registered without an eventfd polls instead of being woken.
+    if (sub != nullptr && sub->notify_eventfd >= 0) t_notify_fds.push_back(sub->notify_eventfd);
   }
-  resp.subscriber_num = subscriber_num;
 
-  // The entry is committed, so a woken subscriber will find it. Drop the topic
-  // lock first so concurrent publishers on this topic are not blocked by the
-  // notification.
-  //
-  // glock stays held, as a shared lock, for the whole notify: the descriptors
-  // in t_notify_fds are owned by SubscriberInfo, and the two paths that close
-  // them (handle_remove_subscriber, process_exit_cleanup) both take
-  // global_mutex_ exclusively. Holding it shared keeps them out until the last
-  // write(2) lands, without blocking any other publisher or receiver, all of
-  // which take it shared too.
+  // The descriptors are owned by SubscriberInfo, and the two paths that close
+  // them (handle_remove_subscriber, process_exit_cleanup) take global_mutex_
+  // exclusively, so the shared glock keeps them open until the last write(2).
   tlock.unlock();
 
   AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_BEGIN();
@@ -898,13 +709,19 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
   }
 
   ReceiveMsgResponse resp{};
-  int ret = receive_msg_core(wrapper, sub_info, req->subscriber_id, &resp, store_);
+  // Publishers are added only under global_mutex_ held exclusively, so
+  // need_mmap_update cannot be set again between the receive and the mapping.
+  TopicShmLock lock(wrapper->shm);
+  int ret = topic_shm_receive(
+    wrapper->shm, req->subscriber_id, true, resp.entry_ids, resp.entry_addrs, &resp.entry_num,
+    &resp.call_again);
   if (ret < 0) {
     send_response(fd, -ret);
     return;
   }
 
-  if (!sub_info->need_mmap_update) {
+  TopicShmId & sub_shm = wrapper->shm->ids[req->subscriber_id];
+  if (!sub_shm.need_mmap_update) {
     resp.pub_shm_num = 0;
   } else {
     ret = set_publisher_shm_info(
@@ -914,14 +731,7 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
       send_response(fd, -ret);
       return;
     }
-    sub_info->need_mmap_update = false;
-  }
-
-  // Pushing resumes once this reply has caught the subscriber up. With
-  // call_again set, the rest still has to come through the request.
-  if (sub_info->channel && !resp.call_again) {
-    std::lock_guard<std::mutex> lock(sub_info->channel->mtx);
-    set_ipc_pending(*sub_info->channel, false);
+    sub_shm.need_mmap_update = 0;
   }
   send_response(fd, 0, &resp, sizeof(resp));
 }
@@ -947,74 +757,30 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
     send_response(fd, EINVAL);
     return;
   }
-  // A queued release of the message about to be taken again must land first,
-  // or allow_same_message would see the stale bit, skip re-referencing, and the
-  // late release would then drop the reference the caller now holds.
-  drain_release_ring(wrapper, *sub_info);
-
   TakeMsgResponse resp{};
-  resp.addr = 0;
-  resp.entry_id = -1;
-
-  uint32_t searched_count = 0;
-  EntryNode * candidate_en = nullptr;
-
-  for (auto rit = wrapper->topic.entries.rbegin(); rit != wrapper->topic.entries.rend(); ++rit) {
-    EntryNode & en = rit->second;
-    if (searched_count >= sub_info->qos_depth) break;
-
-    if (!req->allow_same_message && en.entry_id == sub_info->latest_received_entry_id) {
-      break;
-    }
-    if (en.entry_id < sub_info->latest_received_entry_id) break;
-
-    PublisherInfo * pub_info = find_publisher_info(wrapper, en.publisher_id);
-    if (!pub_info) {
-      send_response(fd, ENODATA);
-      return;
-    }
-
-    ProcessInfo * proc_info = store_.find_process(pub_info->pid);
-    if (!proc_info || proc_info->exited) continue;
-
-    if (sub_info->ignore_local_publications && (sub_info->pid == pub_info->pid)) continue;
-
-    candidate_en = &en;
-    searched_count++;
+  TopicShmLock lock(wrapper->shm);
+  const int ret = topic_shm_take(
+    wrapper->shm, req->subscriber_id, req->allow_same_message, &resp.addr, &resp.entry_id);
+  if (ret < 0) {
+    send_response(fd, -ret);
+    return;
   }
 
-  if (candidate_en) {
-    bool already_referenced = false;
-    if (req->allow_same_message) {
-      already_referenced =
-        candidate_en->referencing_subscribers.test(static_cast<size_t>(req->subscriber_id));
-    }
-    if (!already_referenced) {
-      const int ret = add_subscriber_reference(*candidate_en, req->subscriber_id);
-      if (ret < 0) {
-        send_response(fd, -ret);
-        return;
-      }
-    }
-    resp.addr = candidate_en->msg_virtual_address;
-    resp.entry_id = candidate_en->entry_id;
-    sub_info->latest_received_entry_id = resp.entry_id;
-  }
-
-  if (!sub_info->need_mmap_update) {
+  TopicShmId & sub_shm = wrapper->shm->ids[req->subscriber_id];
+  if (!sub_shm.need_mmap_update) {
     resp.pub_shm_num = 0;
     send_response(fd, 0, &resp, sizeof(resp));
     return;
   }
 
-  const int ret = set_publisher_shm_info(
+  const int mret = set_publisher_shm_info(
     wrapper, sub_info->pid, allocator_, resp.pub_shm_infos, AGNOCAST_PROTO_MAX_PUBLISHER_NUM,
     &resp.pub_shm_num, store_);
-  if (ret < 0) {
-    send_response(fd, -ret);
+  if (mret < 0) {
+    send_response(fd, -mret);
     return;
   }
-  sub_info->need_mmap_update = false;
+  sub_shm.need_mmap_update = 0;
   send_response(fd, 0, &resp, sizeof(resp));
 }
 
@@ -1302,11 +1068,7 @@ void CommandHandlers::handle_remove_subscriber(int fd, pid_t pid, const void * p
   }
 
   if (sub_info->notify_eventfd >= 0) close(sub_info->notify_eventfd);
-  // The cleanup below frees entries no one references, so the other
-  // subscribers' queued releases have to be in the bits first.
-  drain_release_rings(wrapper);
-  wrapper->topic.sub_info_map.erase(req->subscriber_id);
-  cleanup_unreferenced_entries_from_exited_publishers(wrapper, req->subscriber_id, store_);
+  remove_subscriber_info(wrapper, req->subscriber_id);
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
   send_response(fd, 0);
 }
@@ -1333,22 +1095,8 @@ void CommandHandlers::handle_remove_publisher(int fd, pid_t pid, const void * pa
     return;
   }
 
-  drain_release_rings(wrapper);
-  std::vector<int64_t> to_remove;
-  for (auto & [entry_id, en] : wrapper->topic.entries) {
-    if (en.publisher_id != req->publisher_id) continue;
-    if (!is_referenced(en)) {
-      to_remove.push_back(entry_id);
-    }
-  }
-  for (int64_t eid : to_remove) {
-    wrapper->topic.entries.erase(eid);
-    pub_info->entries_num--;
-  }
-
-  if (pub_info->entries_num == 0) {
-    wrapper->topic.pub_info_map.erase(req->publisher_id);
-  }
+  (void)pub_info;
+  remove_publisher_entries(wrapper, req->publisher_id, false);
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
   send_response(fd, 0);
 }
@@ -1589,50 +1337,13 @@ void CommandHandlers::handle_notify_bridge_shutdown(int fd, pid_t pid)
   send_response(fd, 0);
 }
 
-void CommandHandlers::handle_attach_subscriber_channel(
-  int fd, pid_t pid, const void * payload, int channel_fd)
+void CommandHandlers::handle_get_subscriber_eventfds(int fd, pid_t pid, const void * payload)
 {
-  // Owns channel_fd on every path: the mapping, once made, does not need it.
-  struct FdCloser
-  {
-    int fd;
-    ~FdCloser()
-    {
-      if (fd >= 0) close(fd);
-    }
-  } closer{channel_fd};
-
-  if (!payload || channel_fd < 0) {
+  if (!payload) {
     send_response(fd, EINVAL);
     return;
   }
-  const auto * req = static_cast<const AttachSubscriberChannelRequest *>(payload);
-
-  constexpr size_t kChannelSize = sizeof(AgnocastSubscriberChannel);
-  struct stat st
-  {
-  };
-  if (fstat(channel_fd, &st) < 0 || st.st_size != static_cast<off_t>(kChannelSize)) {
-    send_response(fd, EINVAL);
-    return;
-  }
-  const int seals = fcntl(channel_fd, F_GET_SEALS);
-  if (seals < 0 || (seals & F_SEAL_SHRINK) == 0) {
-    send_response(fd, EPERM);
-    return;
-  }
-
-  void * mapped = mmap(nullptr, kChannelSize, PROT_READ | PROT_WRITE, MAP_SHARED, channel_fd, 0);
-  if (mapped == MAP_FAILED) {
-    send_response(fd, errno);
-    return;
-  }
-  auto channel =
-    std::make_unique<SubscriberChannel>(static_cast<AgnocastSubscriberChannel *>(mapped));
-  if (__atomic_load_n(&channel->shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_SUB_CHANNEL_MAGIC) {
-    send_response(fd, EINVAL);
-    return;
-  }
+  const auto * req = static_cast<const GetSubscriberEventfdsRequest *>(payload);
 
   std::shared_lock glock(store_.global_mutex_);
   TopicWrapper * wrapper = store_.find_topic_for_process(pid, req->topic_name);
@@ -1641,27 +1352,25 @@ void CommandHandlers::handle_attach_subscriber_channel(
     return;
   }
 
-  std::unique_lock tlock(wrapper->topic_rwsem);
-  SubscriberInfo * sub_info = find_subscriber_info(wrapper, req->subscriber_id);
-  if (!sub_info) {
-    send_response(fd, ENODATA);
-    return;
-  }
-  if (sub_info->pid != pid) {
-    send_response(fd, EPERM);
-    return;
-  }
-  if (sub_info->channel) {
-    send_response(fd, EEXIST);
-    return;
-  }
+  // Subscribers change only under the topic lock held exclusively, so the
+  // generation read here matches the set listed.
+  std::shared_lock tlock(wrapper->topic_rwsem);
+  GetSubscriberEventfdsResponse resp{};
+  resp.sub_generation = __atomic_load_n(&wrapper->shm->sub_generation, __ATOMIC_ACQUIRE);
 
-  sub_info->channel = std::move(channel);
-  {
-    std::lock_guard<std::mutex> channel_lock(sub_info->channel->mtx);
-    set_ipc_pending(*sub_info->channel, true);
+  int fds[AGNOCAST_SUBSCRIBER_EVENTFD_BATCH];
+  uint32_t index = 0;
+  for (const auto & [id, sub] : wrapper->topic.sub_info_map) {
+    if (sub.notify_eventfd < 0) continue;
+    if (index >= req->offset && resp.num < AGNOCAST_SUBSCRIBER_EVENTFD_BATCH) {
+      resp.subscriber_ids[resp.num] = id;
+      fds[resp.num] = sub.notify_eventfd;
+      resp.num++;
+    }
+    index++;
   }
-  send_response(fd, 0);
+  resp.total = index;
+  send_response(fd, 0, &resp, sizeof(resp), fds, resp.num);
 }
 
 void CommandHandlers::process_exit_cleanup(pid_t pid)
@@ -1682,26 +1391,14 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
     for (auto & [key, wrapper_ptr] : store_.topic_map_) {
       TopicWrapper * wrapper = wrapper_ptr.get();
       std::unique_lock tlock(wrapper->topic_rwsem);
-      drain_release_rings(wrapper);
 
       // Publisher exit cleanup
-      std::vector<int32_t> pubs_to_remove;
-      for (auto & [pub_id, pub_info] : wrapper->topic.pub_info_map) {
-        if (pub_info.pid != pid) continue;
-
-        std::vector<int64_t> entries_to_remove;
-        for (auto & [entry_id, en] : wrapper->topic.entries) {
-          if (en.publisher_id != pub_id) continue;
-          if (!is_referenced(en)) entries_to_remove.push_back(entry_id);
-        }
-        for (int64_t eid : entries_to_remove) {
-          wrapper->topic.entries.erase(eid);
-          pub_info.entries_num--;
-        }
-        if (pub_info.entries_num == 0) pubs_to_remove.push_back(pub_id);
+      std::vector<int32_t> pubs_of_pid;
+      for (const auto & [pub_id, pub_info] : wrapper->topic.pub_info_map) {
+        if (pub_info.pid == pid) pubs_of_pid.push_back(pub_id);
       }
-      for (int32_t pub_id : pubs_to_remove) {
-        wrapper->topic.pub_info_map.erase(pub_id);
+      for (int32_t pub_id : pubs_of_pid) {
+        remove_publisher_entries(wrapper, pub_id, true);
       }
 
       // Subscriber exit cleanup
@@ -1724,12 +1421,10 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
             dying != nullptr && dying->notify_eventfd >= 0) {
           close(dying->notify_eventfd);
         }
-        wrapper->topic.sub_info_map.erase(sub_id);
-        cleanup_unreferenced_entries_from_exited_publishers(wrapper, sub_id, store_);
+        remove_subscriber_info(wrapper, sub_id);
       }
 
       if (wrapper->topic.pub_info_map.empty() && wrapper->topic.sub_info_map.empty()) {
-        wrapper->topic.entries.clear();
         topics_to_remove.push_back(key);
       }
     }

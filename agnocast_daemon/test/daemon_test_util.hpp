@@ -242,7 +242,7 @@ public:
   {
     auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return 0;
-    return static_cast<int>(it->second->topic.entries.size());
+    return static_cast<int>(it->second->shm->entry_num);
   }
 
   bool topic_exists(const char * topic) const
@@ -268,18 +268,23 @@ public:
   {
     auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return -2;
-    auto sit = it->second->topic.sub_info_map.find(sub_id);
-    if (sit == it->second->topic.sub_info_map.end()) return -2;
-    return sit->second.latest_received_entry_id;
+    if (it->second->topic.sub_info_map.count(sub_id) == 0) return -2;
+    return it->second->shm->ids[sub_id].latest_received_entry_id;
   }
 
   int entry_rc(const char * topic, int64_t entry_id, int32_t sub_id) const
   {
     auto it = store_.topic_map_.find(topic_key(topic));
     if (it == store_.topic_map_.end()) return -1;
-    auto eit = it->second->topic.entries.find(entry_id);
-    if (eit == it->second->topic.entries.end()) return -1;
-    return eit->second.referencing_subscribers.test(static_cast<size_t>(sub_id)) ? 1 : 0;
+    const TopicShmEntry * en = topic_shm_find_entry(it->second->shm, entry_id);
+    if (en == nullptr) return -1;
+    return topic_shm_test_ref(*en, sub_id) ? 1 : 0;
+  }
+
+  AgnocastTopicShm * topic_shm(const char * topic) const
+  {
+    auto it = store_.topic_map_.find(topic_key(topic));
+    return (it != store_.topic_map_.end()) ? it->second->shm : nullptr;
   }
 
   int alive_proc_num() const

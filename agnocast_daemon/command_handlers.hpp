@@ -14,9 +14,8 @@ public:
   CommandHandlers(MetadataStore & store, MemoryAllocator & allocator);
 
   // recv_fd is the descriptor the client attached with SCM_RIGHTS, or -1. Only
-  // AGNOCAST_CMD_ADD_SUBSCRIBER (the subscriber's notification eventfd) and
-  // AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL (the channel memfd) send one;
-  // dispatch closes it for every other command so a client cannot leak
+  // AGNOCAST_CMD_ADD_SUBSCRIBER (the subscriber's notification eventfd) sends
+  // one; dispatch closes it for every other command so a client cannot leak
   // descriptors into the daemon.
   void dispatch(
     int client_fd, pid_t client_pid, const RequestHeader & hdr, const void * payload, int recv_fd);
@@ -29,8 +28,10 @@ private:
   MemoryAllocator & allocator_;
 
   static void send_response(int fd, int32_t error_code);
+  // send_fds/send_fd_num are attached with SCM_RIGHTS; the daemon keeps its own copies.
   static void send_response(
-    int fd, int32_t error_code, const void * payload, uint32_t payload_size);
+    int fd, int32_t error_code, const void * payload, uint32_t payload_size,
+    const int * send_fds = nullptr, uint32_t send_fd_num = 0);
 
   void handle_get_version(int fd);
   void handle_add_process(int fd, pid_t pid, const void * payload);
@@ -58,7 +59,7 @@ private:
   void handle_set_ros2_subscriber_num(int fd, pid_t pid, const void * payload);
   void handle_set_ros2_publisher_num(int fd, pid_t pid, const void * payload);
   void handle_notify_bridge_shutdown(int fd, pid_t pid);
-  void handle_attach_subscriber_channel(int fd, pid_t pid, const void * payload, int channel_fd);
+  void handle_get_subscriber_eventfds(int fd, pid_t pid, const void * payload);
 
   void process_exit_cleanup(pid_t pid);
 };
