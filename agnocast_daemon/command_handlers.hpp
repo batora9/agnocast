@@ -36,13 +36,21 @@ public:
   // Called when a client disconnects its Unix socket.
   void on_client_disconnect(pid_t client_pid);
 
+  // Called when the client process itself has exited (its pidfd became
+  // readable), which a socket a forked child still holds would never tell.
+  void on_client_exit(pid_t client_pid);
+
   // Where the pids of the live clients are kept for a successor daemon. Empty
   // (the default, used by the unit tests) keeps nothing.
   void set_state_path(std::string path) { state_path_ = std::move(path); }
 
   // Daemon restart: the predecessor's clients that are still alive. New
   // registrations wait until each has restored or died, or until timeout_ms.
-  void start_recovery(const std::vector<pid_t> & expected_pids, int64_t timeout_ms);
+  // starttimes (pid → /proc start time, from the state file) tells a reused pid
+  // from the client itself; a pid missing there counts as alive while it exists.
+  void start_recovery(
+    const std::vector<pid_t> & expected_pids, int64_t timeout_ms,
+    const std::unordered_map<pid_t, uint64_t> & starttimes = {});
 
   // Blocks until a recovery started by start_recovery() has finished.
   void wait_recovery_end();
@@ -57,6 +65,7 @@ private:
     bool in_recovery = false;
     bool finishing = false;
     std::unordered_map<pid_t, RestoreState> expected;
+    std::unordered_map<pid_t, uint64_t> expected_starttime;
     uint32_t timed_out_num = 0;
     uint32_t adopted_topic_num = 0;
     uint32_t orphan_publisher_num = 0;
@@ -121,6 +130,22 @@ private:
   void handle_restore_done(int fd, pid_t pid);
   void handle_debug_check_topic(int fd, pid_t pid, const void * payload);
   void handle_get_recovery_status(int fd);
+  void handle_report_anomaly(int fd, pid_t pid, const void * payload);
+  void handle_get_topic_segment(int fd, pid_t pid, const void * payload);
+
+  // Replaces the topic's segment with one rebuilt from the registry (and what
+  // can be trusted of the old one, held in old_copy), in the given mode. The
+  // caller holds global_mutex_ (shared) and topic_rwsem (unique), and the old
+  // segment's mutex when it could take it. Returns false when no new segment
+  // could be created.
+  bool rotate_topic_locked(TopicWrapper * wrapper, AgnocastTopicShm * old_copy, uint32_t mode);
+
+  // Removes a process's publishers and subscribers from the topic's registry
+  // and bars it from the topic. Caller holds topic_rwsem (unique).
+  void quarantine_locked(TopicWrapper * wrapper, pid_t pid);
+
+  // Whether the client the state file named is still the same process.
+  bool expected_alive_locked(pid_t pid) const;
 
   void process_exit_cleanup(pid_t pid);
 

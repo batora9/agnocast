@@ -132,6 +132,12 @@ TEST(TopicShm, TransientLocalTakeSeesEarlierLocalPublish)
   EXPECT_EQ(resp.pub_shm_num, 1U);
 }
 
+struct NeverMapped
+{
+  bool operator()(int32_t) const { return false; }
+  bool valid_address(int32_t, uint64_t) const { return true; }
+};
+
 TEST(TopicShm, LocalReceiveWaitsForThePublisherMemory)
 {
   DaemonHarness h;
@@ -180,10 +186,7 @@ TEST(TopicShm, LocalReceiveWaitsForThePublisherMemory)
   bool call_again = false;
   {
     TopicShmLock lock(shm);
-    ASSERT_EQ(
-      topic_shm_receive(
-        shm, sub_id, [](int32_t) { return false; }, ids, addrs, &num, &call_again),
-      0);
+    ASSERT_EQ(topic_shm_receive(shm, sub_id, NeverMapped{}, ids, addrs, &num, &call_again), 0);
   }
   EXPECT_EQ(num, 0);
   ASSERT_EQ(local_receive(shm, sub_id, ids, &num), 0);

@@ -664,10 +664,18 @@ namespace
 
 struct TopicSegment
 {
+  // nullptr while the topic runs on the daemon path (or the segment is of
+  // another build): every data-plane call then goes to the daemon, and the
+  // descriptor is kept only so a restarted daemon can take the segment back.
   AgnocastTopicShm * shm = nullptr;
   // Kept open so the segment can be handed to a restarted daemon.
   int fd = -1;
   std::string topic_name;
+  // The segment's epoch when it was mapped; reports name it so the daemon can
+  // tell a report about a segment it already replaced.
+  uint32_t epoch = 0;
+  // A publisher short of free slots looks for dead subscribers at most this often.
+  std::atomic<int64_t> next_reclaim_ns{0};
 
   // A publisher's copies of the subscribers' eventfds, valid for
   // notify_generation of shm->sub_generation.
@@ -726,11 +734,67 @@ bool topic_shm_enabled()
   return enabled;
 }
 
-// Takes ownership of shm_fd. A handle without a segment still works over plain
-// requests, so failing here is reported and otherwise ignored.
-void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id, int shm_fd)
+// ------------------------------------------------------------
+// Write protection of the segments (AGNOCAST_SHM_PROTECT=1)
+// ------------------------------------------------------------
+
+// With a protection key the segments are writable only inside SegmentLock:
+// anything else in the process that writes there (a stray pointer) faults at
+// once instead of corrupting the topic for everyone. It needs CPU support
+// (x86 PKU); without it the setting is ignored. A key guards against bugs,
+// not malice: code in the process can lift it.
+std::once_flag g_pkey_once;
+int g_pkey = -1;
+
+int shm_pkey()
 {
-  if (shm_fd < 0) return;
+  std::call_once(g_pkey_once, [] {
+    const char * v = std::getenv("AGNOCAST_SHM_PROTECT");
+    if (v == nullptr || std::strcmp(v, "1") != 0) return;
+    const int key = pkey_alloc(0, PKEY_DISABLE_WRITE);
+    if (key < 0) {
+      RCLCPP_WARN(
+        logger, "AGNOCAST_SHM_PROTECT=1 but no protection key is available (%s)", strerror(errno));
+      return;
+    }
+    g_pkey = key;
+  });
+  return g_pkey;
+}
+
+// This thread may write the segments until shm_deny_write(). Reading stays
+// allowed either way.
+inline void shm_allow_write()
+{
+  if (g_pkey >= 0) pkey_set(g_pkey, 0);
+}
+
+inline void shm_deny_write()
+{
+  if (g_pkey >= 0) pkey_set(g_pkey, PKEY_DISABLE_WRITE);
+}
+
+// ------------------------------------------------------------
+// What the data plane ran into (agnocast_ipc_client_stats)
+// ------------------------------------------------------------
+
+struct ClientStats
+{
+  std::atomic<uint64_t> anomaly_reports{0};
+  std::atomic<uint64_t> segment_refetches{0};
+  std::atomic<uint64_t> rollbacks{0};
+  std::atomic<uint64_t> stall_reports{0};
+  std::atomic<uint64_t> bad_entries{0};
+  std::atomic<uint64_t> peer_reclaims{0};
+  std::atomic<uint64_t> daemon_path_calls{0};
+};
+ClientStats g_stats;
+
+// Maps the segment in shm_fd (taken over) for topic, or finds the mapping this
+// process already has of it. Caller holds segments_mtx. nullptr when the
+// descriptor is unusable.
+std::shared_ptr<TopicSegment> map_segment_locked(const std::string & topic, int shm_fd)
+{
   struct FdCloser
   {
     int fd;
@@ -739,43 +803,69 @@ void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id
       if (fd >= 0) close(fd);
     }
   } closer{shm_fd};
-  if (!topic_shm_enabled()) return;
 
   struct stat st
   {
   };
   if (fstat(shm_fd, &st) < 0 || st.st_size != static_cast<off_t>(sizeof(AgnocastTopicShm))) {
     RCLCPP_WARN(logger, "unexpected topic segment from the daemon; using plain requests");
-    return;
+    return nullptr;
+  }
+  if (const auto it = segments_by_inode.find(st.st_ino); it != segments_by_inode.end()) {
+    if (auto existing = it->second.lock()) return existing;
   }
 
+  auto segment = std::make_shared<TopicSegment>();
+  segment->topic_name = topic;
+  void * mapped =
+    mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+  if (mapped == MAP_FAILED) {
+    RCLCPP_WARN(logger, "mapping the topic segment failed: %s", strerror(errno));
+    return nullptr;
+  }
+  if (shm_pkey() >= 0) {
+    pkey_mprotect(mapped, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, g_pkey);
+  }
+  shm_deny_write();  // also gives this thread read access under the key
+  auto * shm = static_cast<AgnocastTopicShm *>(mapped);
+  const bool ours = __atomic_load_n(&shm->magic, __ATOMIC_ACQUIRE) == AGNOCAST_TOPIC_SHM_MAGIC &&
+                    shm->layout_hash == topic_shm_layout_hash();
+  const uint32_t mode = __atomic_load_n(&shm->mode, __ATOMIC_ACQUIRE);
+  segment->epoch = shm->epoch;
+  if (!ours) {
+    // Another build lays the segment out differently: neither side may
+    // interpret the other's writes. The daemon serves this process instead.
+    RCLCPP_WARN(
+      logger, "topic segment of '%s' is of another build; using plain requests", topic.c_str());
+    munmap(mapped, sizeof(AgnocastTopicShm));
+  } else if (mode == TOPIC_SHM_MODE_DAEMON) {
+    munmap(mapped, sizeof(AgnocastTopicShm));
+  } else {
+    segment->shm = shm;
+  }
+  segment->fd = shm_fd;
+  closer.fd = -1;
+  for (auto it = segments_by_inode.begin(); it != segments_by_inode.end();) {
+    it = it->second.expired() ? segments_by_inode.erase(it) : std::next(it);
+  }
+  segments_by_inode[st.st_ino] = segment;
+  return segment;
+}
+
+// Takes ownership of shm_fd. A handle without a segment still works over plain
+// requests, so failing here is reported and otherwise ignored.
+void attach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id, int shm_fd)
+{
+  if (shm_fd < 0) return;
+  if (!topic_shm_enabled()) {
+    close(shm_fd);
+    return;
+  }
+  const std::string topic(topic_name.ptr != nullptr ? topic_name.ptr : "", topic_name.len);
   std::lock_guard<std::mutex> lock(segments_mtx);
-  std::shared_ptr<TopicSegment> segment;
-  if (const auto it = segments_by_inode.find(st.st_ino); it != segments_by_inode.end()) {
-    segment = it->second.lock();
+  if (auto segment = map_segment_locked(topic, shm_fd)) {
+    segments[segment_key(topic_name, pubsub_id)] = std::move(segment);
   }
-  if (!segment) {
-    void * mapped =
-      mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (mapped == MAP_FAILED) {
-      RCLCPP_WARN(logger, "mapping the topic segment failed: %s", strerror(errno));
-      return;
-    }
-    segment = std::make_shared<TopicSegment>();
-    segment->shm = static_cast<AgnocastTopicShm *>(mapped);
-    segment->topic_name.assign(topic_name.ptr != nullptr ? topic_name.ptr : "", topic_name.len);
-    if (__atomic_load_n(&segment->shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_TOPIC_SHM_MAGIC) {
-      RCLCPP_WARN(logger, "topic segment is not initialized; using plain requests");
-      return;
-    }
-    segment->fd = shm_fd;
-    closer.fd = -1;
-    for (auto it = segments_by_inode.begin(); it != segments_by_inode.end();) {
-      it = it->second.expired() ? segments_by_inode.erase(it) : std::next(it);
-    }
-    segments_by_inode[st.st_ino] = segment;
-  }
-  segments[segment_key(topic_name, pubsub_id)] = std::move(segment);
 }
 
 void detach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id)
@@ -783,6 +873,164 @@ void detach_topic_segment(const struct name_info & topic_name, int32_t pubsub_id
   std::lock_guard<std::mutex> lock(segments_mtx);
   segments.erase(segment_key(topic_name, pubsub_id));
 }
+
+// ------------------------------------------------------------
+// Relying on the daemon when the segment goes wrong
+// ------------------------------------------------------------
+
+int64_t shm_lock_timeout_ms()
+{
+  static const int64_t ms = [] {
+    const char * v = std::getenv("AGNOCAST_SHM_LOCK_TIMEOUT_MS");
+    const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 0;
+    return n > 0 ? static_cast<int64_t>(n) : int64_t{500};
+  }();
+  return ms;
+}
+
+// Tells the daemon what this process found. The daemon checks it on its own.
+// Returns the AnomalyAction, or -1 when the daemon could not be asked (down).
+int report_anomaly(const TopicSegment & segment, uint32_t kind, int32_t suspect, int64_t entry_id)
+{
+  ReportAnomalyRequest req{};
+  std::strncpy(req.topic_name, segment.topic_name.c_str(), sizeof(req.topic_name) - 1);
+  req.kind = kind;
+  req.suspect_pid = suspect;
+  req.entry_id = entry_id;
+  req.epoch = segment.epoch;
+  ReportAnomalyResponse resp{};
+  CallOptions opts;
+  opts.wait_for_daemon = false;
+  g_stats.anomaly_reports.fetch_add(1, std::memory_order_relaxed);
+  if (
+    daemon_call(
+      AGNOCAST_CMD_REPORT_ANOMALY, &req, sizeof(req), &resp, sizeof(resp), -1, nullptr, 0, nullptr,
+      &opts) < 0) {
+    return -1;
+  }
+  return static_cast<int>(resp.action);
+}
+
+// The client's way to hold a segment's mutex:
+//   - waits are bounded; each timeout is reported (the holder may be stopped),
+//   - a segment the daemon replaced (retired) is not used,
+//   - the cheap invariant check runs after every lock,
+//   - a dead holder's operation is rolled back by the lock itself and reported,
+//   - the segment is writable (protection key) only while held.
+class SegmentLock
+{
+public:
+  enum class State { Held, Retired, Corrupt, Unlocked };
+
+  explicit SegmentLock(TopicSegment & segment) : segment_(segment)
+  {
+    AgnocastTopicShm * shm = segment_.shm;
+    shm_allow_write();
+    while (true) {
+      const int r = topic_shm_timedlock(shm, shm_lock_timeout_ms(), &recovered_);
+      if (r == 0) break;
+      if (topic_shm_is_retired(shm)) {
+        finish(State::Retired);
+        return;
+      }
+      if (r != ETIMEDOUT) {
+        finish(State::Corrupt);
+        return;
+      }
+      g_stats.stall_reports.fetch_add(1, std::memory_order_relaxed);
+      report_anomaly(
+        segment_, AGNOCAST_ANOMALY_STALL, __atomic_load_n(&shm->holder_pid, __ATOMIC_RELAXED), -1);
+    }
+    if (recovered_) g_stats.rollbacks.fetch_add(1, std::memory_order_relaxed);
+    if (topic_shm_is_retired(shm)) {
+      topic_shm_unlock(shm);
+      finish(State::Retired);
+      return;
+    }
+    if (!topic_shm_quick_check(shm)) {
+      topic_shm_unlock(shm);
+      finish(State::Corrupt);
+      return;
+    }
+    state_ = State::Held;
+  }
+
+  ~SegmentLock() { release(); }
+
+  SegmentLock(const SegmentLock &) = delete;
+  SegmentLock & operator=(const SegmentLock &) = delete;
+
+  bool held() const { return state_ == State::Held; }
+  State state() const { return state_; }
+
+  void release()
+  {
+    if (state_ != State::Held) return;
+    topic_shm_unlock(segment_.shm);
+    finish(State::Unlocked);
+    // The daemon double-checks what the rollback left.
+    if (recovered_) report_anomaly(segment_, AGNOCAST_ANOMALY_RECOVERED, 0, -1);
+  }
+
+private:
+  void finish(State s)
+  {
+    state_ = s;
+    shm_deny_write();
+  }
+
+  TopicSegment & segment_;
+  State state_ = State::Unlocked;
+  bool recovered_ = false;
+};
+
+// After SegmentLock found the segment retired or damaged: reports the damage,
+// then fetches the topic's current segment and puts it in place of the old one
+// for every handle of this process. Returns false when there is nothing to
+// retry with (the daemon is unreachable or barred this process).
+bool replace_segment(
+  const std::shared_ptr<TopicSegment> & old, SegmentLock::State state, int32_t pubsub_id)
+{
+  if (state == SegmentLock::State::Corrupt) {
+    report_anomaly(*old, AGNOCAST_ANOMALY_CHECK_FAILED, 0, -1);
+  }
+  GetTopicSegmentRequest req{};
+  std::strncpy(req.topic_name, old->topic_name.c_str(), sizeof(req.topic_name) - 1);
+  req.pubsub_id = pubsub_id;
+  GetTopicSegmentResponse resp{};
+  int fd = -1;
+  uint32_t fd_num = 0;
+  CallOptions opts;
+  opts.wait_for_daemon = false;
+  const int r = daemon_call(
+    AGNOCAST_CMD_GET_TOPIC_SEGMENT, &req, sizeof(req), &resp, sizeof(resp), -1, &fd, 1, &fd_num,
+    &opts);
+  if (r < 0 || fd_num == 0) {
+    if (r < 0 && errno == EPERM) {
+      RCLCPP_ERROR(
+        logger, "agnocast_daemon quarantined this process on '%s'", old->topic_name.c_str());
+      std::lock_guard<std::mutex> lock(segments_mtx);
+      for (auto it = segments.begin(); it != segments.end();) {
+        it = (it->second == old) ? segments.erase(it) : std::next(it);
+      }
+    }
+    if (fd_num > 0) close(fd);
+    return false;
+  }
+  g_stats.segment_refetches.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(segments_mtx);
+  auto fresh = map_segment_locked(old->topic_name, fd);
+  if (!fresh) return false;
+  for (auto & [key, segment] : segments) {
+    (void)key;
+    if (segment == old) segment = fresh;
+  }
+  return true;
+}
+
+// Whether addr may be a message of this process: inside its own pool. A
+// publisher checks its own publishes, which the daemon used to do for it.
+bool own_pool_contains(uint64_t addr);
 
 // ------------------------------------------------------------
 // Memory pools this process has mapped
@@ -823,6 +1071,24 @@ struct ReadablePublishers
       if (fresh[i].pid == pid) return true;
     }
     return region_mapped(pid);
+  }
+
+  // An entry's address must lie in its publisher's pool, as the daemon told
+  // this process where that pool is. Anything else would have the subscriber
+  // read (and later hand back) memory that is not a message.
+  bool valid_address(int32_t pid, uint64_t addr) const
+  {
+    for (uint32_t i = 0; i < fresh_num; i++) {
+      if (fresh[i].pid == pid) {
+        return addr >= fresh[i].shm_addr && addr < fresh[i].shm_addr + fresh[i].shm_size;
+      }
+    }
+    const uint32_t n = g_region_num.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; i++) {
+      if (g_regions[i].pid != pid) continue;
+      if (addr >= g_regions[i].addr && addr < g_regions[i].addr + g_regions[i].size) return true;
+    }
+    return false;
   }
 };
 
@@ -869,8 +1135,18 @@ struct ProcessRecord
   uint32_t domain_id = 0;
   bool is_performance_bridge_manager = false;
   uint64_t shm_addr = 0;
+  uint64_t shm_size = 0;
 };
 ProcessRecord g_process_record;
+
+bool own_pool_contains(uint64_t addr)
+{
+  if (g_process_record.owner != topic_shm_cached_pid() || g_process_record.shm_size == 0) {
+    return true;
+  }
+  return addr >= g_process_record.shm_addr &&
+         addr < g_process_record.shm_addr + g_process_record.shm_size;
+}
 
 std::mutex registry_mtx;
 // Never freed: a forked child starts a registry of its own and must not free
@@ -1075,9 +1351,10 @@ int refresh_notify_fds(TopicSegment & segment)
   // those already restored. Keep waking the others with the eventfds from
   // before: ids are never reused, so an id still subscribed in the segment is
   // still the same subscriber.
-  {
-    TopicShmLock lock(segment.shm);
+  if (segment.shm != nullptr) {
+    SegmentLock lock(segment);
     for (auto & [id, efd] : segment.notify_fds) {
+      if (!lock.held()) break;
       if (efd < 0 || fds.count(id) > 0 || !topic_shm_valid_id(id)) continue;
       if (segment.shm->ids[id].kind != TOPIC_SHM_ID_SUBSCRIBER) continue;
       fds.emplace(id, efd);
@@ -1121,9 +1398,47 @@ void notify_subscribers_local(
 
 thread_local int32_t t_subscriber_ids[kTopicShmIdNum];
 
-int publish_local(
+// What a local call ran into when it could not do its work on the segment.
+enum class LocalResult { Done, Retired, Corrupt };
+
+LocalResult to_result(SegmentLock::State state)
+{
+  return state == SegmentLock::State::Retired ? LocalResult::Retired : LocalResult::Corrupt;
+}
+
+// While the daemon is down nobody removes a dead subscriber, and what it
+// referenced stays pinned. When free slots run short, a publisher looks for
+// dead subscribers itself (rate-limited: it reads /proc). Caller holds the lock.
+// AGNOCAST_PEER_RECLAIM=0 leaves it all to the daemon, for comparison.
+bool peer_reclaim_enabled()
+{
+  static const bool enabled = [] {
+    const char * v = std::getenv("AGNOCAST_PEER_RECLAIM");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
+void maybe_reclaim_dead_subscribers(TopicSegment & segment)
+{
+  AgnocastTopicShm * shm = segment.shm;
+  if (shm->free_num >= kTopicShmEntrySlots / 8 || !peer_reclaim_enabled()) return;
+  const int64_t now = monotonic_now_ns();
+  if (now < segment.next_reclaim_ns.load(std::memory_order_relaxed)) return;
+  segment.next_reclaim_ns.store(now + 100 * 1000 * 1000, std::memory_order_relaxed);
+  const uint32_t n = topic_shm_reclaim_dead_subscribers(
+    shm, [](int32_t pid, uint64_t starttime) { return topic_shm_proc_alive(pid, starttime); });
+  if (n > 0) {
+    g_stats.peer_reclaims.fetch_add(n, std::memory_order_relaxed);
+    RCLCPP_WARN(
+      logger, "dropped the references of %u dead subscriber(s) on '%s'", n,
+      segment.topic_name.c_str());
+  }
+}
+
+LocalResult publish_local(
   TopicSegment & segment, union ioctl_publish_msg_args * args,
-  [[maybe_unused]] LocalStamps & stamps)
+  [[maybe_unused]] LocalStamps & stamps, int * result)
 {
   int64_t entry_id = -1;
   uint64_t released_addrs[AGNOCAST_PROTO_MAX_RELEASE_NUM];
@@ -1132,17 +1447,20 @@ int publish_local(
   uint64_t generation = 0;
   int ret = 0;
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
-  topic_shm_lock(segment.shm);
+  SegmentLock lock(segment);
+  if (!lock.held()) return to_result(lock.state());
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
+  maybe_reclaim_dead_subscribers(segment);
   ret = topic_shm_publish(
     segment.shm, args->publisher_id, args->msg_virtual_address, &entry_id, released_addrs,
     &released_num, t_subscriber_ids, &subscriber_num);
   generation = segment.shm->sub_generation;
-  topic_shm_unlock(segment.shm);
+  lock.release();
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
   if (ret < 0) {
     errno = -ret;
-    return -1;
+    *result = -1;
+    return LocalResult::Done;
   }
 
   notify_subscribers_local(segment, t_subscriber_ids, subscriber_num, generation);
@@ -1153,7 +1471,8 @@ int publish_local(
   for (uint32_t i = 0; i < released_num; i++) {
     args->ret_released_addrs[i] = released_addrs[i];
   }
-  return 0;
+  *result = 0;
+  return LocalResult::Done;
 }
 
 // When a publisher appeared since the subscriber last looked, asks the daemon
@@ -1166,8 +1485,9 @@ uint32_t fetch_new_publisher_memory(
 {
   bool needed = false;
   {
-    TopicShmLock lock(segment.shm);
-    needed = topic_shm_consume_mmap_update(segment.shm, subscriber_id);
+    // A failed lock is left to the receive itself, which takes it again.
+    SegmentLock lock(segment);
+    if (lock.held()) needed = topic_shm_consume_mmap_update(segment.shm, subscriber_id);
   }
   if (!needed) return 0;
 
@@ -1181,8 +1501,8 @@ uint32_t fetch_new_publisher_memory(
     daemon_call(
       AGNOCAST_CMD_GET_PUBLISHER_SHM_INFOS, &req, sizeof(req), resp.get(), sizeof(*resp), -1,
       nullptr, 0, nullptr, &opts) < 0) {
-    TopicShmLock lock(segment.shm);
-    topic_shm_request_mmap_update(segment.shm, subscriber_id);
+    SegmentLock lock(segment);
+    if (lock.held()) topic_shm_request_mmap_update(segment.shm, subscriber_id);
     return 0;
   }
 
@@ -1199,9 +1519,20 @@ uint32_t fetch_new_publisher_memory(
   return num;
 }
 
-int receive_local(
+// An entry was refused because of its address: the daemon finds out whose.
+void report_bad_entry(const TopicSegment & segment, const TopicShmBadEntry & bad)
+{
+  if (bad.entry_id < 0) return;
+  g_stats.bad_entries.fetch_add(1, std::memory_order_relaxed);
+  RCLCPP_WARN(
+    logger, "entry %lld of pid %d on '%s' points outside its publisher's memory; skipped",
+    static_cast<long long>(bad.entry_id), bad.publisher_pid, segment.topic_name.c_str());
+  report_anomaly(segment, AGNOCAST_ANOMALY_BAD_ADDRESS, bad.publisher_pid, bad.entry_id);
+}
+
+LocalResult receive_local(
   TopicSegment & segment, union ioctl_receive_msg_args * args, publisher_shm_info * shm_buf,
-  uint32_t shm_buf_size, [[maybe_unused]] LocalStamps & stamps)
+  uint32_t shm_buf_size, [[maybe_unused]] LocalStamps & stamps, int * result)
 {
   const uint32_t pub_shm_num =
     fetch_new_publisher_memory(segment, args->subscriber_id, shm_buf, shm_buf_size);
@@ -1210,18 +1541,23 @@ int receive_local(
   uint64_t entry_addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint16_t entry_num = 0;
   bool call_again = false;
+  TopicShmBadEntry bad;
   const ReadablePublishers readable{shm_buf, pub_shm_num};
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_begin);
-  topic_shm_lock(segment.shm);
+  SegmentLock lock(segment);
+  if (!lock.held()) return to_result(lock.state());
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.lock_end);
   const int ret = topic_shm_receive(
-    segment.shm, args->subscriber_id, readable, entry_ids, entry_addrs, &entry_num, &call_again);
-  topic_shm_unlock(segment.shm);
+    segment.shm, args->subscriber_id, readable, entry_ids, entry_addrs, &entry_num, &call_again,
+    &bad);
+  lock.release();
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.work_end);
   AGNOCAST_BENCH_LOCAL_STAMP(stamps.notify_end);
+  report_bad_entry(segment, bad);
   if (ret < 0) {
     errno = -ret;
-    return -1;
+    *result = -1;
+    return LocalResult::Done;
   }
 
   args->ret_entry_num = entry_num;
@@ -1231,37 +1567,61 @@ int receive_local(
     args->ret_entry_ids[i] = entry_ids[i];
     args->ret_entry_addrs[i] = entry_addrs[i];
   }
-  return 0;
+  *result = 0;
+  return LocalResult::Done;
 }
 
-int take_local(
+LocalResult take_local(
   TopicSegment & segment, union ioctl_take_msg_args * args, publisher_shm_info * shm_buf,
-  uint32_t shm_buf_size)
+  uint32_t shm_buf_size, int * result)
 {
-  if (!topic_shm_valid_id(args->subscriber_id)) {
-    errno = EINVAL;
-    return -1;
-  }
   const uint32_t pub_shm_num =
     fetch_new_publisher_memory(segment, args->subscriber_id, shm_buf, shm_buf_size);
 
   uint64_t addr = 0;
   int64_t entry_id = -1;
+  TopicShmBadEntry bad;
   const ReadablePublishers readable{shm_buf, pub_shm_num};
   int ret = 0;
   {
-    TopicShmLock lock(segment.shm);
+    SegmentLock lock(segment);
+    if (!lock.held()) return to_result(lock.state());
     ret = topic_shm_take(
-      segment.shm, args->subscriber_id, args->allow_same_message, readable, &addr, &entry_id);
+      segment.shm, args->subscriber_id, args->allow_same_message, readable, &addr, &entry_id, &bad);
   }
+  report_bad_entry(segment, bad);
   if (ret < 0) {
     errno = -ret;
-    return -1;
+    *result = -1;
+    return LocalResult::Done;
   }
   args->ret_addr = addr;
   args->ret_entry_id = entry_id;
   args->ret_pub_shm_num = pub_shm_num;
-  return 0;
+  *result = 0;
+  return LocalResult::Done;
+}
+
+// Runs a local data-plane call, dealing with a segment the daemon replaced or
+// one found damaged. False when the call has to go to the daemon instead.
+template <typename Call>
+bool run_local(const struct name_info & topic_name, int32_t pubsub_id, Call && call, int * result)
+{
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const auto segment = find_segment(topic_name, pubsub_id);
+    if (!segment) return false;
+    if (segment->shm == nullptr) {
+      g_stats.daemon_path_calls.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    const LocalResult r = call(*segment, result);
+    if (r == LocalResult::Done) return true;
+    const SegmentLock::State state =
+      r == LocalResult::Retired ? SegmentLock::State::Retired : SegmentLock::State::Corrupt;
+    if (!replace_segment(segment, state, pubsub_id)) break;
+  }
+  g_stats.daemon_path_calls.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 }  // namespace
@@ -1312,6 +1672,7 @@ int agnocast_ipc_add_process(union ioctl_add_process_args * args)
     g_process_record.domain_id = c->req->domain_id;
     g_process_record.is_performance_bridge_manager = c->req->is_performance_bridge_manager;
     g_process_record.shm_addr = c->resp->shm_addr;
+    g_process_record.shm_size = c->resp->shm_size;
   };
   int r = daemon_call(
     AGNOCAST_CMD_ADD_PROCESS, &req, sizeof(req), &resp, sizeof(resp), -1, nullptr, 0, nullptr,
@@ -1425,14 +1786,29 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
 {
   AGNOCAST_BENCH_CALL_ENTER();
 
-  if (const auto segment = find_segment(args->topic_name, args->publisher_id)) {
+  // The daemon used to check this for every publish; now the publisher does
+  // (and subscribers check every address they are handed, whoever wrote it).
+  if (!own_pool_contains(args->msg_virtual_address)) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  {
     LocalStamps stamps;
-    const int r = publish_local(*segment, args, stamps);
+    int r = 0;
+    const bool local = run_local(
+      args->topic_name, args->publisher_id,
+      [&](TopicSegment & segment, int * result) {
+        return publish_local(segment, args, stamps, result);
+      },
+      &r);
+    if (local) {
 #ifdef AGNOCAST_BENCH_TIMING
-    last_publish_notify_end_ns = stamps.notify_end;
+      last_publish_notify_end_ns = stamps.notify_end;
 #endif
-    AGNOCAST_BENCH_CALL_LEAVE_LOCAL(publish, stamps);
-    return r;
+      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(publish, stamps);
+      return r;
+    }
   }
 
   PublishMsgRequest req{};
@@ -1467,13 +1843,25 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
   const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
 
-  if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
+  {
     LocalStamps stamps;
-    const int r = receive_local(
-      *segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr), pub_shm_info_size,
-      stamps);
-    AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive, stamps);
-    return r;
+    int r = 0;
+    // Copied: the call writes ret_* fields that overlap topic_name.
+    const struct name_info topic_name = args->topic_name;
+    const int32_t subscriber_id = args->subscriber_id;
+    const bool local = run_local(
+      topic_name, subscriber_id,
+      [&](TopicSegment & segment, int * result) {
+        args->subscriber_id = subscriber_id;
+        return receive_local(
+          segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr),
+          pub_shm_info_size, stamps, result);
+      },
+      &r);
+    if (local) {
+      AGNOCAST_BENCH_CALL_LEAVE_LOCAL(receive, stamps);
+      return r;
+    }
   }
 
   ReceiveMsgRequest req{};
@@ -1514,9 +1902,22 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
   const uint64_t pub_shm_info_addr = args->pub_shm_info_addr;
   const uint32_t pub_shm_info_size = args->pub_shm_info_size;
 
-  if (const auto segment = find_segment(args->topic_name, args->subscriber_id)) {
-    return take_local(
-      *segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr), pub_shm_info_size);
+  {
+    int r = 0;
+    const struct name_info topic_name = args->topic_name;
+    const int32_t subscriber_id = args->subscriber_id;
+    const bool allow_same_message = args->allow_same_message;
+    const bool local = run_local(
+      topic_name, subscriber_id,
+      [&](TopicSegment & segment, int * result) {
+        args->subscriber_id = subscriber_id;
+        args->allow_same_message = allow_same_message;
+        return take_local(
+          segment, args, reinterpret_cast<publisher_shm_info *>(pub_shm_info_addr),
+          pub_shm_info_size, result);
+      },
+      &r);
+    if (local) return r;
   }
 
   TakeMsgRequest req{};
@@ -1544,17 +1945,21 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
 
 int agnocast_ipc_release_sub_ref(struct ioctl_update_entry_args * args)
 {
-  if (const auto segment = find_segment(args->topic_name, args->pubsub_id)) {
-    int ret = 0;
-    {
-      TopicShmLock lock(segment->shm);
-      ret = topic_shm_release_ref(segment->shm, args->pubsub_id, args->entry_id);
-    }
-    if (ret < 0) {
-      errno = -ret;
-      return -1;
-    }
-    return 0;
+  {
+    int r = 0;
+    const bool local = run_local(
+      args->topic_name, args->pubsub_id,
+      [&](TopicSegment & segment, int * result) {
+        SegmentLock lock(segment);
+        if (!lock.held()) return to_result(lock.state());
+        const int ret = topic_shm_release_ref(segment.shm, args->pubsub_id, args->entry_id);
+        lock.release();
+        if (ret < 0) errno = -ret;
+        *result = ret < 0 ? -1 : 0;
+        return LocalResult::Done;
+      },
+      &r);
+    if (local) return r;
   }
 
   ReleaseSubRefRequest req{};
@@ -1840,8 +2245,82 @@ int agnocast_ipc_debug_check_topic(const std::string & topic_name, DaemonTopicCh
     out->sub_num = resp.sub_num;
     std::memcpy(out->message, resp.message, sizeof(out->message));
     out->message[sizeof(out->message) - 1] = '\0';
+    out->epoch = resp.epoch;
+    out->mode = resp.mode;
+    out->rotation_num = resp.rotation_num;
+    out->quarantined_num = resp.quarantined_num;
+    out->stall_kill_num = resp.stall_kill_num;
+    out->anomaly_report_num = resp.anomaly_report_num;
+    out->peer_reclaim_count = resp.peer_reclaim_count;
   }
   return r;
+}
+
+DaemonClientStats agnocast_ipc_client_stats()
+{
+  DaemonClientStats out{};
+  out.anomaly_reports = g_stats.anomaly_reports.load();
+  out.segment_refetches = g_stats.segment_refetches.load();
+  out.rollbacks = g_stats.rollbacks.load();
+  out.stall_reports = g_stats.stall_reports.load();
+  out.bad_entries = g_stats.bad_entries.load();
+  out.peer_reclaims = g_stats.peer_reclaims.load();
+  out.daemon_path_calls = g_stats.daemon_path_calls.load();
+  out.shm_protected = g_pkey >= 0;
+  return out;
+}
+
+int agnocast_ipc_debug_inject_fault(const std::string & topic_name, int32_t pubsub_id, int kind)
+{
+  const char * allow = std::getenv("AGNOCAST_ALLOW_DEBUG_FAULTS");
+  if (allow == nullptr || std::strcmp(allow, "1") != 0) {
+    errno = EPERM;
+    return -1;
+  }
+  const struct name_info name = {topic_name.c_str(), topic_name.size()};
+  const auto segment = find_segment(name, pubsub_id);
+  if (!segment || segment->shm == nullptr) {
+    errno = ENOENT;
+    return -1;
+  }
+  switch (kind) {
+    case AGNOCAST_DEBUG_FAULT_BAD_ADDRESS: {
+      // A publish of an address no pool holds, past the publisher's own check.
+      int64_t entry_id = -1;
+      uint64_t released_addrs[AGNOCAST_PROTO_MAX_RELEASE_NUM];
+      uint32_t released_num = 0;
+      uint32_t subscriber_num = 0;
+      uint64_t generation = 0;
+      int ret = 0;
+      {
+        SegmentLock lock(*segment);
+        if (!lock.held()) {
+          errno = EAGAIN;
+          return -1;
+        }
+        ret = topic_shm_publish(
+          segment->shm, pubsub_id, 0x10, &entry_id, released_addrs, &released_num, t_subscriber_ids,
+          &subscriber_num);
+        generation = segment->shm->sub_generation;
+      }
+      if (ret < 0) {
+        errno = -ret;
+        return -1;
+      }
+      notify_subscribers_local(*segment, t_subscriber_ids, subscriber_num, generation);
+      return 0;
+    }
+    case AGNOCAST_DEBUG_FAULT_SCRIBBLE: {
+      // No lock and no write window: what a stray pointer does. With a
+      // protection key this faults right here.
+      volatile uint32_t * entry_num = &segment->shm->entry_num;
+      *entry_num = kTopicShmEntrySlots + 7;
+      return 0;
+    }
+    default:
+      errno = EINVAL;
+      return -1;
+  }
 }
 
 int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out)

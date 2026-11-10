@@ -77,6 +77,13 @@ if(AGNOCAST_USE_DAEMON)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../agnocast_daemon)
   # The client locks the topic segment's process-shared mutex (topic_shm.hpp).
   target_link_libraries(agnocast pthread)
+  # Crash and stall points inside the segment operations, armed only through
+  # AGNOCAST_CLIENT_FAULT_POINT (agnocast_fault_injection.cpp).
+  option(AGNOCAST_CLIENT_FAULT_INJECTION "Client-side fault points for the evaluation" ON)
+  if(AGNOCAST_CLIENT_FAULT_INJECTION)
+    target_compile_definitions(agnocast PRIVATE AGNOCAST_FAULT_INJECTION)
+    target_sources(agnocast PRIVATE src/agnocast_fault_injection.cpp)
+  endif()
 endif()
 
 ament_target_dependencies(agnocast rclcpp rcpputils rmw ${AGNOCAST_SERVICE_INTROSPECTION_DEPS} agnocast_cie_thread_configurator rosgraph_msgs agnocast_cie_config_msgs ament_index_cpp message_filters tf2 tf2_ros tf2_msgs geometry_msgs diagnostic_msgs diagnostic_updater rosidl_typesupport_introspection_cpp)

@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -55,6 +56,8 @@ struct ProcessInfo
   uint32_t domain_id = 0;
   MemoryAllocator::MempoolEntry * mempool_entry = nullptr;  // owned by MemoryAllocator
   std::vector<ExitSubscriptionEntry> exit_subscriptions;
+  // /proc/<pid>/stat start time, so a reused pid is not taken for this process.
+  uint64_t starttime = 0;
 };
 
 // Equivalent of agnocast_kmod::publisher_info.
@@ -122,6 +125,13 @@ struct TopicWrapper
   int shm_fd = -1;
   AgnocastTopicShm * shm = nullptr;
 
+  // Anomaly handling (topic_rwsem). A quarantined process damaged the segment
+  // and is no longer served on this topic.
+  std::set<pid_t> quarantined;
+  uint32_t rotation_num = 0;
+  uint32_t stall_kill_num = 0;
+  uint32_t anomaly_report_num = 0;
+
   TopicWrapper() = default;
   ~TopicWrapper();
   TopicWrapper(const TopicWrapper &) = delete;
@@ -169,6 +179,9 @@ public:
   // (always consumed). The same segment again is fine; a different one for a
   // topic that already has one is -EEXIST. Caller holds global_mutex_ (unique).
   int adopt_topic(const TopicKey & key, int shm_fd, TopicWrapper ** out);
+
+  // A new, initialized, sealed segment. False when it could not be created.
+  static bool create_segment(int * fd, AgnocastTopicShm ** shm);
 
   // Caller must hold global_mutex_ (at least shared_lock) before calling.
   TopicWrapper * find_topic(const TopicKey & key) const;

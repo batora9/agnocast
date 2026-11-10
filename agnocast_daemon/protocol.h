@@ -119,6 +119,10 @@ typedef enum {
   /* Evaluation only. */
   AGNOCAST_CMD_DEBUG_CHECK_TOPIC = 73,
   AGNOCAST_CMD_GET_RECOVERY_STATUS = 74,
+  /* A client found something wrong with a topic's segment (see "Anomalies"). */
+  AGNOCAST_CMD_REPORT_ANOMALY = 75,
+  /* The topic's current segment, after the daemon replaced the old one. */
+  AGNOCAST_CMD_GET_TOPIC_SEGMENT = 76,
 } CommandType;
 
 /* --------------------------------------------------------------------------
@@ -839,6 +843,14 @@ struct DebugCheckTopicResponse
   uint32_t entry_num;
   uint32_t sub_num;
   char message[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  /* Anomaly handling on this topic. */
+  uint32_t epoch;
+  uint32_t mode; /* TOPIC_SHM_MODE_* of the current segment */
+  uint32_t rotation_num;
+  uint32_t quarantined_num;
+  uint32_t stall_kill_num;
+  uint32_t anomaly_report_num;
+  uint64_t peer_reclaim_count;
 };
 
 /* ---- AGNOCAST_CMD_GET_RECOVERY_STATUS (74) ---- */
@@ -858,6 +870,73 @@ struct GetRecoveryStatusResponse
   uint32_t orphan_subscriber_num;
   int64_t start_ns;
   int64_t end_ns;
+};
+
+/* --------------------------------------------------------------------------
+ * Anomalies
+ *
+ * Clients run the data plane on the topic's segment themselves and rely on the
+ * daemon when something goes wrong. A client reports what it found; the daemon
+ * checks it on its own (a report is never taken on trust) and, when the
+ * segment is damaged, builds a new one from its registry and retires the old
+ * one. Every client sees the retired flag at its next lock and fetches the
+ * new segment with GET_TOPIC_SEGMENT.
+ * -------------------------------------------------------------------------- */
+
+typedef enum {
+  /* The reporter rolled back a dead holder's operation (EOWNERDEAD). */
+  AGNOCAST_ANOMALY_RECOVERED = 1,
+  /* The cheap invariant check failed after taking the lock. */
+  AGNOCAST_ANOMALY_CHECK_FAILED = 2,
+  /* An entry's address lies outside its publisher's pool (suspect_pid,
+   * entry_id). */
+  AGNOCAST_ANOMALY_BAD_ADDRESS = 3,
+  /* The lock could not be taken within the timeout; suspect_pid is the
+   * holder the segment names. */
+  AGNOCAST_ANOMALY_STALL = 4,
+  /* The segment's layout hash differs from the reporter's build. */
+  AGNOCAST_ANOMALY_LAYOUT = 5,
+} AnomalyKind;
+
+typedef enum {
+  AGNOCAST_ANOMALY_ACTION_NONE = 0,    /* checked; nothing wrong */
+  AGNOCAST_ANOMALY_ACTION_ROTATED = 1, /* new segment, same data path */
+  AGNOCAST_ANOMALY_ACTION_DAEMON = 2,  /* new segment, data path via the daemon */
+  AGNOCAST_ANOMALY_ACTION_KILLED = 3,  /* the stalled holder was killed */
+  AGNOCAST_ANOMALY_ACTION_STALE = 4,   /* the report was about an older epoch */
+} AnomalyAction;
+
+/* ---- AGNOCAST_CMD_REPORT_ANOMALY (75) ---- */
+struct ReportAnomalyRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  uint32_t kind; /* AnomalyKind */
+  int32_t suspect_pid;
+  int64_t entry_id;
+  uint32_t epoch; /* of the segment the reporter used */
+  uint32_t _pad;
+};
+
+struct ReportAnomalyResponse
+{
+  uint32_t action; /* AnomalyAction */
+  uint32_t epoch;  /* the topic's epoch afterwards */
+};
+
+/* ---- AGNOCAST_CMD_GET_TOPIC_SEGMENT (76) ---- */
+/* The current segment is attached with SCM_RIGHTS. -EPERM for a process the
+ * daemon quarantined on this topic. */
+struct GetTopicSegmentRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  int32_t pubsub_id;
+  uint32_t _pad;
+};
+
+struct GetTopicSegmentResponse
+{
+  uint32_t mode;
+  uint32_t epoch;
 };
 
 /* --------------------------------------------------------------------------

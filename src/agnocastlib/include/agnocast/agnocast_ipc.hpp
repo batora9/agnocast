@@ -169,8 +169,42 @@ struct DaemonTopicCheck
   uint32_t entry_num;
   uint32_t sub_num;
   char message[256];
+  // Anomaly handling on the topic (see agnocast_daemon/protocol.h, "Anomalies").
+  uint32_t epoch;
+  uint32_t mode;  // 0: clients run the data plane, 1: the daemon does
+  uint32_t rotation_num;
+  uint32_t quarantined_num;
+  uint32_t stall_kill_num;
+  uint32_t anomaly_report_num;
+  uint64_t peer_reclaim_count;
 };
 int agnocast_ipc_debug_check_topic(const std::string & topic_name, DaemonTopicCheck * out);
+
+// What this process's data plane ran into, for the recovery-flow evaluation.
+struct DaemonClientStats
+{
+  uint64_t anomaly_reports;    // reports sent to the daemon
+  uint64_t segment_refetches;  // new segments fetched after the daemon replaced one
+  uint64_t rollbacks;          // dead holders' operations this process rolled back
+  uint64_t stall_reports;      // lock waits that hit the timeout
+  uint64_t bad_entries;        // entries skipped because of their address
+  uint64_t peer_reclaims;      // dead subscribers this process reclaimed
+  uint64_t daemon_path_calls;  // data-plane calls sent to the daemon instead
+  bool shm_protected;          // the segment is write-protected with a pkey
+};
+DaemonClientStats agnocast_ipc_client_stats();
+
+// Evaluation only, and only with AGNOCAST_ALLOW_DEBUG_FAULTS=1: makes this
+// process misbehave on the topic's segment the way a buggy client would.
+enum DebugFaultKind : int {
+  // Publish an entry whose address is outside this process's pool (bypassing
+  // the publisher's own check), as pubsub_id.
+  AGNOCAST_DEBUG_FAULT_BAD_ADDRESS = 1,
+  // Write garbage over the segment's bookkeeping without the mutex, the way a
+  // stray pointer would.
+  AGNOCAST_DEBUG_FAULT_SCRIBBLE = 2,
+};
+int agnocast_ipc_debug_inject_fault(const std::string & topic_name, int32_t pubsub_id, int kind);
 
 struct DaemonRecoveryStatus
 {

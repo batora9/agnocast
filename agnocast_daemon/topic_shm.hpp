@@ -40,16 +40,20 @@
 #include "protocol.h"
 
 #include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <type_traits>
 
-#define AGNOCAST_TOPIC_SHM_MAGIC 0x41475432u /* "AGT2": layout with the undo log */
+#define AGNOCAST_TOPIC_SHM_MAGIC 0x41475433u /* "AGT3": undo log, epochs, layout hash */
 
 // Crash points for the daemon's rollback evaluation (fault_injection.cpp). The
 // client build never defines AGNOCAST_FAULT_INJECTION, so they cost nothing there.
@@ -64,8 +68,14 @@ constexpr uint32_t kTopicShmEntrySlots = 4096;
 constexpr uint32_t kTopicShmIdNum = AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID;
 constexpr uint32_t kTopicShmBitmapWords = kTopicShmIdNum / 64;
 // The largest operation is removing a subscriber: per entry one reference word
-// and one live flag, plus one id record (4 words) per publisher it empties.
-constexpr uint32_t kTopicShmUndoCap = 2 * kTopicShmEntrySlots + 4 * kTopicShmIdNum + 64;
+// and one live flag, plus one id record (5 words) per publisher it empties.
+constexpr uint32_t kTopicShmUndoCap = 2 * kTopicShmEntrySlots + 5 * kTopicShmIdNum + 64;
+
+// Who runs the data plane of a topic (AgnocastTopicShm::mode).
+enum : uint32_t {
+  TOPIC_SHM_MODE_CLIENT = 0, /* clients publish/receive on the segment themselves */
+  TOPIC_SHM_MODE_DAEMON = 1, /* only the daemon touches it; clients send requests */
+};
 
 enum : uint8_t {
   TOPIC_SHM_ID_FREE = 0,
@@ -81,12 +91,14 @@ struct TopicShmId
   uint8_t ignore_local;     /* subscriber */
   uint8_t need_mmap_update; /* subscriber: a publisher's memory may not be mapped yet */
   uint8_t exited;           /* publisher: its process has exited */
-  uint8_t _pad[2];
+  uint8_t reclaimed;        /* subscriber: found dead by a peer, references dropped */
+  uint8_t _pad;
   int32_t pid;
   uint32_t qos_depth;
   uint32_t entries_num; /* publisher; derived */
   uint32_t _pad2;
   int64_t latest_received_entry_id; /* subscriber */
+  uint64_t starttime; /* the process's start time (/proc/<pid>/stat field 22), 0 if unknown */
 };
 
 struct TopicShmEntry
@@ -110,8 +122,17 @@ struct TopicShmUndoRecord
 struct AgnocastTopicShm
 {
   uint32_t magic;
-  uint32_t _pad;
+  uint32_t layout_hash; /* topic_shm_layout_hash() of the build that created it */
   pthread_mutex_t mutex;
+  /* Written by the daemon and read without the mutex (atomically), so they sit
+   * outside the logged range. retired is set once the daemon has replaced this
+   * segment with a new one (a new epoch); every client then fetches the new one. */
+  uint32_t retired;
+  uint32_t mode;  /* TOPIC_SHM_MODE_* */
+  uint32_t epoch; /* 0 for a new topic, +1 per replacement */
+  /* Who holds the mutex, for stall reports. Informational only: a holder that
+   * dies leaves it stale until the next holder overwrites it. */
+  int32_t holder_pid;
   /* Bumped whenever a subscriber is added or removed, and on every recovery, so
    * a publisher knows when its cached copy of the subscribers' eventfds is out
    * of date. Only ever grows; not logged. */
@@ -126,6 +147,7 @@ struct AgnocastTopicShm
   /* Statistics for the rollback evaluation. */
   uint64_t rollback_count;      /* holders whose death was rolled back */
   uint64_t rollback_record_num; /* undo records replayed in total */
+  uint64_t peer_reclaim_count;  /* dead subscribers whose references a peer dropped */
   uint32_t undo_num;
   uint32_t undo_overflow;              /* the running operation outgrew the log */
   uint16_t order[kTopicShmEntrySlots]; /* slot indices by ascending entry_id */
@@ -136,7 +158,40 @@ struct AgnocastTopicShm
   TopicShmUndoRecord undo[kTopicShmUndoCap];
 };
 
-static_assert(sizeof(TopicShmId) == 32, "TopicShmId must be 32 bytes");
+static_assert(sizeof(TopicShmId) == 40, "TopicShmId must be 40 bytes");
+
+// Identifies the segment layout of a build: two processes that disagree on it
+// would misread each other's writes, so a mismatching segment is not used.
+constexpr uint32_t topic_shm_layout_hash()
+{
+  const uint64_t parts[] = {
+    AGNOCAST_TOPIC_SHM_MAGIC,
+    sizeof(AgnocastTopicShm),
+    sizeof(pthread_mutex_t),
+    sizeof(TopicShmId),
+    sizeof(TopicShmEntry),
+    sizeof(TopicShmUndoRecord),
+    kTopicShmEntrySlots,
+    kTopicShmIdNum,
+    kTopicShmUndoCap,
+    offsetof(AgnocastTopicShm, sub_generation),
+    offsetof(AgnocastTopicShm, current_entry_id),
+    offsetof(AgnocastTopicShm, order),
+    offsetof(AgnocastTopicShm, ids),
+    offsetof(AgnocastTopicShm, entries),
+    offsetof(AgnocastTopicShm, undo),
+    offsetof(TopicShmId, latest_received_entry_id),
+    offsetof(TopicShmEntry, refs),
+  };
+  uint32_t h = 2166136261u;  // FNV-1a over the bytes of each part
+  for (const uint64_t v : parts) {
+    for (int i = 0; i < 8; i++) {
+      h ^= static_cast<uint32_t>((v >> (8 * i)) & 0xff);
+      h *= 16777619u;
+    }
+  }
+  return h;
+}
 static_assert(sizeof(TopicShmUndoRecord) == 16, "TopicShmUndoRecord must be 16 bytes");
 static_assert(kTopicShmEntrySlots <= 65536, "slot indices are 16 bit");
 static_assert(sizeof(AgnocastTopicShm) < UINT32_MAX, "undo offsets are 32 bit");
@@ -167,9 +222,12 @@ inline void topic_shm_log_bytes(AgnocastTopicShm * shm, const void * field, uint
   rec.old_value = 0;
   std::memcpy(&rec.old_value, field, size);
   // The record must be complete before it counts, and must count before the
-  // field changes: the holder can be killed between any two instructions.
+  // field changes: the holder can be killed between any two instructions. What
+  // must be ordered is this thread's own stores as seen after its death, so the
+  // fence that matters is the compiler's (a signal fence); the release store
+  // also orders them for a peer that takes the lock afterwards.
   __atomic_store_n(&shm->undo_num, n + 1, __ATOMIC_RELEASE);
-  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 // Logged store of a canonical field.
@@ -291,23 +349,124 @@ inline int topic_shm_init(AgnocastTopicShm * shm)
   for (uint32_t i = 0; i < kTopicShmEntrySlots; i++) {
     shm->free_slots[i] = static_cast<uint16_t>(kTopicShmEntrySlots - 1 - i);
   }
+  shm->layout_hash = topic_shm_layout_hash();
   __atomic_store_n(&shm->magic, AGNOCAST_TOPIC_SHM_MAGIC, __ATOMIC_RELEASE);
   return 0;
 }
 
-inline void topic_shm_lock(AgnocastTopicShm * shm)
+// getpid() is a system call; the holder's pid is written on every lock, so it
+// is cached here and refreshed in a forked child.
+inline pid_t & topic_shm_cached_pid()
 {
-  const int ret = pthread_mutex_lock(&shm->mutex);
-  if (ret == EOWNERDEAD) {
+  static pid_t pid = [] {
+    pthread_atfork(nullptr, nullptr, [] { topic_shm_cached_pid() = getpid(); });
+    return getpid();
+  }();
+  return pid;
+}
+
+// Called right after the mutex was taken. Returns true when the previous holder
+// had died mid-operation and its operation was rolled back.
+inline bool topic_shm_after_lock(AgnocastTopicShm * shm, int lock_ret)
+{
+  const bool recovered = (lock_ret == EOWNERDEAD);
+  if (recovered) {
     topic_shm_recover(shm);
     pthread_mutex_consistent(&shm->mutex);
   }
+  __atomic_store_n(&shm->holder_pid, topic_shm_cached_pid(), __ATOMIC_RELAXED);
+  return recovered;
+}
+
+// Returns true when it rolled back a dead holder's operation.
+inline bool topic_shm_lock_ex(AgnocastTopicShm * shm)
+{
+  return topic_shm_after_lock(shm, pthread_mutex_lock(&shm->mutex));
+}
+
+inline void topic_shm_lock(AgnocastTopicShm * shm)
+{
+  (void)topic_shm_lock_ex(shm);
+}
+
+// 0 once the mutex is held (*recovered as for topic_shm_lock_ex), ETIMEDOUT
+// when timeout_ms passed first. A stopped holder never lets go, and a robust
+// mutex only helps when the holder dies; the caller decides what to do then.
+inline int topic_shm_timedlock(AgnocastTopicShm * shm, int64_t timeout_ms, bool * recovered)
+{
+  int ret = pthread_mutex_trylock(&shm->mutex);
+  if (ret == EBUSY) {
+    timespec abs{};
+    clock_gettime(CLOCK_REALTIME, &abs);
+    abs.tv_sec += static_cast<time_t>(timeout_ms / 1000);
+    abs.tv_nsec += static_cast<long>((timeout_ms % 1000) * 1000000);
+    if (abs.tv_nsec >= 1000000000L) {
+      abs.tv_sec++;
+      abs.tv_nsec -= 1000000000L;
+    }
+    ret = pthread_mutex_timedlock(&shm->mutex, &abs);
+  }
+  if (ret == ETIMEDOUT) return ETIMEDOUT;
+  if (ret != 0 && ret != EOWNERDEAD) return ret;
+  const bool r = topic_shm_after_lock(shm, ret);
+  if (recovered != nullptr) *recovered = r;
+  return 0;
 }
 
 inline void topic_shm_unlock(AgnocastTopicShm * shm)
 {
   topic_shm_commit(shm);
+  __atomic_store_n(&shm->holder_pid, 0, __ATOMIC_RELAXED);
   pthread_mutex_unlock(&shm->mutex);
+}
+
+// The start time of a process (/proc/<pid>/stat field 22), 0 when it is gone or
+// unknown. Together with the pid it names one process: a pid can be reused.
+inline uint64_t topic_shm_proc_starttime(int32_t pid)
+{
+  if (pid <= 0) return 0;
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+  std::FILE * f = std::fopen(path, "re");
+  if (f == nullptr) return 0;
+  char buf[1024];
+  const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+  std::fclose(f);
+  buf[n] = '\0';
+  // The command name (field 2) is in parentheses and may contain spaces.
+  const char * p = std::strrchr(buf, ')');
+  if (p == nullptr) return 0;
+  int field = 2;
+  for (p++; *p != '\0'; p++) {
+    if (*p == ' ' && ++field == 22) return std::strtoull(p + 1, nullptr, 10);
+  }
+  return 0;
+}
+
+// Whether the process (pid, starttime) still runs. starttime 0 means unknown:
+// then any process with that pid counts.
+inline bool topic_shm_proc_alive(int32_t pid, uint64_t starttime)
+{
+  if (pid <= 0) return false;
+  if (starttime == 0) return kill(pid, 0) == 0 || errno == EPERM;
+  return topic_shm_proc_starttime(pid) == starttime;
+}
+
+inline bool topic_shm_is_retired(const AgnocastTopicShm * shm)
+{
+  return __atomic_load_n(&shm->retired, __ATOMIC_ACQUIRE) != 0;
+}
+
+// The cheap part of topic_shm_check, run by a client after each lock: catches
+// a segment that something outside topic_shm_* has written over. Caller holds
+// the mutex.
+inline bool topic_shm_quick_check(const AgnocastTopicShm * shm)
+{
+  return shm->magic == AGNOCAST_TOPIC_SHM_MAGIC && shm->layout_hash == topic_shm_layout_hash() &&
+         shm->entry_num <= kTopicShmEntrySlots && shm->free_num <= kTopicShmEntrySlots &&
+         shm->entry_num + shm->free_num == kTopicShmEntrySlots && shm->sub_num <= kTopicShmIdNum &&
+         shm->undo_num == 0 && shm->next_pubsub_id >= 0 &&
+         shm->next_pubsub_id <= static_cast<int32_t>(kTopicShmIdNum);
 }
 
 class TopicShmLock
@@ -409,6 +568,7 @@ inline int topic_shm_insert(
   std::memset(en.refs, 0, sizeof(en.refs));
   topic_shm_set(shm, en.live, 1u);
   topic_shm_set(shm, shm->current_entry_id, shm->current_entry_id + 1);
+  TOPIC_SHM_FAULT_POINT("shm.publish");
   shm->free_num--;
   // Entry ids only grow, so the new entry is the newest.
   shm->order[shm->entry_num++] = slot;
@@ -468,17 +628,38 @@ inline int topic_shm_publish(
   for (uint32_t i = 0; i < shm->sub_num; i++) {
     const uint16_t id = shm->sub_ids[i];
     const TopicShmId & sub = shm->ids[id];
-    if (sub.is_take_sub) continue;
+    if (sub.is_take_sub || sub.reclaimed) continue;
     if (sub.ignore_local && sub.pid == pub.pid) continue;
     subscriber_ids[(*subscriber_num)++] = id;
   }
   return 0;
 }
 
+// The readers below take an IsMapped functor:
+//   is_mapped(pid)                 can the caller read that publisher's memory
+//   is_mapped.valid_address(pid, addr)  is addr inside that publisher's pool
+// An entry whose address fails the second check is never handed out: the
+// reader skips it and describes it in *bad, so the caller can report it.
 struct TopicShmAlwaysMapped
 {
   bool operator()(int32_t /*publisher_pid*/) const { return true; }
+  bool valid_address(int32_t /*publisher_pid*/, uint64_t /*addr*/) const { return true; }
 };
+
+// The first entry a reader refused because of its address.
+struct TopicShmBadEntry
+{
+  int32_t publisher_pid = 0;
+  int64_t entry_id = -1;
+};
+
+inline void topic_shm_note_bad(TopicShmBadEntry * bad, int32_t pid, int64_t entry_id)
+{
+  if (bad != nullptr && bad->entry_id < 0) {
+    bad->publisher_pid = pid;
+    bad->entry_id = entry_id;
+  }
+}
 
 // Mirrors receive_msg_core. is_mapped(pid) says whether the caller can read
 // that publisher's memory; the scan stops at the first entry it cannot, without
@@ -486,13 +667,14 @@ struct TopicShmAlwaysMapped
 template <typename IsMapped>
 inline int topic_shm_receive(
   AgnocastTopicShm * shm, int32_t subscriber_id, const IsMapped & is_mapped, int64_t * entry_ids,
-  uint64_t * entry_addrs, uint16_t * entry_num, bool * call_again)
+  uint64_t * entry_addrs, uint16_t * entry_num, bool * call_again, TopicShmBadEntry * bad = nullptr)
 {
   *entry_num = 0;
   *call_again = false;
   if (!topic_shm_valid_id(subscriber_id)) return -EINVAL;
   TopicShmId & sub = shm->ids[subscriber_id];
   if (sub.kind != TOPIC_SHM_ID_SUBSCRIBER) return -EINVAL;
+  if (sub.reclaimed) return -ESRCH;
   if (shm->entry_num == 0) return 0;
 
   const int64_t newest_entry_id = topic_shm_entry_at(shm, shm->entry_num - 1).entry_id;
@@ -511,7 +693,12 @@ inline int topic_shm_receive(
     if (pub.exited) continue;
     if (sub.ignore_local && sub.pid == pub.pid) continue;
     if (!is_mapped(pub.pid)) break;
+    if (!is_mapped.valid_address(pub.pid, en.msg_virtual_address)) {
+      topic_shm_note_bad(bad, pub.pid, en.entry_id);
+      continue;
+    }
     if (!topic_shm_set_ref(shm, en, subscriber_id)) return -EALREADY;
+    TOPIC_SHM_FAULT_POINT("shm.receive");
 
     entry_ids[*entry_num] = en.entry_id;
     entry_addrs[*entry_num] = en.msg_virtual_address;
@@ -527,6 +714,7 @@ inline int topic_shm_release_ref(AgnocastTopicShm * shm, int32_t subscriber_id, 
   TopicShmEntry * en = topic_shm_find_entry(shm, entry_id);
   if (en == nullptr) return -EINVAL;
   if (!topic_shm_clear_ref(shm, *en, subscriber_id)) return -EINVAL;
+  TOPIC_SHM_FAULT_POINT("shm.release");
   return 0;
 }
 
@@ -536,13 +724,14 @@ inline int topic_shm_release_ref(AgnocastTopicShm * shm, int32_t subscriber_id, 
 template <typename IsMapped>
 inline int topic_shm_take(
   AgnocastTopicShm * shm, int32_t subscriber_id, bool allow_same_message,
-  const IsMapped & is_mapped, uint64_t * addr, int64_t * entry_id)
+  const IsMapped & is_mapped, uint64_t * addr, int64_t * entry_id, TopicShmBadEntry * bad = nullptr)
 {
   *addr = 0;
   *entry_id = -1;
   if (!topic_shm_valid_id(subscriber_id)) return -EINVAL;
   TopicShmId & sub = shm->ids[subscriber_id];
   if (sub.kind != TOPIC_SHM_ID_SUBSCRIBER) return -EINVAL;
+  if (sub.reclaimed) return -ESRCH;
 
   uint32_t searched_count = 0;
   TopicShmEntry * candidate = nullptr;
@@ -557,6 +746,10 @@ inline int topic_shm_take(
     if (pub.exited) continue;
     if (sub.ignore_local && sub.pid == pub.pid) continue;
     if (!is_mapped(pub.pid)) continue;
+    if (!is_mapped.valid_address(pub.pid, en.msg_virtual_address)) {
+      topic_shm_note_bad(bad, pub.pid, en.entry_id);
+      continue;
+    }
 
     candidate = &en;
     searched_count++;
@@ -568,6 +761,7 @@ inline int topic_shm_take(
     if (!already_referenced && !topic_shm_set_ref(shm, *candidate, subscriber_id)) {
       return -EALREADY;
     }
+    TOPIC_SHM_FAULT_POINT("shm.take");
     *addr = candidate->msg_virtual_address;
     *entry_id = candidate->entry_id;
     topic_shm_set(shm, sub.latest_received_entry_id, candidate->entry_id);
@@ -618,7 +812,8 @@ inline int topic_shm_alloc_id(AgnocastTopicShm * shm, int32_t * id)
 }
 
 inline int topic_shm_add_publisher(
-  AgnocastTopicShm * shm, int32_t pid, uint32_t qos_depth, bool transient_local, int32_t * id)
+  AgnocastTopicShm * shm, int32_t pid, uint32_t qos_depth, bool transient_local, int32_t * id,
+  uint64_t starttime = 0)
 {
   const int ret = topic_shm_alloc_id(shm, id);
   if (ret < 0) return ret;
@@ -627,6 +822,7 @@ inline int topic_shm_add_publisher(
   std::memset(&pub, 0, sizeof(pub));
   pub.kind = TOPIC_SHM_ID_PUBLISHER;
   pub.pid = pid;
+  pub.starttime = starttime;
   pub.qos_depth = qos_depth;
   pub.transient_local = transient_local;
   TOPIC_SHM_FAULT_POINT("shm.add_publisher");
@@ -637,7 +833,7 @@ inline int topic_shm_add_publisher(
 
 inline int topic_shm_add_subscriber(
   AgnocastTopicShm * shm, int32_t pid, uint32_t qos_depth, bool transient_local, bool is_take_sub,
-  bool ignore_local, int32_t * id)
+  bool ignore_local, int32_t * id, uint64_t starttime = 0)
 {
   const int ret = topic_shm_alloc_id(shm, id);
   if (ret < 0) return ret;
@@ -646,6 +842,7 @@ inline int topic_shm_add_subscriber(
   std::memset(&sub, 0, sizeof(sub));
   sub.kind = TOPIC_SHM_ID_SUBSCRIBER;
   sub.pid = pid;
+  sub.starttime = starttime;
   sub.qos_depth = qos_depth;
   sub.transient_local = transient_local;
   sub.is_take_sub = is_take_sub;
@@ -732,6 +929,93 @@ inline uint32_t topic_shm_remove_publisher(
 }
 
 // ============================================================
+// Peers cleaning up after a dead subscriber (no daemon needed)
+// ============================================================
+
+// While the daemon is down nobody removes a dead subscriber, and the entries it
+// referenced stay pinned. A publisher short of free slots calls this: every
+// subscriber that is_alive(pid, starttime) says is gone loses its references
+// and is marked reclaimed (no longer notified or served). The daemon removes
+// it for good later, which is unaffected by what was done here. Caller holds
+// the mutex. Returns how many subscribers it reclaimed.
+template <typename IsAlive>
+inline uint32_t topic_shm_reclaim_dead_subscribers(AgnocastTopicShm * shm, const IsAlive & is_alive)
+{
+  uint32_t reclaimed = 0;
+  for (uint32_t i = 0; i < shm->sub_num; i++) {
+    const uint16_t id = shm->sub_ids[i];
+    TopicShmId & sub = shm->ids[id];
+    if (sub.reclaimed || is_alive(sub.pid, sub.starttime)) continue;
+    for (uint32_t pos = 0; pos < shm->entry_num; pos++) {
+      (void)topic_shm_clear_ref(shm, topic_shm_entry_at(shm, pos), id);
+    }
+    topic_shm_set(shm, sub.reclaimed, uint8_t{1});
+    reclaimed++;
+  }
+  shm->peer_reclaim_count += reclaimed;
+  return reclaimed;
+}
+
+// ============================================================
+// Replacing a damaged segment (the daemon's side)
+// ============================================================
+
+// Fills fresh (just initialized by topic_shm_init, seen by nobody) from old (a
+// private copy of the damaged segment, not the live one) and makes it
+// consistent. Nothing is taken on trust from old:
+//   keep_id(id, old_rec, &out)   the daemon's registry decides which ids
+//                                survive and what they hold; old_rec is only
+//                                a hint (receive position) and may be garbage
+//   keep_entry(entry)            whether a live entry of a surviving
+//                                publisher is genuine (address in its pool)
+// References of ids that did not survive are dropped by the rebuild.
+template <typename KeepId, typename KeepEntry>
+inline void topic_shm_salvage(
+  const AgnocastTopicShm * old, AgnocastTopicShm * fresh, const KeepId & keep_id,
+  const KeepEntry & keep_entry)
+{
+  fresh->current_entry_id = std::max<int64_t>(old->current_entry_id, 0);
+  fresh->next_pubsub_id = std::min<int32_t>(
+    std::max<int32_t>(old->next_pubsub_id, 0), static_cast<int32_t>(kTopicShmIdNum));
+  for (uint32_t id = 0; id < kTopicShmIdNum; id++) {
+    TopicShmId rec{};
+    if (keep_id(static_cast<int32_t>(id), old->ids[id], &rec)) fresh->ids[id] = rec;
+  }
+
+  uint32_t free_num = 0;
+  for (uint32_t slot = 0; slot < kTopicShmEntrySlots; slot++) {
+    const TopicShmEntry & en = old->entries[slot];
+    const bool keep = en.live != 0 && topic_shm_valid_id(en.publisher_id) &&
+                      fresh->ids[en.publisher_id].kind == TOPIC_SHM_ID_PUBLISHER &&
+                      en.entry_id >= 0 && keep_entry(en);
+    if (keep) {
+      fresh->entries[slot] = en;
+      fresh->entries[slot].live = 1;
+      if (en.entry_id >= fresh->current_entry_id) fresh->current_entry_id = en.entry_id + 1;
+    } else {
+      std::memset(&fresh->entries[slot], 0, sizeof(fresh->entries[slot]));
+      free_num++;
+    }
+  }
+  (void)free_num;
+  // A receive position past the newest entry would hide everything after it.
+  for (uint32_t id = 0; id < kTopicShmIdNum; id++) {
+    TopicShmId & rec = fresh->ids[id];
+    if (rec.kind != TOPIC_SHM_ID_SUBSCRIBER) continue;
+    if (rec.latest_received_entry_id >= fresh->current_entry_id) {
+      rec.latest_received_entry_id = fresh->current_entry_id - 1;
+    }
+    if (rec.latest_received_entry_id < -1) rec.latest_received_entry_id = -1;
+  }
+  fresh->rollback_count = old->rollback_count;
+  fresh->rollback_record_num = old->rollback_record_num;
+  fresh->peer_reclaim_count = old->peer_reclaim_count;
+  fresh->sub_generation = old->sub_generation + 1;
+  topic_shm_rebuild(fresh);
+  topic_shm_commit(fresh);
+}
+
+// ============================================================
 // Invariants
 // ============================================================
 
@@ -746,7 +1030,13 @@ inline uint32_t topic_shm_check(AgnocastTopicShm * shm, char * msg, size_t msg_s
     }
   };
 
+  if (shm->magic != AGNOCAST_TOPIC_SHM_MAGIC || shm->layout_hash != topic_shm_layout_hash()) {
+    fail("magic %ld / layout hash %ld do not match this build", shm->magic, shm->layout_hash);
+  }
   if (shm->undo_num != 0) fail("undo log not empty (%ld records)", shm->undo_num, 0);
+  if (shm->next_pubsub_id < 0 || shm->next_pubsub_id > static_cast<int32_t>(kTopicShmIdNum)) {
+    fail("next_pubsub_id %ld out of range (%ld)", shm->next_pubsub_id, kTopicShmIdNum);
+  }
   if (shm->entry_num + shm->free_num != kTopicShmEntrySlots) {
     fail("entry_num %ld + free_num %ld != slots", shm->entry_num, shm->free_num);
   }
@@ -756,10 +1046,18 @@ inline uint32_t topic_shm_check(AgnocastTopicShm * shm, char * msg, size_t msg_s
   uint32_t entries_of[kTopicShmIdNum] = {};
   for (uint32_t pos = 0; pos < shm->entry_num && pos < kTopicShmEntrySlots; pos++) {
     const uint16_t slot = shm->order[pos];
+    // A segment written over from outside can hold anything: index only with
+    // values that were checked first.
+    if (slot >= kTopicShmEntrySlots) {
+      fail("order[%ld] = %ld is not a slot", pos, slot);
+      continue;
+    }
     const TopicShmEntry & en = shm->entries[slot];
     if (seen[slot]++) fail("slot %ld listed twice in order[] (pos %ld)", slot, pos);
     if (en.live == 0) fail("slot %ld in order[] is not live (pos %ld)", slot, pos);
-    if (pos > 0 && shm->entries[shm->order[pos - 1]].entry_id >= en.entry_id) {
+    if (
+      pos > 0 && shm->order[pos - 1] < kTopicShmEntrySlots &&
+      shm->entries[shm->order[pos - 1]].entry_id >= en.entry_id) {
       fail("order[] not ascending at pos %ld (entry %ld)", pos, en.entry_id);
     }
     if (en.entry_id >= shm->current_entry_id) {
@@ -781,6 +1079,8 @@ inline uint32_t topic_shm_check(AgnocastTopicShm * shm, char * msg, size_t msg_s
         bits &= bits - 1;
         if (shm->ids[id].kind != TOPIC_SHM_ID_SUBSCRIBER) {
           fail("entry %ld referenced by non-subscriber id %ld", en.entry_id, id);
+        } else if (shm->ids[id].reclaimed) {
+          fail("entry %ld referenced by reclaimed subscriber %ld", en.entry_id, id);
         }
       }
     }
@@ -788,6 +1088,10 @@ inline uint32_t topic_shm_check(AgnocastTopicShm * shm, char * msg, size_t msg_s
   }
   for (uint32_t i = 0; i < shm->free_num && i < kTopicShmEntrySlots; i++) {
     const uint16_t slot = shm->free_slots[i];
+    if (slot >= kTopicShmEntrySlots) {
+      fail("free_slots[%ld] = %ld is not a slot", i, slot);
+      continue;
+    }
     if (seen[slot]++) fail("free slot %ld also listed elsewhere (index %ld)", slot, i);
     if (shm->entries[slot].live != 0) fail("free slot %ld is live (index %ld)", slot, i);
   }
@@ -807,7 +1111,9 @@ inline uint32_t topic_shm_check(AgnocastTopicShm * shm, char * msg, size_t msg_s
   }
   if (sub_count != shm->sub_num) fail("sub_num %ld != subscribers %ld", shm->sub_num, sub_count);
   for (uint32_t i = 0; i < shm->sub_num && i < kTopicShmIdNum; i++) {
-    if (shm->ids[shm->sub_ids[i]].kind != TOPIC_SHM_ID_SUBSCRIBER) {
+    if (shm->sub_ids[i] >= kTopicShmIdNum) {
+      fail("sub_ids[%ld] = %ld is not an id", i, shm->sub_ids[i]);
+    } else if (shm->ids[shm->sub_ids[i]].kind != TOPIC_SHM_ID_SUBSCRIBER) {
       fail("sub_ids[%ld] = %ld is not a subscriber", i, shm->sub_ids[i]);
     }
   }

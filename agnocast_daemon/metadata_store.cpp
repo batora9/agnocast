@@ -14,10 +14,7 @@ TopicWrapper::~TopicWrapper()
   if (shm_fd >= 0) close(shm_fd);
 }
 
-namespace
-{
-
-bool create_topic_shm(TopicWrapper & wrapper)
+bool MetadataStore::create_segment(int * out_fd, AgnocastTopicShm ** out_shm)
 {
   const int fd = memfd_create("agnocast_topic", MFD_CLOEXEC | MFD_ALLOW_SEALING);
   if (fd < 0) return false;
@@ -37,12 +34,10 @@ bool create_topic_shm(TopicWrapper & wrapper)
     close(fd);
     return false;
   }
-  wrapper.shm_fd = fd;
-  wrapper.shm = shm;
+  *out_fd = fd;
+  *out_shm = shm;
   return true;
 }
-
-}  // namespace
 
 TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
 {
@@ -51,7 +46,7 @@ TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
     return it->second.get();
   }
   auto wrapper = std::make_unique<TopicWrapper>();
-  if (!create_topic_shm(*wrapper)) return nullptr;
+  if (!create_segment(&wrapper->shm_fd, &wrapper->shm)) return nullptr;
   wrapper->key = key.name;
   wrapper->domain_id = key.domain_id;
   auto * ptr = wrapper.get();
@@ -99,7 +94,11 @@ int MetadataStore::adopt_topic(const TopicKey & key, int shm_fd, TopicWrapper **
     mmap(nullptr, sizeof(AgnocastTopicShm), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
   if (mapped == MAP_FAILED) return -errno;
   auto * shm = static_cast<AgnocastTopicShm *>(mapped);
-  if (__atomic_load_n(&shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_TOPIC_SHM_MAGIC) {
+  // A segment of another build, or one this daemon's predecessor had already
+  // replaced, is not taken back.
+  if (
+    __atomic_load_n(&shm->magic, __ATOMIC_ACQUIRE) != AGNOCAST_TOPIC_SHM_MAGIC ||
+    shm->layout_hash != topic_shm_layout_hash() || topic_shm_is_retired(shm)) {
     munmap(mapped, sizeof(AgnocastTopicShm));
     return -EINVAL;
   }

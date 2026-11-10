@@ -17,10 +17,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -131,6 +133,23 @@ void unlink_posix_resources_for_exit(
   }
 }
 
+// The daemon maps every pool, so it can read any publisher; what it checks is
+// that an entry's address lies in the pool of the publisher that owns it.
+// Caller holds global_mutex_.
+struct DaemonReadable
+{
+  MetadataStore & store;
+  MemoryAllocator & allocator;
+  bool operator()(int32_t /*publisher_pid*/) const { return true; }
+  bool valid_address(int32_t publisher_pid, uint64_t addr) const
+  {
+    const ProcessInfo * proc = store.find_process(publisher_pid);
+    if (proc == nullptr || proc->mempool_entry == nullptr) return false;
+    const uint64_t start = proc->mempool_entry->addr;
+    return addr >= start && addr < start + allocator.mempool_size_bytes();
+  }
+};
+
 int insert_subscriber_info(
   TopicWrapper * wrapper, const char * node_name, pid_t subscriber_pid, uint32_t qos_depth,
   bool qos_is_transient_local, bool qos_is_reliable, bool is_take_sub,
@@ -140,12 +159,15 @@ int insert_subscriber_info(
     return -ENOBUFS;
   }
 
+  if (wrapper->quarantined.count(subscriber_pid) > 0) return -EPERM;
+
   int32_t new_id = -1;
+  const uint64_t starttime = topic_shm_proc_starttime(subscriber_pid);
   {
     TopicShmLock lock(wrapper->shm);
     const int ret = topic_shm_add_subscriber(
       wrapper->shm, subscriber_pid, qos_depth, qos_is_transient_local, is_take_sub,
-      ignore_local_publications, &new_id);
+      ignore_local_publications, &new_id, starttime);
     if (ret < 0) return ret;
   }
   SubscriberInfo info;
@@ -174,11 +196,14 @@ int insert_publisher_info(
     return -ENOBUFS;
   }
 
+  if (wrapper->quarantined.count(publisher_pid) > 0) return -EPERM;
+
   int32_t new_id = -1;
+  const uint64_t starttime = topic_shm_proc_starttime(publisher_pid);
   {
     TopicShmLock lock(wrapper->shm);
     const int ret = topic_shm_add_publisher(
-      wrapper->shm, publisher_pid, qos_depth, qos_is_transient_local, &new_id);
+      wrapper->shm, publisher_pid, qos_depth, qos_is_transient_local, &new_id, starttime);
     if (ret < 0) return ret;
   }
   PublisherInfo info;
@@ -458,6 +483,12 @@ void CommandHandlers::dispatch(
     case AGNOCAST_CMD_GET_RECOVERY_STATUS:
       handle_get_recovery_status(client_fd);
       break;
+    case AGNOCAST_CMD_REPORT_ANOMALY:
+      handle_report_anomaly(client_fd, client_pid, payload);
+      break;
+    case AGNOCAST_CMD_GET_TOPIC_SEGMENT:
+      handle_get_topic_segment(client_fd, client_pid, payload);
+      break;
     case AGNOCAST_CMD_RELEASE_SUB_REF:
       handle_release_sub_ref(client_fd, client_pid, payload);
       break;
@@ -571,6 +602,7 @@ void CommandHandlers::handle_add_process(int fd, pid_t pid, const void * payload
   proc.is_performance_bridge_manager = req->is_performance_bridge_manager;
   proc.domain_id = req->domain_id;
   proc.pid = pid;
+  proc.starttime = topic_shm_proc_starttime(pid);
   proc.mempool_entry = allocator_.assign_memory(pid);
   if (!proc.mempool_entry) {
     send_response(fd, ENOMEM);
@@ -704,6 +736,13 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
     send_response(fd, EINVAL);
     return;
   }
+  // Once a topic is on the daemon path the daemon is its only writer: it then
+  // serves a publisher id only to the process that registered it.
+  const bool daemon_path = wrapper->shm->mode == TOPIC_SHM_MODE_DAEMON;
+  if ((daemon_path && pub_info->pid != pid) || wrapper->quarantined.count(pid) > 0) {
+    send_response(fd, EPERM);
+    return;
+  }
 
   ProcessInfo * proc_info = store_.find_process(pub_info->pid);
   if (!proc_info) {
@@ -779,8 +818,8 @@ void CommandHandlers::handle_receive_msg(int fd, pid_t pid, const void * payload
   // need_mmap_update cannot be set again between the receive and the mapping.
   TopicShmLock lock(wrapper->shm);
   int ret = topic_shm_receive(
-    wrapper->shm, req->subscriber_id, TopicShmAlwaysMapped{}, resp.entry_ids, resp.entry_addrs,
-    &resp.entry_num, &resp.call_again);
+    wrapper->shm, req->subscriber_id, DaemonReadable{store_, allocator_}, resp.entry_ids,
+    resp.entry_addrs, &resp.entry_num, &resp.call_again);
   if (ret < 0) {
     send_response(fd, -ret);
     return;
@@ -826,8 +865,8 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
   TakeMsgResponse resp{};
   TopicShmLock lock(wrapper->shm);
   const int ret = topic_shm_take(
-    wrapper->shm, req->subscriber_id, req->allow_same_message, TopicShmAlwaysMapped{}, &resp.addr,
-    &resp.entry_id);
+    wrapper->shm, req->subscriber_id, req->allow_same_message, DaemonReadable{store_, allocator_},
+    &resp.addr, &resp.entry_id);
   if (ret < 0) {
     send_response(fd, -ret);
     return;
@@ -1452,7 +1491,8 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
     std::unique_lock glock(store_.global_mutex_);
 
     ProcessInfo * proc_info = store_.find_process(pid);
-    if (!proc_info) return;
+    // Both the pidfd and the socket report the same exit: clean up once.
+    if (!proc_info || proc_info->exited) return;
 
     proc_info->exited = true;
     allocator_.free_memory(pid);
@@ -1521,6 +1561,11 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
 }
 
 void CommandHandlers::on_client_disconnect(pid_t client_pid)
+{
+  process_exit_cleanup(client_pid);
+}
+
+void CommandHandlers::on_client_exit(pid_t client_pid)
 {
   process_exit_cleanup(client_pid);
 }
@@ -1619,6 +1664,7 @@ void CommandHandlers::handle_restore_process(int fd, pid_t pid, const void * pay
   proc.domain_id = req->domain_id;
   proc.is_performance_bridge_manager = req->is_performance_bridge_manager;
   proc.mempool_entry = entry;
+  proc.starttime = topic_shm_proc_starttime(pid);
   store_.proc_info_map_.emplace(pid, std::move(proc));
   persist_state_locked();
   send_response(fd, 0);
@@ -1862,13 +1908,16 @@ void CommandHandlers::persist_state_locked()
     if (!ofs) return;
     ofs << "agnocast_daemon " << getpid() << "\n";
     for (const auto & [pid, proc] : store_.proc_info_map_) {
-      if (!proc.exited) ofs << pid << "\n";
+      if (!proc.exited) ofs << pid << " " << proc.starttime << "\n";
     }
     // A crash during the recovery must not forget the clients still to restore.
     std::lock_guard<std::mutex> lock(recovery_mtx_);
     if (recovery_.in_recovery) {
       for (const auto & [pid, state] : recovery_.expected) {
-        if (state == RestoreState::Pending) ofs << pid << "\n";
+        if (state == RestoreState::Pending) {
+          const auto st = recovery_.expected_starttime.find(pid);
+          ofs << pid << " " << (st != recovery_.expected_starttime.end() ? st->second : 0) << "\n";
+        }
       }
     }
   }
@@ -1878,11 +1927,20 @@ void CommandHandlers::persist_state_locked()
   }
 }
 
-void CommandHandlers::start_recovery(const std::vector<pid_t> & expected_pids, int64_t timeout_ms)
+bool CommandHandlers::expected_alive_locked(pid_t pid) const
+{
+  const auto it = recovery_.expected_starttime.find(pid);
+  return topic_shm_proc_alive(pid, it != recovery_.expected_starttime.end() ? it->second : 0);
+}
+
+void CommandHandlers::start_recovery(
+  const std::vector<pid_t> & expected_pids, int64_t timeout_ms,
+  const std::unordered_map<pid_t, uint64_t> & starttimes)
 {
   {
     std::lock_guard<std::mutex> lock(recovery_mtx_);
     recovery_ = Recovery{};
+    recovery_.expected_starttime = starttimes;
     recovery_.recovered = true;
     recovery_.in_recovery = true;
     recovery_.start_ns = monotonic_ns();
@@ -1904,7 +1962,7 @@ void CommandHandlers::recovery_thread_main()
     bool settled = true;
     for (auto & [pid, state] : recovery_.expected) {
       if (state != RestoreState::Pending) continue;
-      if (pid_alive(pid)) {
+      if (expected_alive_locked(pid)) {
         settled = false;
       } else {
         state = RestoreState::Dead;
@@ -1929,7 +1987,9 @@ void CommandHandlers::finish_recovery()
       if (!recovery_.in_recovery || recovery_.finishing) return;
       recovery_.finishing = true;
       for (auto & [pid, state] : recovery_.expected) {
-        if (state == RestoreState::Pending && !pid_alive(pid)) state = RestoreState::Dead;
+        if (state == RestoreState::Pending && !expected_alive_locked(pid)) {
+          state = RestoreState::Dead;
+        }
         if (state == RestoreState::Pending) recovery_.timed_out_num++;
         if (state == RestoreState::Dead) dead.push_back(pid);
       }
@@ -2068,5 +2128,293 @@ void CommandHandlers::handle_debug_check_topic(int fd, pid_t pid, const void * p
   resp.rollback_record_num = shm->rollback_record_num;
   resp.entry_num = shm->entry_num;
   resp.sub_num = shm->sub_num;
+  resp.epoch = shm->epoch;
+  resp.mode = shm->mode;
+  resp.rotation_num = wrapper->rotation_num;
+  resp.quarantined_num = static_cast<uint32_t>(wrapper->quarantined.size());
+  resp.stall_kill_num = wrapper->stall_kill_num;
+  resp.anomaly_report_num = wrapper->anomaly_report_num;
+  resp.peer_reclaim_count = shm->peer_reclaim_count;
   send_response(fd, 0, &resp, sizeof(resp));
+}
+
+// ============================================================
+// Anomalies: check what a client reported, repair, quarantine
+// ============================================================
+
+namespace
+{
+
+int64_t env_ms(const char * name, int64_t fallback)
+{
+  const char * v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return fallback;
+  const long long n = std::strtoll(v, nullptr, 10);
+  return n > 0 ? n : fallback;
+}
+
+// AGNOCAST_STALL_ACTION=report leaves a stalled holder alone (and the topic
+// stuck until it moves); the default kills it, after which the robust mutex
+// hands the next locker EOWNERDEAD and the undo log rolls its operation back.
+bool stall_action_kill()
+{
+  const char * v = std::getenv("AGNOCAST_STALL_ACTION");
+  return v == nullptr || std::strcmp(v, "report") != 0;
+}
+
+const char * anomaly_name(uint32_t kind)
+{
+  switch (kind) {
+    case AGNOCAST_ANOMALY_RECOVERED:
+      return "recovered";
+    case AGNOCAST_ANOMALY_CHECK_FAILED:
+      return "check-failed";
+    case AGNOCAST_ANOMALY_BAD_ADDRESS:
+      return "bad-address";
+    case AGNOCAST_ANOMALY_STALL:
+      return "stall";
+    case AGNOCAST_ANOMALY_LAYOUT:
+      return "layout";
+    default:
+      return "unknown";
+  }
+}
+
+}  // namespace
+
+void CommandHandlers::quarantine_locked(TopicWrapper * wrapper, pid_t pid)
+{
+  wrapper->quarantined.insert(pid);
+  for (auto it = wrapper->topic.pub_info_map.begin(); it != wrapper->topic.pub_info_map.end();) {
+    it = (it->second.pid == pid) ? wrapper->topic.pub_info_map.erase(it) : std::next(it);
+  }
+  for (auto it = wrapper->topic.sub_info_map.begin(); it != wrapper->topic.sub_info_map.end();) {
+    if (it->second.pid != pid) {
+      ++it;
+      continue;
+    }
+    if (it->second.notify_eventfd >= 0) close(it->second.notify_eventfd);
+    it = wrapper->topic.sub_info_map.erase(it);
+  }
+}
+
+bool CommandHandlers::rotate_topic_locked(
+  TopicWrapper * wrapper, AgnocastTopicShm * old_copy, uint32_t mode)
+{
+  int new_fd = -1;
+  AgnocastTopicShm * fresh = nullptr;
+  if (!MetadataStore::create_segment(&new_fd, &fresh)) return false;
+
+  // A stalled holder was stopped mid-operation: undo it on the copy first.
+  if (old_copy->undo_num != 0) topic_shm_recover(old_copy);
+
+  const auto & pubs = wrapper->topic.pub_info_map;
+  const auto & subs = wrapper->topic.sub_info_map;
+  const int64_t old_current = std::max<int64_t>(old_copy->current_entry_id, 0);
+  auto starttime_of = [this](pid_t pid) {
+    const ProcessInfo * proc = store_.find_process(pid);
+    return proc != nullptr ? proc->starttime : 0;
+  };
+  auto keep_id = [&](int32_t id, const TopicShmId & old_rec, TopicShmId * out) {
+    if (const auto it = pubs.find(id); it != pubs.end()) {
+      const PublisherInfo & info = it->second;
+      const ProcessInfo * proc = store_.find_process(info.pid);
+      out->kind = TOPIC_SHM_ID_PUBLISHER;
+      out->pid = info.pid;
+      out->qos_depth = info.qos_depth;
+      out->transient_local = info.qos_is_transient_local;
+      out->exited = (proc == nullptr || proc->exited) ? 1 : 0;
+      out->starttime = starttime_of(info.pid);
+      return true;
+    }
+    if (const auto it = subs.find(id); it != subs.end()) {
+      const SubscriberInfo & info = it->second;
+      out->kind = TOPIC_SHM_ID_SUBSCRIBER;
+      out->pid = info.pid;
+      out->qos_depth = info.qos_depth;
+      out->transient_local = info.qos_is_transient_local;
+      out->is_take_sub = info.is_take_sub;
+      out->ignore_local = info.ignore_local_publications;
+      out->need_mmap_update = 1;
+      out->starttime = starttime_of(info.pid);
+      // The receive position is the one thing only the segment knows. Taken
+      // when the old record plausibly is this subscriber's; otherwise the
+      // subscriber starts after everything already published.
+      const bool same = old_rec.kind == TOPIC_SHM_ID_SUBSCRIBER && old_rec.pid == info.pid &&
+                        old_rec.latest_received_entry_id >= -1 &&
+                        old_rec.latest_received_entry_id < old_current;
+      out->latest_received_entry_id = same ? old_rec.latest_received_entry_id : old_current - 1;
+      out->reclaimed = same ? old_rec.reclaimed : 0;
+      return true;
+    }
+    // A publisher whose process exited stays, unlisted, until its entries go.
+    if (
+      old_rec.kind == TOPIC_SHM_ID_PUBLISHER && old_rec.exited &&
+      wrapper->quarantined.count(old_rec.pid) == 0) {
+      out->kind = TOPIC_SHM_ID_PUBLISHER;
+      out->pid = old_rec.pid;
+      out->qos_depth = old_rec.qos_depth;
+      out->exited = 1;
+      return true;
+    }
+    return false;
+  };
+  const DaemonReadable readable{store_, allocator_};
+  auto keep_entry = [&](const TopicShmEntry & en) {
+    return readable.valid_address(fresh->ids[en.publisher_id].pid, en.msg_virtual_address);
+  };
+  topic_shm_salvage(old_copy, fresh, keep_id, keep_entry);
+  fresh->epoch = std::max(old_copy->epoch, wrapper->shm->epoch) + 1;
+  fresh->mode = mode;
+
+  // Everyone who still uses the old segment finds this at the next lock.
+  __atomic_store_n(&wrapper->shm->retired, 1u, __ATOMIC_RELEASE);
+  wrapper->shm = fresh;
+  wrapper->shm_fd = new_fd;
+  wrapper->rotation_num++;
+  fprintf(
+    stderr, "agnocast_daemon: topic %s: replaced its segment (epoch %u, %s path)\n",
+    wrapper->key.c_str(), fresh->epoch, mode == TOPIC_SHM_MODE_DAEMON ? "daemon" : "client");
+  return true;
+}
+
+void CommandHandlers::handle_report_anomaly(int fd, pid_t pid, const void * payload)
+{
+  if (!payload) {
+    send_response(fd, EINVAL);
+    return;
+  }
+  const auto * req = static_cast<const ReportAnomalyRequest *>(payload);
+  ReportAnomalyResponse resp{};
+
+  std::shared_lock glock(store_.global_mutex_);
+  TopicWrapper * wrapper =
+    store_.find_topic_for_process(pid, bounded_name(req->topic_name, sizeof(req->topic_name)));
+  if (!wrapper) {
+    send_response(fd, ENOENT);
+    return;
+  }
+  std::unique_lock tlock(wrapper->topic_rwsem);
+  wrapper->anomaly_report_num++;
+  if (wrapper->quarantined.count(pid) > 0) {
+    send_response(fd, EPERM);
+    return;
+  }
+  AgnocastTopicShm * const old = wrapper->shm;
+  const int old_fd = wrapper->shm_fd;
+  if (req->epoch != old->epoch || topic_shm_is_retired(old)) {
+    resp.action = AGNOCAST_ANOMALY_ACTION_STALE;
+    resp.epoch = old->epoch;
+    send_response(fd, 0, &resp, sizeof(resp));
+    return;
+  }
+
+  // Never block on the segment for good: a stalled holder would take the
+  // daemon down with it.
+  bool recovered = false;
+  int lr = topic_shm_timedlock(old, env_ms("AGNOCAST_STALL_CONFIRM_MS", 200), &recovered);
+  if (lr == ETIMEDOUT) {
+    const pid_t holder = __atomic_load_n(&old->holder_pid, __ATOMIC_RELAXED);
+    if (holder <= 0 || holder == getpid() || !stall_action_kill()) {
+      send_response(fd, EBUSY);
+      return;
+    }
+    fprintf(
+      stderr, "agnocast_daemon: topic %s: pid %d has held the segment too long; killing it\n",
+      wrapper->key.c_str(), holder);
+    kill(holder, SIGKILL);
+    wrapper->stall_kill_num++;
+    resp.action = AGNOCAST_ANOMALY_ACTION_KILLED;
+    lr = topic_shm_timedlock(old, env_ms("AGNOCAST_STALL_KILL_WAIT_MS", 2000), &recovered);
+  }
+  if (lr != 0) {
+    send_response(fd, lr == ETIMEDOUT ? EBUSY : lr);
+    return;
+  }
+
+  // From here the daemon holds the old segment's mutex and decides on its own:
+  // the report only says where to look.
+  char msg[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE] = {};
+  const uint32_t violations = topic_shm_check(old, msg, sizeof(msg));
+  bool rotate = violations > 0;
+  bool culprit_known = false;
+  if (req->kind == AGNOCAST_ANOMALY_BAD_ADDRESS && violations == 0) {
+    const TopicShmEntry * en = topic_shm_find_entry(old, req->entry_id);
+    if (en != nullptr) {
+      const TopicShmId & pub = old->ids[en->publisher_id];
+      const DaemonReadable readable{store_, allocator_};
+      if (!pub.exited && !readable.valid_address(pub.pid, en->msg_virtual_address)) {
+        quarantine_locked(wrapper, pub.pid);
+        rotate = true;
+        culprit_known = true;
+        fprintf(
+          stderr,
+          "agnocast_daemon: topic %s: entry %lld of pid %d points outside its pool; "
+          "quarantined\n",
+          wrapper->key.c_str(), static_cast<long long>(req->entry_id), pub.pid);
+      }
+    }
+  }
+  if (violations > 0) {
+    fprintf(
+      stderr, "agnocast_daemon: topic %s: %u violation(s) after a %s report from pid %d: %s\n",
+      wrapper->key.c_str(), violations, anomaly_name(req->kind), pid, msg);
+  }
+
+  bool rotated = false;
+  if (rotate) {
+    // With no one to blame, nobody can be trusted to write the segment any
+    // more: from now on only the daemon does.
+    const uint32_t mode = culprit_known ? old->mode : TOPIC_SHM_MODE_DAEMON;
+    std::unique_ptr<AgnocastTopicShm, void (*)(void *)> copy(
+      static_cast<AgnocastTopicShm *>(std::malloc(sizeof(AgnocastTopicShm))), std::free);
+    if (copy) {
+      std::memcpy(static_cast<void *>(copy.get()), old, sizeof(AgnocastTopicShm));
+      rotated = rotate_topic_locked(wrapper, copy.get(), mode);
+    }
+    if (rotated && resp.action != AGNOCAST_ANOMALY_ACTION_KILLED) {
+      resp.action = mode == TOPIC_SHM_MODE_DAEMON ? AGNOCAST_ANOMALY_ACTION_DAEMON
+                                                  : AGNOCAST_ANOMALY_ACTION_ROTATED;
+    }
+  }
+  topic_shm_unlock(old);
+  if (rotated) {
+    munmap(old, sizeof(AgnocastTopicShm));
+    close(old_fd);
+  }
+  resp.epoch = wrapper->shm->epoch;
+  send_response(fd, 0, &resp, sizeof(resp));
+}
+
+void CommandHandlers::handle_get_topic_segment(int fd, pid_t pid, const void * payload)
+{
+  if (!payload) {
+    send_response(fd, EINVAL);
+    return;
+  }
+  const auto * req = static_cast<const GetTopicSegmentRequest *>(payload);
+  std::shared_lock glock(store_.global_mutex_);
+  TopicWrapper * wrapper =
+    store_.find_topic_for_process(pid, bounded_name(req->topic_name, sizeof(req->topic_name)));
+  if (!wrapper) {
+    send_response(fd, ENOENT);
+    return;
+  }
+  std::shared_lock tlock(wrapper->topic_rwsem);
+  if (wrapper->quarantined.count(pid) > 0) {
+    send_response(fd, EPERM);
+    return;
+  }
+  const auto pub = wrapper->topic.pub_info_map.find(req->pubsub_id);
+  const auto sub = wrapper->topic.sub_info_map.find(req->pubsub_id);
+  const bool owns = (pub != wrapper->topic.pub_info_map.end() && pub->second.pid == pid) ||
+                    (sub != wrapper->topic.sub_info_map.end() && sub->second.pid == pid);
+  if (!owns) {
+    send_response(fd, ENOENT);
+    return;
+  }
+  GetTopicSegmentResponse resp{};
+  resp.mode = wrapper->shm->mode;
+  resp.epoch = wrapper->shm->epoch;
+  send_response(fd, 0, &resp, sizeof(resp), &wrapper->shm_fd, 1);
 }
