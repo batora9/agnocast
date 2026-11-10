@@ -6,11 +6,13 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -47,6 +49,23 @@ private:
 }  // namespace
 
 static constexpr int kMaxEpollEvents = 64;
+// epoll data of the listening socket; a pidfd's is (pidfd << 32) | pid.
+static constexpr uint64_t kServerTag = ~uint64_t{0};
+
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77
+#endif
+
+// AGNOCAST_DAEMON_PIDFD=0 turns process watching off (exit is then noticed
+// only through the socket), for comparison.
+static bool pidfd_watch_enabled()
+{
+  static const bool enabled = [] {
+    const char * v = std::getenv("AGNOCAST_DAEMON_PIDFD");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
 static constexpr int kEpollTimeoutMs = 1000;
 
 // Maximum size of a single request message (RequestHeader + largest payload).
@@ -109,7 +128,7 @@ void SocketServer::run()
 
   epoll_event ev{};
   ev.events = EPOLLIN;
-  ev.data.fd = server_fd_;
+  ev.data.u64 = kServerTag;
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) < 0) {
     throw std::runtime_error(std::string("epoll_ctl() failed: ") + strerror(errno));
   }
@@ -123,8 +142,11 @@ void SocketServer::run()
       break;
     }
     for (int i = 0; i < nfds; ++i) {
-      if (events[i].data.fd == server_fd_) {
+      const uint64_t tag = events[i].data.u64;
+      if (tag == kServerTag) {
         accept_client();
+      } else {
+        on_pidfd_ready(static_cast<int>(tag >> 32), static_cast<pid_t>(tag & 0xffffffffu));
       }
     }
   }
@@ -171,10 +193,41 @@ void SocketServer::accept_client()
     return;
   }
 
+  watch_process(client_fd, cred.pid);
+
   std::thread([this, client_fd, pid = cred.pid]() {
     handle_client(client_fd, pid);
     close(client_fd);
   }).detach();
+}
+
+void SocketServer::watch_process(int client_fd, pid_t pid)
+{
+  if (!pidfd_watch_enabled() || pidfds_.count(pid) > 0) return;
+  // SO_PEERPIDFD (Linux 6.5) names exactly the process that connected;
+  // pidfd_open by pid is the fallback, racy only if it exited already.
+  int pidfd = -1;
+  socklen_t len = sizeof(pidfd);
+  if (getsockopt(client_fd, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len) < 0 || pidfd < 0) {
+    pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+  }
+  if (pidfd < 0) return;
+  epoll_event ev{};
+  ev.events = EPOLLIN;
+  ev.data.u64 = (static_cast<uint64_t>(pidfd) << 32) | static_cast<uint32_t>(pid);
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, pidfd, &ev) < 0) {
+    close(pidfd);
+    return;
+  }
+  pidfds_[pid] = pidfd;
+}
+
+void SocketServer::on_pidfd_ready(int pidfd, pid_t pid)
+{
+  epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, pidfd, nullptr);
+  close(pidfd);
+  pidfds_.erase(pid);
+  handlers_.on_client_exit(pid);
 }
 
 // ============================================================

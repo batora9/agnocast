@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <unordered_map>
 
 // Unix Domain Socket server for the Agnocast daemon.
 //
@@ -47,6 +48,14 @@ private:
   // Runs in a per-client thread.  Loops reading requests until the client
   // disconnects or an error occurs.
   void handle_client(int client_fd, pid_t client_pid);
+
+  // Watches the client process itself, not just its socket: a child forked
+  // without exec keeps the socket open after its parent died.
+  void watch_process(int client_fd, pid_t pid);
+  void on_pidfd_ready(int pidfd, pid_t pid);
+
+  // Main thread only.
+  std::unordered_map<pid_t, int> pidfds_;
 
   int server_fd_ = -1;
   int epoll_fd_ = -1;
