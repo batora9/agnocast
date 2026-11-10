@@ -11,12 +11,15 @@
 #include "agnocast_sample_interfaces/msg/static_size_array.hpp"
 #include "consistency_common.hpp"
 
+#include <unistd.h>
+
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -43,6 +46,11 @@ class ConsistencySubscriber : public agnocast::Node
   std::string status_file_;
   int64_t received_{0};
   int64_t written_received_{-1};
+  // hoard_num > 0: keep up to that many messages referenced (they stay pinned
+  // in the topic segment until this process lets go or dies).
+  int hoard_num_{0};
+  std::deque<agnocast::ipc_shared_ptr<const MessageT>> hoard_;
+  std::string stats_file_;
 
   void write_status()
   {
@@ -56,6 +64,7 @@ class ConsistencySubscriber : public agnocast::Node
     }
     std::filesystem::rename(tmp, status_file_);
     written_received_ = received_;
+    write_client_stats(stats_file_);
   }
 
   void receive_and_release_once()
@@ -124,6 +133,8 @@ public:
     sync_dir_ = this->declare_parameter<std::string>("sync_dir", "");
     index_ = this->declare_parameter<int>("subscriber_index", 0);
     status_file_ = this->declare_parameter<std::string>("status_file", "");
+    hoard_num_ = this->declare_parameter<int>("hoard_num", 0);
+    stats_file_ = this->declare_parameter<std::string>("stats_file", "");
 
     const rclcpp::QoS qos(rclcpp::KeepLast(static_cast<size_t>(qos_depth_)));
 
@@ -136,6 +147,12 @@ public:
           last_ = msg;
           if (last_) {
             (void)last_->id;
+          }
+          if (hoard_num_ > 0 && hoard_.size() < static_cast<size_t>(hoard_num_)) {
+            hoard_.push_back(msg);
+            if (hoard_.size() == static_cast<size_t>(hoard_num_)) {
+              write_sync_marker(sync_dir_, "sub_" + std::to_string(index_) + ".hoarded");
+            }
           }
           received_++;
           if ((received_ & 15) == 0) {
@@ -162,6 +179,25 @@ public:
     write_ready_and_wait_start(sync_dir_, "sub_" + std::to_string(index_));
   }
 
+  // fork_child:=true leaves a child behind that holds every descriptor of this
+  // process (the daemon socket included) and does nothing else, as a forked
+  // helper that never execs would.
+  void maybe_fork_child()
+  {
+    if (!this->declare_parameter<bool>("fork_child", false)) {
+      return;
+    }
+    const pid_t child = fork();
+    if (child == 0) {
+      for (;;) {
+        pause();
+      }
+    }
+    if (child > 0) {
+      std::ofstream(sync_dir_ + "/sub_" + std::to_string(index_) + ".child") << child << '\n';
+    }
+  }
+
   void run_victim_loop()
   {
     while (agnocast::ok()) {
@@ -179,6 +215,7 @@ public:
       return;
     }
     last_.reset();
+    hoard_.clear();
     write_sync_marker(sync_dir_, marker);
   }
 
@@ -216,6 +253,7 @@ int main(int argc, char ** argv)
 {
   agnocast::init(argc, argv);
   auto node = std::make_shared<ConsistencySubscriber>();
+  node->maybe_fork_child();
   node->wait_for_start();
   if (node->is_victim()) {
     node->run_victim_loop();

@@ -192,3 +192,95 @@ Limitations: a client run with `AGNOCAST_TOPIC_SHM=0` keeps no segment and
 cannot be restored, and its daemon-served publish may be applied twice if the
 daemon dies after committing it. A client that does not restore within the
 recovery timeout loses its registrations.
+
+## Recovering from misbehaving clients (user daemon only)
+
+With the data plane in the clients, a client can now damage the topic's
+segment: die or stop in the middle of an update, publish a bad address, or
+write over the segment by accident. Clients do the work and rely on the daemon
+when something goes wrong; this harness checks each such flow.
+
+### How the clients rely on the daemon
+
+- **Every lock is checked.** A client takes the segment's mutex with a bounded
+  wait, refuses a segment the daemon has replaced (`retired`), and runs a cheap
+  invariant check after locking (`topic_shm_quick_check`). A dead holder's
+  operation is rolled back by the undo log as before, and reported.
+- **Readers check what they are handed.** A subscriber skips an entry whose
+  address is outside its publisher's pool, and a publisher checks its own
+  publishes (the daemon used to do both).
+- **The daemon decides, on its own evidence.** A client reports
+  (`REPORT_ANOMALY`: rolled back, check failed, bad address, stall). The daemon
+  takes the segment itself (bounded) and checks it. A writer of a bad address
+  is quarantined. A damaged segment is rebuilt from the daemon's registry plus
+  what of the old segment checks out, under a new epoch; the old one is marked
+  retired and every client fetches the new one (`GET_TOPIC_SEGMENT`). When no
+  culprit is known, the new segment is in daemon mode: clients keep the
+  descriptor but send every call to the daemon, which serves a publisher id
+  only to its owner and checks every address.
+- **A stalled holder is killed.** Waiters that time out report the holder (the
+  segment names it); if the daemon cannot take the mutex either, it kills the
+  holder, and the robust mutex plus the undo log do the rest.
+- **Exit is watched through the process, not the socket.** The daemon watches
+  each client's pidfd (`SO_PEERPIDFD`, else `pidfd_open`), so a child that
+  inherited the socket does not hide its parent's death. The state file records
+  each pid with its start time, so a restarted daemon does not mistake a reused
+  pid for its client.
+- **Peers clean up while the daemon is away.** A publisher short of free slots
+  checks the subscribers' pids and start times and drops the references of dead
+  ones itself.
+- **Optional write protection.** With `AGNOCAST_SHM_PROTECT=1` the segments are
+  mapped under a memory protection key that is writable only inside the lock,
+  so a stray write faults in the writer instead. This needs CPU support (x86
+  PKU); without it the setting is ignored and `scribble_protected` reports
+  `UNSUPPORTED`.
+
+### Scenarios
+
+| scenario | failure | must follow |
+| --- | --- | --- |
+| `client_kill` | a holder is SIGKILLed | removed by the daemon |
+| `crash_publish` / `crash_receive` / `crash_release` | a client dies inside that operation, holding the mutex | rolled back by the next locker |
+| `stall` | a publisher stops (SIGSTOP) inside a publish, holding the mutex | waiters report, the daemon kills it, rollback |
+| `bad_address` | a publisher publishes an address outside its pool | readers skip it, writer quarantined, segment rebuilt |
+| `scribble` | a publisher writes over the segment without the mutex | check fails, segment rebuilt, topic on the daemon path |
+| `scribble_protected` | the same with `AGNOCAST_SHM_PROTECT=1` | the writer faults; the segment is untouched |
+| `reclaim` | the daemon is killed, then a subscriber holding most slots dies | the publisher reclaims its references while the daemon is down |
+| `fork_exit` | a subscriber whose forked child keeps the socket is SIGKILLed | removed through its pidfd |
+
+Every trial also checks `flow` (publishes and deliveries continue),
+`consistent` (`DEBUG_CHECK_TOPIC`: 0 violations), `membership`, `leak_free`
+and `survived`, as for the daemon-crash trials. The daemon-crash flows
+themselves are covered by `run_daemon_crash.bash` above.
+
+### Run
+
+```bash
+source /opt/ros/humble/setup.bash
+scripts/consistency/build.bash daemon
+
+# one trial
+scripts/consistency/run_fault_flows.bash --scenario stall --output-dir /tmp/ff_stall
+
+# a baseline: the same failure with the mechanism off
+scripts/consistency/run_fault_flows.bash --scenario fork_exit \
+  --daemon-env AGNOCAST_DAEMON_PIDFD=0 --output-dir /tmp/ff_fork_baseline
+
+# paper sweep: 20 trials per scenario, 5 per baseline
+scripts/consistency/run_fault_flows_paper.bash --output-dir results/fault_flows
+python3 scripts/consistency/summarize_fault_flows.py results/fault_flows
+```
+
+Knobs. Client: `AGNOCAST_SHM_LOCK_TIMEOUT_MS` (lock wait before a stall report,
+default 500), `AGNOCAST_SHM_PROTECT=1`, `AGNOCAST_PEER_RECLAIM=0` (baseline),
+`AGNOCAST_CLIENT_FAULT_POINT` / `_HIT` / `_ACTION` (fault injection, built with
+`AGNOCAST_CLIENT_FAULT_INJECTION`, on by default), `AGNOCAST_ALLOW_DEBUG_FAULTS=1`
+(lets `agnocast_ipc_debug_inject_fault` run). Daemon: `AGNOCAST_STALL_CONFIRM_MS`
+(default 200), `AGNOCAST_STALL_ACTION=report` (baseline: never kill),
+`AGNOCAST_STALL_KILL_WAIT_MS` (default 2000), `AGNOCAST_DAEMON_PIDFD=0`
+(baseline: socket EOF only).
+
+Limitations: the checks guard against buggy clients, not malicious ones (a
+process can lift its own protection key, and a determined writer can damage
+the segment between two checks). A dead publisher stays listed while entries
+of its are still referenced, as with the kernel module.

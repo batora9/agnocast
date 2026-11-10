@@ -176,6 +176,13 @@ struct Extras
   uint64_t rollback_record_num = 0;
   uint32_t entry_num = 0;
   std::string check_message;
+  uint32_t epoch = 0;
+  uint32_t mode = 0;
+  uint32_t rotation_num = 0;
+  uint32_t quarantined_num = 0;
+  uint32_t stall_kill_num = 0;
+  uint32_t anomaly_report_num = 0;
+  uint64_t peer_reclaim_count = 0;
 };
 
 void write_snapshot(std::ostream & os, const Snapshot & snap, const Extras & extras)
@@ -201,7 +208,12 @@ void write_snapshot(std::ostream & os, const Snapshot & snap, const Extras & ext
        << ", \"registry_violations\": " << extras.registry_violations
        << ", \"rollback_count\": " << extras.rollback_count
        << ", \"rollback_record_num\": " << extras.rollback_record_num
-       << ", \"entry_num\": " << extras.entry_num << ", \"message\": \""
+       << ", \"entry_num\": " << extras.entry_num << ", \"epoch\": " << extras.epoch
+       << ", \"mode\": " << extras.mode << ", \"rotation_num\": " << extras.rotation_num
+       << ", \"quarantined_num\": " << extras.quarantined_num
+       << ", \"stall_kill_num\": " << extras.stall_kill_num
+       << ", \"anomaly_report_num\": " << extras.anomaly_report_num
+       << ", \"peer_reclaim_count\": " << extras.peer_reclaim_count << ", \"message\": \""
        << json_escape(extras.check_message) << "\"}";
   }
   os << "\n}\n";
@@ -314,6 +326,13 @@ int main(int argc, char ** argv)
       extras.rollback_record_num = check.rollback_record_num;
       extras.entry_num = check.entry_num;
       extras.check_message = check.message;
+      extras.epoch = check.epoch;
+      extras.mode = check.mode;
+      extras.rotation_num = check.rotation_num;
+      extras.quarantined_num = check.quarantined_num;
+      extras.stall_kill_num = check.stall_kill_num;
+      extras.anomaly_report_num = check.anomaly_report_num;
+      extras.peer_reclaim_count = check.peer_reclaim_count;
     } else {
       extras.check_message = std::string("check failed: ") + std::strerror(errno);
     }

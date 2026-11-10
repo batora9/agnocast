@@ -41,6 +41,7 @@ class ConsistencyPublisher : public agnocast::Node
   std::string topic_;
   std::string status_file_;
   std::string sync_dir_;
+  std::string stats_file_;
   int qos_depth_;
   int64_t published_ = 0;
   int64_t released_ = 0;
@@ -54,6 +55,7 @@ public:
     qos_depth_ = this->declare_parameter<int>("qos_depth", 10);
     status_file_ = this->declare_parameter<std::string>("status_file", "");
     sync_dir_ = this->declare_parameter<std::string>("sync_dir", "");
+    stats_file_ = this->declare_parameter<std::string>("stats_file", "");
 
     pub_ = this->create_publisher<MessageT>(
       topic_, rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qos_depth_))));
@@ -62,6 +64,9 @@ public:
   void write_counts()
   {
     write_status_file(status_file_, published_, released_, published_ - released_);
+    if ((published_ & 1023) == 0 || flushed_) {
+      write_client_stats(stats_file_);
+    }
   }
 
   void maybe_flush()
@@ -80,6 +85,7 @@ public:
       return false;
     }
     write_counts();
+    write_client_stats(stats_file_);
     write_sync_marker(sync_dir_, "pub.paused");
     idle_until_shutdown();
     return true;
