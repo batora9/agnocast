@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <string>
 
 // Unix Domain Socket server for the Agnocast daemon.
 //
@@ -37,6 +38,12 @@ public:
 
   // Thread-safe; may be called from a signal handler.
   void request_shutdown() noexcept;
+
+  // See CommandHandlers::begin_recovery. Call before run().
+  size_t begin_recovery(const std::string & state_path)
+  {
+    return handlers_.begin_recovery(state_path);
+  }
 
 private:
   // Accept one client from server_fd_ and spawn a handler thread.

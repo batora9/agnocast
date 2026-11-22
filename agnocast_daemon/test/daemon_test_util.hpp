@@ -115,6 +115,13 @@ public:
 
   void disconnect(pid_t pid) { handlers_.on_client_disconnect(pid); }
 
+  size_t begin_recovery(const std::string & state_path)
+  {
+    return handlers_.begin_recovery(state_path);
+  }
+  MetadataStore & store() { return store_; }
+  MemoryAllocator & allocator() { return allocator_; }
+
   static void set_topic(char (&dst)[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE], const char * src)
   {
     std::strncpy(dst, src, sizeof(dst) - 1);

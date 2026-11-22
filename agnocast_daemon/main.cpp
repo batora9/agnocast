@@ -44,6 +44,10 @@ int main()
     g_server = &server;
 
     fprintf(stderr, "agnocast_daemon: started (socket: %s)\n", AGNOCAST_DAEMON_SOCKET_PATH);
+    // AGNOCAST_DAEMON_STATE_PATH overrides where the clients' pids are kept.
+    const char * state_path = std::getenv("AGNOCAST_DAEMON_STATE_PATH");
+    server.begin_recovery(
+      (state_path != nullptr && state_path[0] != '\0') ? state_path : AGNOCAST_DAEMON_STATE_PATH);
 
     server.run();
 

@@ -77,3 +77,28 @@ void MemoryAllocator::free_memory(pid_t pid)
     }
   }
 }
+
+MemoryAllocator::MempoolEntry * MemoryAllocator::find_entry(uint64_t addr)
+{
+  std::lock_guard lock(mutex_);
+  for (auto & e : entries_) {
+    if (e.addr == addr) return &e;
+  }
+  return nullptr;
+}
+
+MemoryAllocator::MempoolEntry * MemoryAllocator::restore_assignment(pid_t pid, uint64_t addr)
+{
+  std::lock_guard lock(mutex_);
+  for (auto & e : entries_) {
+    if (e.addr != addr) continue;
+    if (std::find(e.mapped_pids.begin(), e.mapped_pids.end(), pid) != e.mapped_pids.end()) {
+      return nullptr;
+    }
+    // The owner goes first, as assign_memory() would have put it.
+    e.mapped_pids.insert(e.mapped_pids.begin(), pid);
+    e.mapped_num++;
+    return &e;
+  }
+  return nullptr;
+}

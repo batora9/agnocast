@@ -48,6 +48,15 @@ public:
   // the publishers it mapped. Equivalent of agnocast_kmod::free_memory().
   void free_memory(pid_t pid);
 
+  // The slot that starts at addr, or nullptr.
+  MempoolEntry * find_entry(uint64_t addr);
+
+  // For a daemon restart: give pid back the slot at addr, which it says it
+  // mapped. Other processes may already reference the slot (they restored
+  // first). Returns nullptr when addr is not a slot or the slot already has
+  // another owner.
+  MempoolEntry * restore_assignment(pid_t pid, uint64_t addr);
+
   uint64_t mempool_size_bytes() const noexcept { return mempool_size_bytes_; }
   int mempool_num() const noexcept { return static_cast<int>(entries_.size()); }
 

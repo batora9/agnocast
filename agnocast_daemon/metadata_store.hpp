@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ============================================================
@@ -51,6 +52,9 @@ struct ProcessInfo
   bool exited = false;
   bool is_performance_bridge_manager = false;
   pid_t pid = 0;
+  // From /proc/<pid>/stat (0 when unknown); with pid, names the process in
+  // the state file across pid reuse.
+  uint64_t starttime = 0;
   // The process's ROS_DOMAIN_ID (0 if unset), fixed for the process's lifetime.
   uint32_t domain_id = 0;
   MemoryAllocator::MempoolEntry * mempool_entry = nullptr;  // owned by MemoryAllocator
@@ -68,6 +72,13 @@ struct PublisherInfo
   bool qos_is_transient_local = false;
   uint32_t entries_num = 0;
   bool is_bridge = false;
+  // After a daemon restart: addresses of messages this publisher asked to
+  // publish without getting the reply. A repeated publish of one of them is
+  // answered from the entry already there, if any (see protocol.h).
+  std::unordered_set<uint64_t> pending_addrs;
+  // After a daemon restart: the newest id this publisher had been answered
+  // with. A pending publish was committed, if at all, under a newer one.
+  int64_t restored_last_entry_id = -1;
 };
 
 // The daemon's side of a subscriber's AgnocastSubscriberChannel. Owns the

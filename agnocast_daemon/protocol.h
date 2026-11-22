@@ -108,6 +108,15 @@ typedef enum {
   /* Daemon-only commands. They have no ioctl counterpart, so they are numbered
    * well clear of the range agnocast.h uses. */
   AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL = 64,
+  /* Rebuilding the daemon's state from its clients after a restart; see
+   * "Daemon restart recovery" below. */
+  AGNOCAST_CMD_RESTORE_PROCESS = 65,
+  AGNOCAST_CMD_RESTORE_MAPPINGS = 66,
+  AGNOCAST_CMD_RESTORE_PUBLISHER = 67,
+  AGNOCAST_CMD_RESTORE_SUBSCRIBER = 68,
+  AGNOCAST_CMD_RESTORE_ENTRIES = 69,
+  AGNOCAST_CMD_RESTORE_DONE = 70,
+  AGNOCAST_CMD_GET_RECOVERY_STATUS = 71,
 } CommandType;
 
 /* --------------------------------------------------------------------------
@@ -295,6 +304,10 @@ struct AddSubscriberResponse
 {
   int32_t subscriber_id; /* topic_local_id_t */
   char mq_topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  uint32_t _pad;
+  /* Where the subscriber's receives start (it gets only newer entries). The
+   * client reports it back after a daemon restart if it received nothing. */
+  int64_t latest_received_entry_id;
 };
 
 /* ---- AGNOCAST_CMD_ADD_PUBLISHER (4) ---- */
@@ -774,6 +787,143 @@ struct AgnocastSubscriberChannel
 };
 
 /* --------------------------------------------------------------------------
+ * Daemon restart recovery
+ *
+ * The daemon keeps its metadata on its heap and does not persist it. Every
+ * piece of it is known to a live client, so a restarted daemon rebuilds it
+ * from what the clients report:
+ *
+ *   registrations          the process that made them
+ *   a publisher's entries  the publisher (those it was not told to free), and
+ *                          a subscriber that holds one
+ *   reference bits         the subscriber holding the message
+ *   receive positions      the subscriber (the last entry handed to the user)
+ *   the next entry id      one above the largest id anyone reports
+ *
+ * What no live client knows is either the state of a process that died, or
+ * the effect of a request whose reply never arrived: dropping it is correct.
+ * The daemon writes only the pids of its clients to AGNOCAST_DAEMON_STATE_PATH
+ * (before answering a registration). A daemon that finds live ones there
+ * waits (the grace period) until each has restored or is known to be dead,
+ * and serves nothing else meanwhile, so nothing is handed back to a publisher
+ * while a subscriber that holds it has not reported yet.
+ *
+ * A client restores with RESTORE_PROCESS, RESTORE_MAPPINGS, RESTORE_PUBLISHER
+ * and RESTORE_SUBSCRIBER (each followed by RESTORE_ENTRIES), may replay
+ * ADD_BRIDGE, SET_ROS2_*_NUM and ATTACH_SUBSCRIBER_CHANNEL, and ends with
+ * RESTORE_DONE. A publish whose reply was lost is repeated with the same
+ * message address, which identifies it: the daemon answers it from the entry
+ * it already has instead of adding a second one.
+ * -------------------------------------------------------------------------- */
+#define AGNOCAST_DAEMON_STATE_PATH "/tmp/agnocast_daemon.state"
+
+#define AGNOCAST_PROTO_RESTORE_BATCH 16
+
+/* ---- AGNOCAST_CMD_RESTORE_PROCESS (65) ---- */
+struct RestoreProcessRequest
+{
+  uint64_t shm_addr; /* the pool this process was given and has mapped */
+  uint32_t domain_id;
+  bool is_performance_bridge_manager;
+  uint8_t _pad[3];
+};
+/* Response: no payload. EBUSY when no recovery is going on. */
+
+/* ---- AGNOCAST_CMD_RESTORE_MAPPINGS (66) ---- */
+struct AgnocastRestoreMapping
+{
+  int32_t pid; /* the pool's owner */
+  uint32_t _pad;
+  uint64_t shm_addr;
+};
+
+struct RestoreMappingsRequest
+{
+  uint32_t mapping_num;
+  uint32_t _pad;
+  struct AgnocastRestoreMapping mappings[AGNOCAST_PROTO_RESTORE_BATCH];
+};
+
+/* ---- AGNOCAST_CMD_RESTORE_PUBLISHER (67) ---- */
+struct RestorePublisherRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  char node_name[AGNOCAST_PROTO_NODE_NAME_BUFFER_SIZE];
+  int32_t publisher_id;
+  uint32_t qos_depth;
+  int64_t last_entry_id; /* the newest id it was given, -1 if none */
+  bool qos_is_transient_local;
+  bool is_bridge;
+  uint8_t _pad[6];
+};
+
+/* ---- AGNOCAST_CMD_RESTORE_SUBSCRIBER (68) ----
+ * The notification eventfd travels with SCM_RIGHTS, as with ADD_SUBSCRIBER. */
+struct RestoreSubscriberRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  char node_name[AGNOCAST_PROTO_NODE_NAME_BUFFER_SIZE];
+  int32_t subscriber_id;
+  uint32_t qos_depth;
+  int64_t latest_received_entry_id;
+  bool qos_is_transient_local;
+  bool qos_is_reliable;
+  bool is_take_sub;
+  bool ignore_local_publications;
+  bool is_bridge;
+  uint8_t _pad[3];
+};
+
+/* ---- AGNOCAST_CMD_RESTORE_ENTRIES (69) ---- */
+enum AgnocastRestoreEntryKind {
+  /* A publisher's entry it has not been told to free. */
+  AGNOCAST_RESTORE_ENTRY_PUBLISHED = 0,
+  /* A message a publisher asked to publish without getting the reply
+   * (entry_id is -1): the daemon may have committed it. */
+  AGNOCAST_RESTORE_ENTRY_PENDING = 1,
+  /* An entry a subscriber holds a reference to. */
+  AGNOCAST_RESTORE_ENTRY_HELD = 2,
+  /* An entry recently handed to a subscriber, held or not. It tells the daemon
+   * that a pending publish was committed (and under which id), so repeating
+   * it does not deliver the message twice. */
+  AGNOCAST_RESTORE_ENTRY_DELIVERED = 3,
+};
+
+struct AgnocastRestoreEntry
+{
+  int64_t entry_id;
+  uint64_t addr;
+};
+
+struct RestoreEntriesRequest
+{
+  char topic_name[AGNOCAST_PROTO_TOPIC_NAME_BUFFER_SIZE];
+  int32_t pubsub_id;
+  uint32_t kind; /* AgnocastRestoreEntryKind */
+  uint32_t entry_num;
+  uint32_t _pad;
+  struct AgnocastRestoreEntry entries[AGNOCAST_PROTO_RESTORE_BATCH];
+};
+
+/* ---- AGNOCAST_CMD_RESTORE_DONE (70) ---- no payload either way */
+
+/* ---- AGNOCAST_CMD_GET_RECOVERY_STATUS (71) ---- */
+struct GetRecoveryStatusResponse
+{
+  uint32_t recovering;         /* 1 during the grace period */
+  uint32_t expected_num;       /* live clients found in the state file */
+  uint32_t restored_num;       /* of those, restored */
+  uint32_t dead_num;           /* of those, found dead (before or during) */
+  uint32_t fenced_num;         /* of those, killed for not restoring in time */
+  uint32_t claim_num;          /* references subscribers reported */
+  uint32_t rejected_claim_num; /* references to an entry a live publisher did not report */
+  uint32_t orphan_claim_num;   /* references to an entry of a publisher that died */
+  uint32_t dedup_publish_num;  /* repeated publishes answered from an existing entry */
+  uint32_t recovery_num;       /* recoveries this daemon ran (0 or 1) */
+  int64_t grace_ns;            /* how long the grace period lasted */
+};
+
+/* --------------------------------------------------------------------------
  * Compile-time layout assertions
  *
  * Verify sizes for the framing headers and shared types.  Payload structs that
@@ -793,7 +943,7 @@ static_assert(
 static_assert(sizeof(struct AddProcessRequest) == 8, "AddProcessRequest must be 8 bytes");
 static_assert(sizeof(struct AddProcessResponse) == 24, "AddProcessResponse must be 24 bytes");
 static_assert(
-  sizeof(struct AddSubscriberResponse) == 260, "AddSubscriberResponse must be 260 bytes");
+  sizeof(struct AddSubscriberResponse) == 272, "AddSubscriberResponse must be 272 bytes");
 static_assert(sizeof(struct AddPublisherResponse) == 260, "AddPublisherResponse must be 260 bytes");
 static_assert(sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
 static_assert(sizeof(struct PublishMsgRequest) == 272, "PublishMsgRequest must be 272 bytes");
@@ -809,6 +959,17 @@ static_assert(sizeof(struct AddBridgeResponse) == 8, "AddBridgeResponse must be 
 static_assert(
   sizeof(struct CheckAndRequestBridgeShutdownResponse) == 4,
   "CheckAndRequestBridgeShutdownResponse must be 4 bytes");
+static_assert(sizeof(struct RestoreProcessRequest) == 16, "RestoreProcessRequest must be 16 bytes");
+static_assert(
+  sizeof(struct RestoreMappingsRequest) == 264, "RestoreMappingsRequest must be 264 bytes");
+static_assert(
+  sizeof(struct RestorePublisherRequest) == 536, "RestorePublisherRequest must be 536 bytes");
+static_assert(
+  sizeof(struct RestoreSubscriberRequest) == 536, "RestoreSubscriberRequest must be 536 bytes");
+static_assert(
+  sizeof(struct RestoreEntriesRequest) == 528, "RestoreEntriesRequest must be 528 bytes");
+static_assert(
+  sizeof(struct GetRecoveryStatusResponse) == 48, "GetRecoveryStatusResponse must be 48 bytes");
 #else
 _Static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 _Static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");
@@ -823,7 +984,7 @@ _Static_assert(
 _Static_assert(sizeof(struct AddProcessRequest) == 8, "AddProcessRequest must be 8 bytes");
 _Static_assert(sizeof(struct AddProcessResponse) == 24, "AddProcessResponse must be 24 bytes");
 _Static_assert(
-  sizeof(struct AddSubscriberResponse) == 260, "AddSubscriberResponse must be 260 bytes");
+  sizeof(struct AddSubscriberResponse) == 272, "AddSubscriberResponse must be 272 bytes");
 _Static_assert(
   sizeof(struct AddPublisherResponse) == 260, "AddPublisherResponse must be 260 bytes");
 _Static_assert(
