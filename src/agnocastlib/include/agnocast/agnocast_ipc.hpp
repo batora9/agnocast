@@ -5,6 +5,10 @@
 
 #ifndef AGNOCAST_USE_DAEMON
 #include <sys/ioctl.h>
+#else
+#include <sys/types.h>
+
+#include <cstdint>
 #endif
 
 namespace agnocast
@@ -145,6 +149,30 @@ int agnocast_ipc_set_ros2_publisher_num(struct ioctl_set_ros2_publisher_num_args
 int agnocast_ipc_get_topic_list(union ioctl_topic_list_args * args);
 int agnocast_ipc_get_topic_subscriber_info(union ioctl_topic_info_args * args);
 int agnocast_ipc_get_topic_publisher_info(union ioctl_topic_info_args * args);
+
+// Records that this process mapped pid's memory pool (its own included), so a
+// restarted daemon can be told.
+void daemon_note_mapped_region(pid_t pid, uint64_t addr, uint64_t size);
+
+// How often this process reconnected to a restarted daemon and restored.
+uint64_t daemon_reconnect_count();
+
+// The daemon's account of its restart recovery (protocol.h).
+struct DaemonRecoveryStatus
+{
+  bool recovering;
+  uint32_t expected_num;
+  uint32_t restored_num;
+  uint32_t dead_num;
+  uint32_t fenced_num;
+  uint32_t claim_num;
+  uint32_t rejected_claim_num;
+  uint32_t orphan_claim_num;
+  uint32_t dedup_publish_num;
+  uint32_t recovery_num;
+  int64_t grace_ns;
+};
+int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out);
 
 #endif  // AGNOCAST_USE_DAEMON
 
