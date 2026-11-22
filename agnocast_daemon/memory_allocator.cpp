@@ -74,7 +74,6 @@ void MemoryAllocator::free_memory(pid_t pid)
     if (it != pids.end()) {
       pids.erase(it);
       e.mapped_num--;
-      return;
     }
   }
 }
