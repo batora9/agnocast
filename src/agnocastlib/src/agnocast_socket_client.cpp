@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -492,6 +491,10 @@ struct PublisherState
   int32_t id = 0;
   AddPublisherRequest req{};
   std::mutex mtx;
+  // Held across a publish: at most one publish of this publisher is without a
+  // reply at any time, which a restarted daemon relies on (protocol.h). The
+  // daemon serializes the publishes of a topic anyway.
+  std::mutex publish_mtx;
   std::map<int64_t, uint64_t> entries;  // entry id → message address
   int64_t last_entry_id = -1;
   std::unordered_set<uint64_t> pending;  // published, reply not seen yet
@@ -509,19 +512,19 @@ struct SubscriberState
   std::shared_ptr<ClientChannel> channel;
   std::unordered_map<int64_t, uint64_t> held;  // entry id → message address
   int64_t latest_received_entry_id = -1;
-  // The last entries handed out, released or not: they tell a restarted daemon
-  // that a publish whose reply was lost was committed (see protocol.h).
-  std::deque<std::pair<int64_t, uint64_t>> recent;
+  // The newest entry handed out from each publisher, released or not: it
+  // tells a restarted daemon whether a publish whose reply was lost was
+  // committed (see AGNOCAST_RESTORE_ENTRY_DELIVERED in protocol.h).
+  std::unordered_map<int32_t, std::pair<int64_t, uint64_t>> newest_by_publisher;
 
   // Caller holds mtx.
-  void note_delivered(int64_t entry_id, uint64_t addr)
+  void note_delivered(int64_t entry_id, uint64_t addr, int32_t publisher_id)
   {
     held[entry_id] = addr;
     latest_received_entry_id = std::max(latest_received_entry_id, entry_id);
-    recent.emplace_back(entry_id, addr);
-    if (recent.size() > kRecentNum) recent.pop_front();
+    auto & newest = newest_by_publisher[publisher_id];
+    if (newest.first < entry_id || newest.second == 0) newest = {entry_id, addr};
   }
-  static constexpr size_t kRecentNum = 64;
 };
 
 struct BridgeRecord
@@ -596,11 +599,13 @@ bool take_pushed_locked(SubscriberState & sub, union ioctl_receive_msg_args * ar
 
   int64_t entry_ids[MAX_RECEIVE_NUM];
   uint64_t entry_addrs[MAX_RECEIVE_NUM];
+  int32_t publisher_ids[MAX_RECEIVE_NUM];
   uint16_t entry_num = 0;
   for (; tail != head && entry_num < MAX_RECEIVE_NUM; tail++, entry_num++) {
     const AgnocastPushSlot & slot = ring.slots[tail % AGNOCAST_PUSH_RING_SLOTS];
     entry_ids[entry_num] = __atomic_load_n(&slot.entry_id, __ATOMIC_RELAXED);
     entry_addrs[entry_num] = __atomic_load_n(&slot.entry_addr, __ATOMIC_RELAXED);
+    publisher_ids[entry_num] = __atomic_load_n(&slot.publisher_id, __ATOMIC_RELAXED);
   }
   __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
 
@@ -610,7 +615,7 @@ bool take_pushed_locked(SubscriberState & sub, union ioctl_receive_msg_args * ar
   for (uint16_t i = 0; i < entry_num; i++) {
     args->ret_entry_ids[i] = entry_ids[i];
     args->ret_entry_addrs[i] = entry_addrs[i];
-    sub.note_delivered(entry_ids[i], entry_addrs[i]);
+    sub.note_delivered(entry_ids[i], entry_addrs[i], publisher_ids[i]);
   }
   return true;
 }
@@ -888,7 +893,10 @@ bool restore_locked()
       req.ignore_local_publications = sub->req.ignore_local_publications;
       req.is_bridge = sub->req.is_bridge;
       held.assign(sub->held.begin(), sub->held.end());
-      recent.assign(sub->recent.begin(), sub->recent.end());
+      for (const auto & [pub_id, newest] : sub->newest_by_publisher) {
+        (void)pub_id;
+        recent.push_back(newest);
+      }
     }
     if (
       restore_call(
@@ -1286,7 +1294,9 @@ int agnocast_ipc_publish_msg(union ioctl_publish_msg_args * args)
   // Pending before the request: if the daemon commits it and dies before
   // answering, the restarted one must hear of the address.
   const auto pub = find_publisher(args->topic_name, args->publisher_id);
+  std::unique_lock<std::mutex> one_at_a_time;
   if (pub) {
+    one_at_a_time = std::unique_lock<std::mutex>(pub->publish_mtx);
     std::lock_guard<std::mutex> lock(pub->mtx);
     pub->pending.insert(req.msg_virtual_address);
   }
@@ -1393,7 +1403,8 @@ int agnocast_ipc_receive_msg(union ioctl_receive_msg_args * args)
     if (c->sub == nullptr) return;
     std::lock_guard<std::mutex> lock(c->sub->mtx);
     for (uint16_t i = 0; i < c->resp->entry_num && i < AGNOCAST_PROTO_MAX_RECEIVE_NUM; i++) {
-      c->sub->note_delivered(c->resp->entry_ids[i], c->resp->entry_addrs[i]);
+      c->sub->note_delivered(
+        c->resp->entry_ids[i], c->resp->entry_addrs[i], c->resp->publisher_ids[i]);
     }
   };
   int r = daemon_call(AGNOCAST_CMD_RECEIVE_MSG, &req, sizeof(req), &resp, sizeof(resp), -1, &opts);
@@ -1437,7 +1448,7 @@ int agnocast_ipc_take_msg(union ioctl_take_msg_args * args)
     const auto * c = static_cast<Ctx *>(p);
     if (c->sub == nullptr || c->resp->entry_id < 0) return;
     std::lock_guard<std::mutex> lock(c->sub->mtx);
-    c->sub->note_delivered(c->resp->entry_id, c->resp->addr);
+    c->sub->note_delivered(c->resp->entry_id, c->resp->addr, c->resp->publisher_id);
   };
   int r = daemon_call(AGNOCAST_CMD_TAKE_MSG, &req, sizeof(req), &resp, sizeof(resp), -1, &opts);
   if (r == 0) {

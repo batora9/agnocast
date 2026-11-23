@@ -424,6 +424,7 @@ int receive_msg_core(
 
     resp->entry_ids[resp->entry_num] = en.entry_id;
     resp->entry_addrs[resp->entry_num] = en.msg_virtual_address;
+    resp->publisher_ids[resp->entry_num] = en.publisher_id;
     resp->entry_num++;
   }
 
@@ -485,6 +486,7 @@ void push_receive(TopicWrapper * wrapper, SubscriberInfo & sub, MetadataStore & 
     AgnocastPushSlot & slot = ring.slots[head % AGNOCAST_PUSH_RING_SLOTS];
     __atomic_store_n(&slot.entry_id, resp.entry_ids[i], __ATOMIC_RELAXED);
     __atomic_store_n(&slot.entry_addr, resp.entry_addrs[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&slot.publisher_id, resp.publisher_ids[i], __ATOMIC_RELAXED);
   }
   channel->push_head = head;
   __atomic_store_n(&ring.head, head, __ATOMIC_RELEASE);
@@ -1146,6 +1148,7 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
     }
     resp.addr = candidate_en->msg_virtual_address;
     resp.entry_id = candidate_en->entry_id;
+    resp.publisher_id = candidate_en->publisher_id;
     sub_info->latest_received_entry_id = resp.entry_id;
   }
 
@@ -2380,10 +2383,12 @@ void CommandHandlers::finish_recovery_locked()
   recovery_.claims.clear();
 
   // A pending publish no subscriber holds may still have been committed and
-  // delivered (and released since): then a subscriber was recently handed an
-  // entry at that address. Put the entry back under its id, so the repeated
-  // publish is answered from it and the subscribers that already got it do
-  // not get it again.
+  // delivered (and released since). A publisher has at most one publish
+  // without a reply, so if it was committed it is that publisher's newest
+  // entry, and a subscriber that got it reports it as the newest it got from
+  // that publisher. Put the entry back under its id, so the repeated publish
+  // is answered from it and the subscribers that already got it do not get
+  // it again.
   for (auto & [key, delivered] : recovery_.delivered) {
     TopicWrapper * wrapper = store_.find_topic(key);
     if (!wrapper) continue;

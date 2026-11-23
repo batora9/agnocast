@@ -388,15 +388,16 @@ struct PublishMsgResponse
  * publisher shm infos are returned inline in the response.
  * Maximum response size ≈ 25 KB.
  *
- * Layout of response (24752 bytes, alignment 8):
+ * Layout of response (24792 bytes, alignment 8):
  *   offset   0: entry_num        (2 bytes)
  *   offset   2: call_again       (1 byte)
  *   offset   3: _pad1[5]         (5 bytes) — aligns entry_ids to 8-byte boundary
  *   offset   8: entry_ids[10]    (80 bytes)
  *   offset  88: entry_addrs[10]  (80 bytes)
- *   offset 168: pub_shm_num      (4 bytes)
- *   offset 172: _pad2            (4 bytes) — aligns pub_shm_infos to 8-byte boundary
- *   offset 176: pub_shm_infos[1024] (24576 bytes)
+ *   offset 168: publisher_ids[10] (40 bytes)
+ *   offset 208: pub_shm_num      (4 bytes)
+ *   offset 212: _pad2            (4 bytes) — aligns pub_shm_infos to 8-byte boundary
+ *   offset 216: pub_shm_infos[1024] (24576 bytes)
  */
 struct ReceiveMsgRequest
 {
@@ -411,6 +412,9 @@ struct ReceiveMsgResponse
   uint8_t _pad1[5]; /* explicit: aligns entry_ids to 8-byte boundary */
   int64_t entry_ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint64_t entry_addrs[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
+  /* The publisher of each entry: a client keeps the newest entry it got from
+   * each publisher, which identifies a publish whose reply was lost. */
+  int32_t publisher_ids[AGNOCAST_PROTO_MAX_RECEIVE_NUM];
   uint32_t pub_shm_num;
   uint32_t _pad2; /* explicit: aligns pub_shm_infos to 8-byte boundary */
   struct AgnocastPublisherShmInfo pub_shm_infos[AGNOCAST_PROTO_MAX_PUBLISHER_NUM];
@@ -427,7 +431,7 @@ struct ReceiveMsgResponse
  *   offset  0: addr          (8 bytes)
  *   offset  8: entry_id      (8 bytes)
  *   offset 16: pub_shm_num   (4 bytes)
- *   offset 20: _pad          (4 bytes) — aligns pub_shm_infos to 8-byte boundary
+ *   offset 20: publisher_id  (4 bytes)
  *   offset 24: pub_shm_infos[1024] (24576 bytes)
  */
 struct TakeMsgRequest
@@ -443,7 +447,7 @@ struct TakeMsgResponse
   uint64_t addr;
   int64_t entry_id;
   uint32_t pub_shm_num;
-  uint32_t _pad; /* explicit: aligns pub_shm_infos to 8-byte boundary */
+  int32_t publisher_id; /* of the entry, as in ReceiveMsgResponse */
   struct AgnocastPublisherShmInfo pub_shm_infos[AGNOCAST_PROTO_MAX_PUBLISHER_NUM];
 };
 
@@ -746,6 +750,8 @@ struct AgnocastPushSlot
 {
   int64_t entry_id;
   uint64_t entry_addr;
+  int32_t publisher_id;
+  uint32_t _pad;
 };
 
 struct AgnocastPushRing
@@ -883,9 +889,12 @@ enum AgnocastRestoreEntryKind {
   AGNOCAST_RESTORE_ENTRY_PENDING = 1,
   /* An entry a subscriber holds a reference to. */
   AGNOCAST_RESTORE_ENTRY_HELD = 2,
-  /* An entry recently handed to a subscriber, held or not. It tells the daemon
-   * that a pending publish was committed (and under which id), so repeating
-   * it does not deliver the message twice. */
+  /* The newest entry a subscriber was handed from one publisher, held or not
+   * (pubsub_id names the subscriber, entries[i] one per publisher). A
+   * publisher has at most one publish without a reply, and it is that
+   * publisher's newest entry if it was committed, so this tells the daemon
+   * whether and under which id it was, and repeating it delivers nothing
+   * twice. */
   AGNOCAST_RESTORE_ENTRY_DELIVERED = 3,
 };
 
@@ -947,7 +956,7 @@ static_assert(
 static_assert(sizeof(struct AddPublisherResponse) == 260, "AddPublisherResponse must be 260 bytes");
 static_assert(sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
 static_assert(sizeof(struct PublishMsgRequest) == 272, "PublishMsgRequest must be 272 bytes");
-static_assert(sizeof(struct ReceiveMsgResponse) == 24752, "ReceiveMsgResponse must be 24752 bytes");
+static_assert(sizeof(struct ReceiveMsgResponse) == 24792, "ReceiveMsgResponse must be 24792 bytes");
 static_assert(sizeof(struct TakeMsgResponse) == 24600, "TakeMsgResponse must be 24600 bytes");
 static_assert(
   sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
@@ -991,7 +1000,7 @@ _Static_assert(
   sizeof(struct ReleaseSubRefRequest) == 272, "ReleaseSubRefRequest must be 272 bytes");
 _Static_assert(sizeof(struct PublishMsgRequest) == 272, "PublishMsgRequest must be 272 bytes");
 _Static_assert(
-  sizeof(struct ReceiveMsgResponse) == 24752, "ReceiveMsgResponse must be 24752 bytes");
+  sizeof(struct ReceiveMsgResponse) == 24792, "ReceiveMsgResponse must be 24792 bytes");
 _Static_assert(sizeof(struct TakeMsgResponse) == 24600, "TakeMsgResponse must be 24600 bytes");
 _Static_assert(
   sizeof(struct GetSubscriberNumResponse) == 16, "GetSubscriberNumResponse must be 16 bytes");
