@@ -128,10 +128,13 @@ bool proc_alive(pid_t pid, uint64_t starttime)
 // daemon SIGKILLs itself the n-th time it passes that point. Points:
 //   publish_before_reply  a publish committed and pushed, its reply not sent
 //   receive_before_reply  a receive committed, its reply not sent
-void fault_point(const char * name)
+//   corrupt_reference     a publish sets the reference bit of a subscriber id
+//                         that does not exist, as a bug would (with
+//                         AGNOCAST_DAEMON_CHECK=1 the next publish aborts)
+bool fault_due(const char * name)
 {
   static const char * armed = std::getenv("AGNOCAST_DAEMON_FAULT_POINT");
-  if (armed == nullptr || std::strcmp(armed, name) != 0) return;
+  if (armed == nullptr || std::strcmp(armed, name) != 0) return false;
   static const long hit = std::max(
     1L,
     std::strtol(
@@ -139,9 +142,36 @@ void fault_point(const char * name)
                                                           : "1",
       nullptr, 10));
   static std::atomic<long> passed{0};
-  if (passed.fetch_add(1) + 1 == hit) {
+  return passed.fetch_add(1) + 1 == hit;
+}
+
+void fault_point(const char * name)
+{
+  if (fault_due(name)) {
     fprintf(stderr, "agnocast_daemon: fault point %s reached; killing itself\n", name);
     kill(getpid(), SIGKILL);
+  }
+}
+
+// AGNOCAST_DAEMON_CHECK=1: a reference bit must belong to a subscriber of the
+// topic. The daemon aborts on a violation, as an assertion would.
+void check_references(const TopicWrapper * wrapper)
+{
+  static const bool enabled = std::getenv("AGNOCAST_DAEMON_CHECK") != nullptr;
+  if (!enabled) return;
+  for (const auto & [eid, en] : wrapper->topic.entries) {
+    for (size_t w = 0; w < AtomicSubscriberBitmap::kWords; w++) {
+      for (uint64_t bits = en.referencing_subscribers.words[w].load(); bits != 0;
+           bits &= bits - 1) {
+        const auto id = static_cast<int32_t>(w * 64 + static_cast<size_t>(__builtin_ctzll(bits)));
+        if (wrapper->topic.sub_info_map.count(id) == 0) {
+          fprintf(
+            stderr, "agnocast_daemon: entry %lld references unknown subscriber %d; aborting\n",
+            static_cast<long long>(eid), id);
+          abort();
+        }
+      }
+    }
   }
 }
 
@@ -1009,6 +1039,14 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
     pub_info->entries_num++;
     PERSIST(counters(*wrapper));
     PERSIST(entry_put(*wrapper, it->second));
+    if (fault_due("corrupt_reference")) {
+      fprintf(stderr, "agnocast_daemon: fault point corrupt_reference reached\n");
+      constexpr int32_t kBogus = AGNOCAST_PROTO_MAX_TOPIC_LOCAL_ID - 1;
+      it->second.referencing_subscribers.test_and_set(kBogus);
+      PERSIST(ref(*wrapper, it->second, kBogus, true));
+    } else {
+      check_references(wrapper);
+    }
   }
 
   drain_release_rings(wrapper);
