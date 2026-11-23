@@ -1,9 +1,9 @@
-import glob, sys
+import glob, os, sys
 import pandas as pd
 root = sys.argv[1]
 rows = []
 for v in ['orig', 'c', 'a', 'b']:
-    for cfg in ['t1_s1', 't10_s4', 't3_s16']:
+    for cfg in sorted(os.path.basename(d) for d in glob.glob(f'{root}/{v}/t*_s*')):
         d = f'{root}/{v}/{cfg}'
         pubs = glob.glob(f'{d}/iter_*/publisher_*_latencies.csv')
         subs = glob.glob(f'{d}/iter_*/subscriber_*_latencies.csv')
