@@ -1979,6 +1979,12 @@ CommandHandlers::~CommandHandlers()
   }
   recovery_cv_.notify_all();
   if (watchdog_.joinable()) watchdog_.join();
+  if (sink_ && persist::g_sink == sink_.get()) {
+    fprintf(
+      stderr, "agnocast_daemon: wrote %llu bytes of persisted metadata\n",
+      static_cast<unsigned long long>(sink_->bytes_written()));
+    persist::g_sink = nullptr;
+  }
 }
 
 void CommandHandlers::persist_state_locked()
