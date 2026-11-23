@@ -9,7 +9,9 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 // Unix Domain Socket server for the Agnocast daemon.
 //
@@ -46,6 +48,13 @@ public:
   }
 
 private:
+  // Client connections still being served. On shutdown each is shut down and
+  // waited for, so no handler thread outlives the handlers it calls.
+  std::mutex clients_mtx_;
+  std::unordered_set<int> client_fds_;
+  std::atomic<int> active_clients_{0};
+  void stop_clients() noexcept;
+
   // Accept one client from server_fd_ and spawn a handler thread.
   void accept_client();
 

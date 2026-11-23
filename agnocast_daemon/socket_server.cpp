@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -90,6 +91,7 @@ SocketServer::SocketServer(MetadataStore & store, MemoryAllocator & allocator)
 
 SocketServer::~SocketServer()
 {
+  stop_clients();
   if (server_fd_ >= 0) close(server_fd_);
   if (epoll_fd_ >= 0) close(epoll_fd_);
   // Remove socket file so a subsequent daemon start does not see a stale path.
@@ -171,9 +173,19 @@ void SocketServer::accept_client()
     return;
   }
 
+  {
+    std::lock_guard<std::mutex> lock(clients_mtx_);
+    client_fds_.insert(client_fd);
+    active_clients_.fetch_add(1);
+  }
   std::thread([this, client_fd, pid = cred.pid]() {
     handle_client(client_fd, pid);
+    {
+      std::lock_guard<std::mutex> lock(clients_mtx_);
+      client_fds_.erase(client_fd);
+    }
     close(client_fd);
+    active_clients_.fetch_sub(1);
   }).detach();
 }
 
@@ -259,5 +271,19 @@ void SocketServer::handle_client(int client_fd, pid_t client_pid)
     handlers_.dispatch(client_fd, client_pid, hdr, payload, recv_fd_guard.release());
   }
 
-  handlers_.on_client_disconnect(client_pid);
+  // A daemon that is shutting down leaves its clients registered: they are
+  // alive, and the next daemon takes them back (protocol.h).
+  if (!shutdown_requested_) handlers_.on_client_disconnect(client_pid);
+}
+
+void SocketServer::stop_clients() noexcept
+{
+  shutdown_requested_.store(true);
+  {
+    std::lock_guard<std::mutex> lock(clients_mtx_);
+    for (const int fd : client_fds_) shutdown(fd, SHUT_RDWR);
+  }
+  for (int i = 0; i < 300 && active_clients_.load() > 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
 }
