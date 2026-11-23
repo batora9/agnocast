@@ -930,6 +930,7 @@ struct GetRecoveryStatusResponse
   uint32_t dedup_publish_num;  /* repeated publishes answered from an existing entry */
   uint32_t recovery_num;       /* recoveries this daemon ran (0 or 1) */
   int64_t grace_ns;            /* how long the grace period lasted */
+  int64_t load_ns;             /* loading persisted metadata (A, B; 0 for C) */
 };
 
 /* --------------------------------------------------------------------------
@@ -978,7 +979,7 @@ static_assert(
 static_assert(
   sizeof(struct RestoreEntriesRequest) == 528, "RestoreEntriesRequest must be 528 bytes");
 static_assert(
-  sizeof(struct GetRecoveryStatusResponse) == 48, "GetRecoveryStatusResponse must be 48 bytes");
+  sizeof(struct GetRecoveryStatusResponse) == 56, "GetRecoveryStatusResponse must be 56 bytes");
 #else
 _Static_assert(sizeof(struct RequestHeader) == 8, "RequestHeader must be 8 bytes");
 _Static_assert(sizeof(struct ResponseHeader) == 8, "ResponseHeader must be 8 bytes");

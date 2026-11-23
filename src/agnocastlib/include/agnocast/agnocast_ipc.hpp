@@ -171,6 +171,7 @@ struct DaemonRecoveryStatus
   uint32_t dedup_publish_num;
   uint32_t recovery_num;
   int64_t grace_ns;
+  int64_t load_ns;
 };
 int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out);
 

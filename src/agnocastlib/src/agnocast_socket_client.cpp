@@ -1117,6 +1117,7 @@ int agnocast_ipc_get_recovery_status(DaemonRecoveryStatus * out)
     out->dedup_publish_num = resp.dedup_publish_num;
     out->recovery_num = resp.recovery_num;
     out->grace_ns = resp.grace_ns;
+    out->load_ns = resp.load_ns;
   }
   return r;
 }

@@ -58,6 +58,7 @@ struct ProcessInfo
   // The process's ROS_DOMAIN_ID (0 if unset), fixed for the process's lifetime.
   uint32_t domain_id = 0;
   MemoryAllocator::MempoolEntry * mempool_entry = nullptr;  // owned by MemoryAllocator
+  int32_t persist_slot = -1;                                // see persist.hpp
   std::vector<ExitSubscriptionEntry> exit_subscriptions;
 };
 
@@ -79,6 +80,7 @@ struct PublisherInfo
   // After a daemon restart: the newest id this publisher had been answered
   // with. A pending publish was committed, if at all, under a newer one.
   int64_t restored_last_entry_id = -1;
+  int32_t persist_slot = -1;  // see persist.hpp
 };
 
 // The daemon's side of a subscriber's AgnocastSubscriberChannel. Owns the
@@ -132,6 +134,7 @@ struct SubscriberInfo
   // Set by AGNOCAST_CMD_ATTACH_SUBSCRIBER_CHANNEL; null for a subscriber that
   // never attached one, which then uses the plain request path throughout.
   std::unique_ptr<SubscriberChannel> channel;
+  int32_t persist_slot = -1;  // see persist.hpp
 };
 
 // Equivalent of agnocast_kmod::topic_struct.
@@ -161,6 +164,7 @@ struct TopicWrapper
   mutable std::shared_mutex topic_rwsem;
 
   TopicStruct topic;
+  int32_t persist_tid = -1;  // see persist.hpp
 
   TopicWrapper() = default;
   TopicWrapper(const TopicWrapper &) = delete;

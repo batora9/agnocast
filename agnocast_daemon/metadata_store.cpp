@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "metadata_store.hpp"
 
+#include "persist.hpp"
+
 #include <sys/mman.h>
 
 SubscriberChannel::~SubscriberChannel()
@@ -19,6 +21,7 @@ TopicWrapper * MetadataStore::find_or_create_topic(const TopicKey & key)
   wrapper->domain_id = key.domain_id;
   auto * ptr = wrapper.get();
   topic_map_.emplace(key, std::move(wrapper));
+  PERSIST(topic_put(*ptr));
   return ptr;
 }
 

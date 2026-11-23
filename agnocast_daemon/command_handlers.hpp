@@ -3,6 +3,7 @@
 
 #include "memory_allocator.hpp"
 #include "metadata_store.hpp"
+#include "persist.hpp"
 #include "protocol.h"
 
 #include <sys/types.h>
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -81,6 +83,9 @@ private:
   void handle_attach_subscriber_channel(int fd, pid_t pid, const void * payload, int channel_fd);
 
   void process_exit_cleanup(pid_t pid);
+  // The body of process_exit_cleanup; caller holds global_mutex_ (unique).
+  // False when pid is unknown.
+  bool exit_cleanup_locked(pid_t pid, std::vector<ExitSubscriptionEntry> * unlink_subscriptions);
 
   // ---- Daemon restart recovery ----
   struct Claim
@@ -99,6 +104,9 @@ private:
     std::unordered_set<pid_t> restored;
     std::unordered_set<pid_t> dead;  // expected ones known to be dead
     std::vector<Claim> claims;       // references reported, resolved at the end
+    // Persisted subscribers that restored: their references are reset to what
+    // they report (entry_id unused).
+    std::vector<Claim> reconcile;
     // Entries subscribers were recently handed: topic → entry id → address.
     std::unordered_map<TopicKey, std::unordered_map<int64_t, uint64_t>, TopicKeyHash> delivered;
     std::unordered_map<uint64_t, pid_t> pool_owner;  // pool address → owner, as reported
@@ -125,7 +133,9 @@ private:
   void handle_restore_done(int fd, pid_t pid);
   void handle_get_recovery_status(int fd);
 
-  std::string state_path_;  // empty: nothing persisted
+  std::string state_path_;               // empty: nothing persisted
+  std::unique_ptr<persist::Sink> sink_;  // A or B (persist.hpp); null for C
+  bool persisted_ = false;               // the metadata was loaded from sink_
   std::atomic<bool> recovering_{false};
   std::mutex recovery_mtx_;  // after global_mutex_ when both are held
   std::condition_variable recovery_cv_;

@@ -2,6 +2,7 @@
 #include "command_handlers.hpp"
 
 #include "bench_timing.hpp"
+#include "persist.hpp"
 
 #include <fcntl.h>
 #include <mqueue.h>
@@ -251,7 +252,9 @@ void drain_release_ring(TopicWrapper * wrapper, SubscriberInfo & sub)
     const int64_t entry_id =
       __atomic_load_n(&ring.entry_ids[tail % AGNOCAST_RELEASE_RING_SLOTS], __ATOMIC_RELAXED);
     EntryNode * en = find_message_entry(wrapper->topic, entry_id);
-    if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
+    if (en != nullptr && en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id))) {
+      PERSIST(ref(*wrapper, *en, sub.id, false));
+    }
   }
   channel->release_tail = tail;
   __atomic_store_n(&ring.tail, tail, __ATOMIC_RELEASE);
@@ -296,6 +299,8 @@ int insert_subscriber_info(
   auto [it, inserted] = wrapper->topic.sub_info_map.emplace(new_id, std::move(info));
   if (!inserted) return -ENOMEM;
   *out = &it->second;
+  PERSIST(counters(*wrapper));
+  PERSIST(sub_put(*wrapper, it->second));
   return 0;
 }
 
@@ -324,6 +329,8 @@ int insert_publisher_info(
   auto [it, inserted] = wrapper->topic.pub_info_map.emplace(new_id, std::move(info));
   if (!inserted) return -ENOMEM;
   *out = &it->second;
+  PERSIST(counters(*wrapper));
+  PERSIST(pub_put(*wrapper, it->second));
   return 0;
 }
 
@@ -345,6 +352,7 @@ int set_publisher_shm_info(
       if (ret == -EEXIST) continue;
       return ret;
     }
+    PERSIST(map_put(subscriber_pid, proc_info->mempool_entry->addr));
 
     if (publisher_num == pub_shm_infos_size) return -ENOBUFS;
 
@@ -379,6 +387,7 @@ int release_msgs_to_meet_depth(
     if (is_referenced(en)) continue;
 
     resp->released_addrs[resp->released_num++] = en.msg_virtual_address;
+    PERSIST(entry_del(*wrapper, en));
     wrapper->topic.entries.erase(entry_id);
     pub_info->entries_num--;
   }
@@ -421,6 +430,7 @@ int receive_msg_core(
 
     const int ret = add_subscriber_reference(en, subscriber_id);
     if (ret < 0) return ret;
+    PERSIST(ref(*wrapper, en, subscriber_id, true));
 
     resp->entry_ids[resp->entry_num] = en.entry_id;
     resp->entry_addrs[resp->entry_num] = en.msg_virtual_address;
@@ -430,6 +440,7 @@ int receive_msg_core(
 
   if (resp->entry_num > 0) {
     sub_info->latest_received_entry_id = resp->entry_ids[resp->entry_num - 1];
+    PERSIST(sub_cursor(*wrapper, *sub_info));
   }
   return 0;
 }
@@ -475,7 +486,10 @@ void push_receive(TopicWrapper * wrapper, SubscriberInfo & sub, MetadataStore & 
     // Nothing was delivered, so give back the references it did take.
     for (uint16_t i = 0; i < resp.entry_num; i++) {
       EntryNode * en = find_message_entry(wrapper->topic, resp.entry_ids[i]);
-      if (en != nullptr) en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id));
+      if (
+        en != nullptr && en->referencing_subscribers.test_and_clear(static_cast<size_t>(sub.id))) {
+        PERSIST(ref(*wrapper, *en, sub.id, false));
+      }
     }
     set_ipc_pending(*channel, true);
     return;
@@ -499,7 +513,9 @@ void cleanup_unreferenced_entries_from_exited_publishers(
   std::vector<int64_t> to_remove;
   for (auto & [entry_id, en] : wrapper->topic.entries) {
     (void)entry_id;
-    en.referencing_subscribers.test_and_clear(static_cast<size_t>(subscriber_id));
+    if (en.referencing_subscribers.test_and_clear(static_cast<size_t>(subscriber_id))) {
+      PERSIST(ref(*wrapper, en, subscriber_id, false));
+    }
 
     if (is_referenced(en)) continue;
 
@@ -512,10 +528,12 @@ void cleanup_unreferenced_entries_from_exited_publishers(
     to_remove.push_back(en.entry_id);
     pub_info->entries_num--;
     if (pub_info->entries_num == 0) {
+      PERSIST(pub_del(*wrapper, *pub_info));
       wrapper->topic.pub_info_map.erase(pub_info->id);
     }
   }
   for (int64_t eid : to_remove) {
+    PERSIST(entry_del(*wrapper, wrapper->topic.entries.at(eid)));
     wrapper->topic.entries.erase(eid);
   }
 }
@@ -526,7 +544,12 @@ void try_remove_empty_topic(MetadataStore & store, const TopicKey & key)
   if (it == store.topic_map_.end()) return;
   TopicWrapper * wrapper = it->second.get();
   if (!wrapper->topic.pub_info_map.empty() || !wrapper->topic.sub_info_map.empty()) return;
+  for (auto & [eid, en] : wrapper->topic.entries) {
+    (void)eid;
+    PERSIST(entry_del(*wrapper, en));
+  }
   wrapper->topic.entries.clear();
+  PERSIST(topic_del(*wrapper));
   store.topic_map_.erase(it);
 }
 
@@ -589,6 +612,9 @@ void CommandHandlers::send_response(int fd, int32_t error_code)
 void CommandHandlers::send_response(
   int fd, int32_t error_code, const void * payload, uint32_t payload_size)
 {
+  // Whatever the request changed is durable before the client hears of it,
+  // and the handler still holds its locks here (see persist.hpp).
+  PERSIST(commit());
   ResponseHeader hdr{error_code, payload_size};
   iovec iov[3];
   int n_iov = 0;
@@ -797,7 +823,8 @@ void CommandHandlers::handle_add_process(int fd, pid_t pid, const void * payload
   resp.shm_addr = proc.mempool_entry->addr;
   resp.shm_size = allocator_.mempool_size_bytes();
 
-  store_.proc_info_map_.emplace(pid, std::move(proc));
+  auto & inserted_proc = store_.proc_info_map_.emplace(pid, std::move(proc)).first->second;
+  PERSIST(proc_put(inserted_proc));
   // Before the reply: a client this process knows of is in the state file.
   persist_state_locked();
   send_response(fd, 0, &resp, sizeof(resp));
@@ -906,6 +933,7 @@ void CommandHandlers::handle_release_sub_ref(int fd, pid_t pid, const void * pay
     send_response(fd, after_recovery ? 0 : EINVAL);
     return;
   }
+  PERSIST(ref(*wrapper, *en, req->pubsub_id, false));
 
   send_response(fd, 0);
 }
@@ -979,6 +1007,8 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
     it->second.msg_virtual_address = req->msg_virtual_address;
     resp.entry_id = entry_id;
     pub_info->entries_num++;
+    PERSIST(counters(*wrapper));
+    PERSIST(entry_put(*wrapper, it->second));
   }
 
   drain_release_rings(wrapper);
@@ -1012,6 +1042,7 @@ void CommandHandlers::handle_publish_msg(int fd, pid_t pid, const void * payload
   // global_mutex_ exclusively. Holding it shared keeps them out until the last
   // write(2) lands, without blocking any other publisher or receiver, all of
   // which take it shared too.
+  PERSIST(commit());  // durable in topic order, before anyone is woken
   tlock.unlock();
 
   AGNOCAST_DAEMON_BENCH_STAMP_NOTIFY_BEGIN();
@@ -1145,11 +1176,13 @@ void CommandHandlers::handle_take_msg(int fd, pid_t pid, const void * payload)
         send_response(fd, -ret);
         return;
       }
+      PERSIST(ref(*wrapper, *candidate_en, req->subscriber_id, true));
     }
     resp.addr = candidate_en->msg_virtual_address;
     resp.entry_id = candidate_en->entry_id;
     resp.publisher_id = candidate_en->publisher_id;
     sub_info->latest_received_entry_id = resp.entry_id;
+    PERSIST(sub_cursor(*wrapper, *sub_info));
   }
 
   if (!sub_info->need_mmap_update) {
@@ -1456,6 +1489,7 @@ void CommandHandlers::handle_remove_subscriber(int fd, pid_t pid, const void * p
   // The cleanup below frees entries no one references, so the other
   // subscribers' queued releases have to be in the bits first.
   drain_release_rings(wrapper);
+  PERSIST(sub_del(*wrapper, *sub_info));
   wrapper->topic.sub_info_map.erase(req->subscriber_id);
   cleanup_unreferenced_entries_from_exited_publishers(wrapper, req->subscriber_id, store_);
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
@@ -1493,11 +1527,13 @@ void CommandHandlers::handle_remove_publisher(int fd, pid_t pid, const void * pa
     }
   }
   for (int64_t eid : to_remove) {
+    PERSIST(entry_del(*wrapper, wrapper->topic.entries.at(eid)));
     wrapper->topic.entries.erase(eid);
     pub_info->entries_num--;
   }
 
   if (pub_info->entries_num == 0) {
+    PERSIST(pub_del(*wrapper, *pub_info));
     wrapper->topic.pub_info_map.erase(req->publisher_id);
   }
   try_remove_empty_topic(store_, TopicKey{req->topic_name, store_.get_process_domain_id(pid)});
@@ -1821,11 +1857,23 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
 
   {
     std::unique_lock glock(store_.global_mutex_);
+    if (!exit_cleanup_locked(pid, &unlink_subscriptions)) return;
+    persist_state_locked();
+  }
 
+  unlink_posix_resources_for_exit(pid, unlink_subscriptions);
+  forget_restoring_client(pid);
+}
+
+bool CommandHandlers::exit_cleanup_locked(
+  pid_t pid, std::vector<ExitSubscriptionEntry> * unlink_subscriptions)
+{
+  {
     ProcessInfo * proc_info = store_.find_process(pid);
-    if (!proc_info) return;
+    if (!proc_info) return false;
 
     proc_info->exited = true;
+    PERSIST(proc_del(*proc_info));
     allocator_.free_memory(pid);
 
     std::vector<TopicKey> topics_to_remove;
@@ -1846,12 +1894,14 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
           if (!is_referenced(en)) entries_to_remove.push_back(entry_id);
         }
         for (int64_t eid : entries_to_remove) {
+          PERSIST(entry_del(*wrapper, wrapper->topic.entries.at(eid)));
           wrapper->topic.entries.erase(eid);
           pub_info.entries_num--;
         }
         if (pub_info.entries_num == 0) pubs_to_remove.push_back(pub_id);
       }
       for (int32_t pub_id : pubs_to_remove) {
+        PERSIST(pub_del(*wrapper, wrapper->topic.pub_info_map.at(pub_id)));
         wrapper->topic.pub_info_map.erase(pub_id);
       }
 
@@ -1875,14 +1925,22 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
             dying != nullptr && dying->notify_eventfd >= 0) {
           close(dying->notify_eventfd);
         }
+        PERSIST(sub_del(*wrapper, wrapper->topic.sub_info_map.at(sub_id)));
         wrapper->topic.sub_info_map.erase(sub_id);
         cleanup_unreferenced_entries_from_exited_publishers(wrapper, sub_id, store_);
       }
 
       if (wrapper->topic.pub_info_map.empty() && wrapper->topic.sub_info_map.empty()) {
+        for (auto & [eid, en] : wrapper->topic.entries) {
+          (void)eid;
+          PERSIST(entry_del(*wrapper, en));
+        }
         wrapper->topic.entries.clear();
+        PERSIST(topic_del(*wrapper));
         topics_to_remove.push_back(key);
       }
+      // One topic is one step: a crash leaves whole topics cleaned up.
+      PERSIST(commit());
     }
 
     for (const auto & key : topics_to_remove) {
@@ -1898,12 +1956,10 @@ void CommandHandlers::process_exit_cleanup(pid_t pid)
     }
 
     // Snapshot for POSIX unlink after releasing metadata locks.
-    unlink_subscriptions = proc_info->exit_subscriptions;
-    persist_state_locked();
+    *unlink_subscriptions = proc_info->exit_subscriptions;
+    PERSIST(commit());
   }
-
-  unlink_posix_resources_for_exit(pid, unlink_subscriptions);
-  forget_restoring_client(pid);
+  return true;
 }
 
 void CommandHandlers::on_client_disconnect(pid_t client_pid)
@@ -1956,6 +2012,27 @@ size_t CommandHandlers::begin_recovery(const std::string & state_path)
   std::unique_lock glock(store_.global_mutex_);
   state_path_ = state_path;
 
+  // A (persistent region) or B (redo log): load what was persisted first.
+  // The clients still restore, to hand over their descriptors and to
+  // reconcile what they own (their receive position, the pushes they had not
+  // taken yet) with what the daemon persisted.
+  int64_t load_ns = 0;
+  {
+    const char * v = std::getenv("AGNOCAST_DAEMON_PERSIST");
+    if (v == nullptr || std::strcmp(v, "0") != 0) sink_ = persist::make_sink();
+  }
+  if (sink_) {
+    const int64_t t0 = monotonic_ns();
+    persisted_ = sink_->load(store_, allocator_);
+    load_ns = monotonic_ns() - t0;
+    persist::g_sink = sink_.get();
+    if (persisted_) {
+      fprintf(
+        stderr, "agnocast_daemon: loaded the persisted metadata in %.3f ms (%zu processes)\n",
+        static_cast<double>(load_ns) / 1e6, store_.proc_info_map_.size());
+    }
+  }
+
   std::unordered_map<pid_t, uint64_t> alive;
   std::ifstream ifs(state_path_);
   long long pid = 0;
@@ -1966,9 +2043,25 @@ size_t CommandHandlers::begin_recovery(const std::string & state_path)
     }
   }
 
+  // Persisted processes that are gone get the exit cleanup they missed.
+  if (persisted_) {
+    std::vector<pid_t> gone;
+    for (const auto & [p, proc] : store_.proc_info_map_) {
+      if (!proc.exited && alive.count(p) == 0) gone.push_back(p);
+    }
+    for (const pid_t p : gone) {
+      std::vector<ExitSubscriptionEntry> unlink;
+      exit_cleanup_locked(p, &unlink);
+      unlink_posix_resources_for_exit(p, unlink);
+    }
+  }
+
   std::lock_guard<std::mutex> lock(recovery_mtx_);
+  recovery_.status.load_ns = load_ns;
   if (alive.empty()) {
+    const int64_t kept_load_ns = load_ns;
     recovery_ = Recovery{};
+    recovery_.status.load_ns = kept_load_ns;
   } else {
     recovery_.expected = alive;
     recovery_.begin_ns = monotonic_ns();
@@ -2034,7 +2127,16 @@ void CommandHandlers::handle_restore_process(int fd, pid_t pid, const void * pay
       return;
     }
   }
-  if (store_.find_process(pid)) {
+  if (ProcessInfo * known = store_.find_process(pid)) {
+    // Loaded from the persisted state: the client only reattaches.
+    if (
+      persisted_ && !known->exited && known->mempool_entry != nullptr &&
+      known->mempool_entry->addr == req->shm_addr) {
+      std::lock_guard<std::mutex> lock(recovery_mtx_);
+      recovery_.restoring.insert(pid);
+      send_response(fd, 0);
+      return;
+    }
     send_response(fd, EEXIST);
     return;
   }
@@ -2050,7 +2152,8 @@ void CommandHandlers::handle_restore_process(int fd, pid_t pid, const void * pay
   proc.domain_id = req->domain_id;
   proc.is_performance_bridge_manager = req->is_performance_bridge_manager;
   proc.mempool_entry = entry;
-  store_.proc_info_map_.emplace(pid, std::move(proc));
+  ProcessInfo & added = store_.proc_info_map_.emplace(pid, std::move(proc)).first->second;
+  PERSIST(proc_put(added));
   {
     std::lock_guard<std::mutex> lock(recovery_mtx_);
     recovery_.restoring.insert(pid);
@@ -2080,7 +2183,7 @@ void CommandHandlers::handle_restore_mappings(int fd, pid_t pid, const void * pa
     const AgnocastRestoreMapping & m = req->mappings[i];
     MemoryAllocator::MempoolEntry * entry = allocator_.find_entry(m.shm_addr);
     if (entry == nullptr) continue;
-    allocator_.reference_memory(entry, pid);  // -EEXIST: reported twice, fine
+    if (allocator_.reference_memory(entry, pid) == 0) PERSIST(map_put(pid, m.shm_addr));
     recovery_.pool_owner[m.shm_addr] = m.pid;
   }
   send_response(fd, 0);
@@ -2110,6 +2213,12 @@ void CommandHandlers::handle_restore_publisher(int fd, pid_t pid, const void * p
   }
   TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
   TopicStruct & topic = wrapper->topic;
+  if (const auto known = topic.pub_info_map.find(req->publisher_id);
+      persisted_ && known != topic.pub_info_map.end() && known->second.pid == pid) {
+    known->second.restored_last_entry_id = req->last_entry_id;
+    send_response(fd, 0);
+    return;
+  }
   if (
     topic.pub_info_map.count(req->publisher_id) != 0 ||
     topic.sub_info_map.count(req->publisher_id) != 0) {
@@ -2126,9 +2235,11 @@ void CommandHandlers::handle_restore_publisher(int fd, pid_t pid, const void * p
   info.qos_is_transient_local = req->qos_is_transient_local;
   info.is_bridge = req->is_bridge;
   info.restored_last_entry_id = req->last_entry_id;
-  topic.pub_info_map.emplace(info.id, std::move(info));
+  PublisherInfo & added = topic.pub_info_map.emplace(info.id, std::move(info)).first->second;
   topic.current_pubsub_id = std::max(topic.current_pubsub_id, req->publisher_id + 1);
   topic.current_entry_id = std::max(topic.current_entry_id, req->last_entry_id + 1);
+  PERSIST(counters(*wrapper));
+  PERSIST(pub_put(*wrapper, added));
   for (auto & [id, sub] : topic.sub_info_map) {
     (void)id;
     sub.need_mmap_update = true;
@@ -2164,6 +2275,24 @@ void CommandHandlers::handle_restore_subscriber(
   }
   TopicWrapper * wrapper = store_.find_or_create_topic_for_process(pid, req->topic_name);
   TopicStruct & topic = wrapper->topic;
+  if (const auto known = topic.sub_info_map.find(req->subscriber_id);
+      persisted_ && known != topic.sub_info_map.end() && known->second.pid == pid) {
+    // The persisted receive position counts pushes the client never took; its
+    // own position and held entries win (see finish_recovery_locked).
+    SubscriberInfo & sub = known->second;
+    if (sub.notify_eventfd >= 0) close(sub.notify_eventfd);
+    sub.notify_eventfd = notify_eventfd;
+    sub.latest_received_entry_id = req->latest_received_entry_id;
+    sub.need_mmap_update = true;
+    PERSIST(sub_cursor(*wrapper, sub));
+    {
+      std::lock_guard<std::mutex> lock(recovery_mtx_);
+      recovery_.reconcile.push_back(
+        Claim{TopicKey{req->topic_name, wrapper->domain_id}, req->subscriber_id, -1, 0});
+    }
+    send_response(fd, 0);
+    return;
+  }
   if (
     topic.pub_info_map.count(req->subscriber_id) != 0 ||
     topic.sub_info_map.count(req->subscriber_id) != 0) {
@@ -2187,9 +2316,11 @@ void CommandHandlers::handle_restore_subscriber(
   // The pools it mapped were restored; set_publisher_shm_info() skips those.
   info.need_mmap_update = true;
   info.notify_eventfd = notify_eventfd;
-  topic.sub_info_map.emplace(info.id, std::move(info));
+  SubscriberInfo & added = topic.sub_info_map.emplace(info.id, std::move(info)).first->second;
   topic.current_pubsub_id = std::max(topic.current_pubsub_id, req->subscriber_id + 1);
   topic.current_entry_id = std::max(topic.current_entry_id, req->latest_received_entry_id + 1);
+  PERSIST(counters(*wrapper));
+  PERSIST(sub_put(*wrapper, added));
   send_response(fd, 0);
 }
 
@@ -2258,12 +2389,14 @@ void CommandHandlers::handle_restore_entries(int fd, pid_t pid, const void * pay
     }
     if (req->kind != AGNOCAST_RESTORE_ENTRY_PUBLISHED || e.entry_id < 0) continue;
     auto [it, inserted] = topic.entries.try_emplace(e.entry_id);
-    if (!inserted) continue;  // two publishers cannot share an id
+    if (!inserted) continue;  // persisted already, or two publishers sharing an id
     it->second.entry_id = e.entry_id;
     it->second.publisher_id = pub->id;
     it->second.msg_virtual_address = e.addr;
     pub->entries_num++;
     topic.current_entry_id = std::max(topic.current_entry_id, e.entry_id + 1);
+    PERSIST(counters(*wrapper));
+    PERSIST(entry_put(*wrapper, it->second));
   }
   send_response(fd, 0);
 }
@@ -2322,6 +2455,21 @@ void CommandHandlers::finish_recovery_locked()
     return proc != nullptr && !proc->exited;
   };
 
+  // A persisted subscriber's references include pushes it never took and
+  // releases it queued in a ring the daemon never drained: drop them, and take
+  // what it reports below.
+  for (const Claim & r : recovery_.reconcile) {
+    TopicWrapper * wrapper = store_.find_topic(r.key);
+    if (!wrapper) continue;
+    for (auto & [eid, en] : wrapper->topic.entries) {
+      (void)eid;
+      if (en.referencing_subscribers.test_and_clear(static_cast<size_t>(r.subscriber_id))) {
+        PERSIST(ref(*wrapper, en, r.subscriber_id, false));
+      }
+    }
+  }
+  recovery_.reconcile.clear();
+
   // Every subscriber has reported: give each reference back to its entry.
   for (const Claim & c : recovery_.claims) {
     TopicWrapper * wrapper = store_.find_topic(c.key);
@@ -2365,6 +2513,8 @@ void CommandHandlers::finish_recovery_locked()
         info.pid = owner;
         info.node_name = "(exited during a daemon restart)";
         holder = &topic.pub_info_map.emplace(info.id, std::move(info)).first->second;
+        PERSIST(counters(*wrapper));
+        PERSIST(pub_put(*wrapper, *holder));
       }
       auto [it, inserted] = topic.entries.try_emplace(c.entry_id);
       (void)inserted;
@@ -2373,12 +2523,15 @@ void CommandHandlers::finish_recovery_locked()
       it->second.msg_virtual_address = c.addr;
       holder->entries_num++;
       en = &it->second;
+      PERSIST(entry_put(*wrapper, *en));
       if (!pending) recovery_.status.orphan_claim_num++;
     } else if (en->msg_virtual_address != c.addr) {
       recovery_.status.rejected_claim_num++;
       continue;
     }
-    en->referencing_subscribers.test_and_set(static_cast<size_t>(c.subscriber_id));
+    if (!en->referencing_subscribers.test_and_set(static_cast<size_t>(c.subscriber_id))) {
+      PERSIST(ref(*wrapper, *en, c.subscriber_id, true));
+    }
   }
   recovery_.claims.clear();
 
@@ -2417,6 +2570,7 @@ void CommandHandlers::finish_recovery_locked()
         it->second.publisher_id = pub.id;
         it->second.msg_virtual_address = addr;
         pub.entries_num++;
+        PERSIST(entry_put(*wrapper, it->second));
       }
     }
   }
@@ -2428,6 +2582,7 @@ void CommandHandlers::finish_recovery_locked()
     if (!alive_client(p)) unlink_posix_resources_for_exit(p, {});
   }
 
+  PERSIST(commit());
   recovery_.status.recovering = 0;
   recovery_.status.grace_ns = monotonic_ns() - recovery_.begin_ns;
   recovering_.store(false, std::memory_order_release);

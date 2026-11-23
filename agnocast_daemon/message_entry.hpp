@@ -68,6 +68,7 @@ struct EntryNode
   uint64_t msg_virtual_address = 0;
 
   AtomicSubscriberBitmap referencing_subscribers;
+  int32_t persist_slot = -1;  // the persistence sink's own index (persist.hpp)
 
   bool is_referenced() const noexcept { return referencing_subscribers.any(); }
 };
