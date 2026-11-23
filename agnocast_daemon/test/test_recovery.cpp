@@ -66,9 +66,15 @@ std::string state_path()
 class Recovery : public ::testing::Test
 {
 protected:
-  void SetUp() override { path = state_path(); }
+  void SetUp() override
+  {
+    path = state_path();
+    // These cover recovery from the client reports alone (C).
+    setenv("AGNOCAST_DAEMON_PERSIST", "0", 1);
+  }
   void TearDown() override
   {
+    unsetenv("AGNOCAST_DAEMON_PERSIST");
     std::remove(path.c_str());
     std::remove((path + ".tmp").c_str());
     unsetenv("AGNOCAST_DAEMON_RECOVERY_FENCE_MS");
